@@ -32,7 +32,20 @@
 
   <section class="panel">
     <div class="panel-head">
-      <h2>URL Review Queue</h2>
+      <div class="helper-title">
+        <h2>URL Review Queue</h2>
+        <span class="helper-tip">
+          <button
+            class="helper-icon"
+            type="button"
+            aria-label="Giải thích bảng URL Review Queue"
+            aria-describedby="url-review-queue-help"
+          >?</button>
+          <span class="helper-popover helper-popover-wide" id="url-review-queue-help" role="tooltip">
+            Bảng này duyệt từng URL cụ thể trước khi crawl. Approve chỉ áp dụng cho URL trong dòng đó và đưa URL vào tiến trình crawl; Reject URL chỉ loại URL đó. Reject Domain trong dòng URL sẽ loại tất cả URL còn Need Action thuộc cùng domain. Các URL đã Approved hoặc Rejected chỉ còn read-only.
+          </span>
+        </span>
+      </div>
       <span class="muted">{{ urls|length }} rows</span>
     </div>
     <nav class="table-tabs" aria-label="URL review status tabs">
@@ -114,7 +127,20 @@
 
   <section class="panel">
     <div class="panel-head">
-      <h2>Domain Review</h2>
+      <div class="helper-title">
+        <h2>Domain Review</h2>
+        <span class="helper-tip">
+          <button
+            class="helper-icon"
+            type="button"
+            aria-label="Giải thích bảng Domain Review"
+            aria-describedby="domain-review-help"
+          >?</button>
+          <span class="helper-popover helper-popover-wide" id="domain-review-help" role="tooltip">
+            Bảng này gom các URL theo domain để thao tác hàng loạt. Approve domain sẽ approve tất cả URL còn Need Action thuộc domain đó và queue crawl cho các URL này. Reject domain sẽ reject tất cả URL còn Need Action thuộc domain đó. Các URL/domain đã duyệt trước đó không bị đổi lại.
+          </span>
+        </span>
+      </div>
       <span class="muted">Approve/reject all URLs under a domain.</span>
     </div>
     <nav class="table-tabs" aria-label="Domain review status tabs">
