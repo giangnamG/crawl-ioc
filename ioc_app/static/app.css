@@ -316,6 +316,7 @@ small {
 
 .review-url-wrap {
   max-height: min(58vh, 560px);
+  scrollbar-gutter: stable;
 }
 
 .review-domain-wrap {
@@ -395,7 +396,77 @@ th {
 }
 
 .url-review-table {
-  min-width: 1280px;
+  min-width: 1276px;
+}
+
+.review-url-col-id {
+  width: 58px;
+}
+
+.review-url-col-domain {
+  width: 154px;
+}
+
+.review-url-col-source {
+  width: 106px;
+}
+
+.review-url-col-url {
+  width: 360px;
+}
+
+.review-url-col-query {
+  width: 150px;
+}
+
+.review-url-col-status {
+  width: 130px;
+}
+
+.review-url-col-actions {
+  width: 188px;
+}
+
+.url-review-table th,
+.url-review-table td {
+  vertical-align: middle;
+}
+
+.review-url-actions-head,
+.review-url-actions-cell {
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  box-shadow: -10px 0 14px rgba(15, 23, 42, 0.06);
+}
+
+.review-url-actions-head {
+  background: var(--surface-2);
+  z-index: 4;
+}
+
+.review-url-actions-cell {
+  background: var(--surface);
+}
+
+tbody tr:hover .review-url-actions-cell {
+  background: #f8fbff;
+}
+
+.url-review-table .cell-actions .row-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 6px;
+}
+
+.url-review-table .cell-actions form:nth-child(3) {
+  grid-column: 1 / -1;
+}
+
+.url-review-table .cell-actions .button {
+  min-width: 0;
+  width: 100%;
+  white-space: nowrap;
 }
 
 .domain-review-table {
@@ -780,6 +851,10 @@ td small {
   align-items: end;
 }
 
+.review-filter-bar {
+  grid-template-columns: 220px minmax(220px, 1fr) auto;
+}
+
 .queue-create-form {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: end;
@@ -789,6 +864,42 @@ td small {
   display: grid;
   grid-template-columns: minmax(220px, 0.8fr) minmax(260px, 1.2fr);
   gap: 12px;
+}
+
+.table-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: -2px 0 12px;
+}
+
+.tab-pill {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #f8fafc;
+  color: #334155;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.tab-pill:hover {
+  border-color: var(--primary);
+  background: #eff6ff;
+  text-decoration: none;
+}
+
+.tab-pill.active {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #ffffff;
 }
 
 label,

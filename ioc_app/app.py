@@ -492,27 +492,32 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.get("/review")
     def review():
-        status = request.args.get("status", "pending_review")
+        legacy_status = request.args.get("status")
+        url_status = normalize_review_status(
+            request.args.get("url_status") or legacy_status or "pending_review"
+        )
+        domain_status = normalize_review_status(
+            request.args.get("domain_status") or legacy_status or "pending_review"
+        )
         source = request.args.get("source", "")
         q = request.args.get("q", "").strip()
         with connect() as conn:
-            urls = list(query_review_urls(conn, status, q))
+            urls = list(query_review_urls(conn, url_status, q))
             if source:
                 urls = [row for row in urls if source_matches(row["domain_sources"] or "", source)]
-            domains = conn.execute(
-                """
-                SELECT d.*,
-                       GROUP_CONCAT(DISTINCT ds.source_type) AS sources,
-                       COUNT(DISTINCT u.id) AS url_count
-                FROM domains d
-                LEFT JOIN domain_sources ds ON ds.domain_id = d.id
-                LEFT JOIN urls u ON u.domain = d.domain
-                GROUP BY d.id
-                ORDER BY d.created_at DESC
-                LIMIT 200
-                """
-            ).fetchall()
-        return render_template("review.html", urls=urls, domains=domains, status=status, source=source, q=q)
+            domains = list(query_review_domains(conn, domain_status, q))
+            if source:
+                domains = [row for row in domains if source_matches(row["sources"] or "", source)]
+        return render_template(
+            "review.html",
+            urls=urls,
+            domains=domains,
+            url_status=url_status,
+            domain_status=domain_status,
+            review_tabs=REVIEW_TABS,
+            source=source,
+            q=q,
+        )
 
     @app.post("/urls/<int:url_id>/approve")
     def approve_url(url_id: int):
@@ -661,9 +666,21 @@ NAV = [
     ("IOCs", "iocs"),
 ]
 
+REVIEW_TABS = [
+    {"value": "pending_review", "label": "Need Action"},
+    {"value": "approved", "label": "Approved"},
+    {"value": "rejected", "label": "Rejected"},
+]
+
+REVIEW_STATUS_VALUES = {item["value"] for item in REVIEW_TABS}
+
 
 def scalar(conn, sql: str, params: tuple[object, ...] = ()) -> int:
     return int(conn.execute(sql, params).fetchone()[0])
+
+
+def normalize_review_status(value: str | None) -> str:
+    return value if value in REVIEW_STATUS_VALUES else "pending_review"
 
 
 def parse_lines(value: str) -> list[str]:
@@ -1558,6 +1575,33 @@ def query_review_urls(conn, status: str, q: str):
         {where_sql}
         GROUP BY u.id
         ORDER BY u.created_at DESC
+        LIMIT 500
+        """,
+        params,
+    ).fetchall()
+
+
+def query_review_domains(conn, status: str, q: str):
+    params: list[object] = []
+    where = []
+    if status:
+        where.append("d.review_status = ?")
+        params.append(status)
+    if q:
+        where.append("d.domain LIKE ?")
+        params.append(f"%{q}%")
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+    return conn.execute(
+        f"""
+        SELECT d.*,
+               GROUP_CONCAT(DISTINCT ds.source_type) AS sources,
+               COUNT(DISTINCT u.id) AS url_count
+        FROM domains d
+        LEFT JOIN domain_sources ds ON ds.domain_id = d.id
+        LEFT JOIN urls u ON u.domain = d.domain
+        {where_sql}
+        GROUP BY d.id
+        ORDER BY d.created_at DESC
         LIMIT 500
         """,
         params,

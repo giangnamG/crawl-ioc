@@ -8,17 +8,11 @@
   <section class="panel">
     <div class="panel-head">
       <h2>Filters</h2>
-      <span class="muted">Rejected rows are hidden unless selected.</span>
+      <span class="muted">Use table tabs to switch review status.</span>
     </div>
-    <form method="get" class="filter-bar">
-      <label>
-        <span>Status</span>
-        <select name="status">
-          {% for item in ["pending_review", "approved", "rejected"] %}
-            <option value="{{ item }}" {% if status == item %}selected{% endif %}>{{ item|status_label }}</option>
-          {% endfor %}
-        </select>
-      </label>
+    <form method="get" class="filter-bar review-filter-bar">
+      <input type="hidden" name="url_status" value="{{ url_status }}">
+      <input type="hidden" name="domain_status" value="{{ domain_status }}">
       <label>
         <span>Domain Source</span>
         <select name="source">
@@ -41,17 +35,26 @@
       <h2>URL Review Queue</h2>
       <span class="muted">{{ urls|length }} rows</span>
     </div>
+    <nav class="table-tabs" aria-label="URL review status tabs">
+      {% for tab in review_tabs %}
+        <a
+          class="tab-pill {% if url_status == tab.value %}active{% endif %}"
+          href="{{ url_for('review', url_status=tab.value, domain_status=domain_status, source=source, q=q) }}"
+          aria-current="{{ 'page' if url_status == tab.value else 'false' }}"
+        >{{ tab.label }}</a>
+      {% endfor %}
+    </nav>
     <div class="table-wrap scroll-y review-url-wrap">
       <table class="review-table url-review-table">
         <colgroup>
-          <col class="col-id">
-          <col class="col-domain">
-          <col class="col-source">
-          <col class="col-url">
-          <col class="col-query">
-          <col class="col-status">
-          <col class="col-status">
-          <col class="col-actions">
+          <col class="review-url-col-id">
+          <col class="review-url-col-domain">
+          <col class="review-url-col-source">
+          <col class="review-url-col-url">
+          <col class="review-url-col-query">
+          <col class="review-url-col-status">
+          <col class="review-url-col-status">
+          <col class="review-url-col-actions">
         </colgroup>
         <thead>
           <tr>
@@ -62,7 +65,7 @@
             <th>Query</th>
             <th>Review</th>
             <th>Crawl</th>
-            <th class="actions-col">Actions</th>
+            <th class="review-url-actions-head">Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -82,7 +85,7 @@
               <td class="cell-query"><code class="truncate-line" title="{{ row.queries or '' }}">{{ row.queries or "" }}</code></td>
               <td class="cell-status"><span class="badge {{ row.review_status }}">{{ row.review_status|status_label }}</span></td>
               <td class="cell-status"><span class="badge {{ row.crawl_status }}">{{ row.crawl_status|status_label }}</span></td>
-              <td class="cell-actions">
+              <td class="cell-actions review-url-actions-cell">
                 <div class="row-actions">
                   <form method="post" action="{{ url_for('approve_url', url_id=row.id) }}">
                     <button class="button small primary" type="submit">Approve</button>
@@ -98,7 +101,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="8" class="empty">No URLs match this filter.</td></tr>
+            <tr><td colspan="8" class="empty">No URLs in this tab.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -110,6 +113,15 @@
       <h2>Domain Review</h2>
       <span class="muted">Approve/reject all URLs under a domain.</span>
     </div>
+    <nav class="table-tabs" aria-label="Domain review status tabs">
+      {% for tab in review_tabs %}
+        <a
+          class="tab-pill {% if domain_status == tab.value %}active{% endif %}"
+          href="{{ url_for('review', url_status=url_status, domain_status=tab.value, source=source, q=q) }}"
+          aria-current="{{ 'page' if domain_status == tab.value else 'false' }}"
+        >{{ tab.label }}</a>
+      {% endfor %}
+    </nav>
     <div class="table-wrap compact scroll-y review-domain-wrap">
       <table class="review-table domain-review-table">
         <colgroup>
@@ -153,7 +165,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="5" class="empty">No domains found.</td></tr>
+            <tr><td colspan="5" class="empty">No domains in this tab.</td></tr>
           {% endfor %}
         </tbody>
       </table>
