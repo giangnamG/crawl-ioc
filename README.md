@@ -112,7 +112,7 @@ Tự động hóa một luồng đơn giản:
 4. Dùng CloakBrowser search Google theo từng search query.
 5. Lưu URL/title kết quả tìm kiếm.
 6. User review và loại URL/domain không hợp lệ.
-7. Crawl các URL còn lại.
+7. Crawl các URL còn lại bằng strategy phù hợp: CloakBrowser cho HTML/rendered page, HTTP text cho static/API/feed.
 8. Trích xuất IOC: domain, URL, email, phone, hash, địa chỉ.
 9. URL/domain mới phát hiện được đưa lại vào danh sách review.
 
@@ -144,7 +144,7 @@ flowchart TD
   H --> I["Reject domain/URL không hợp lệ"]
   H --> J["Approve domain/URL hợp lệ"]
   J --> K["Tạo job: crawl_url"]
-  K --> L["CloakBrowser truy cập từng URL chưa crawl"]
+  K --> L["Crawler chọn CloakBrowser hoặc HTTP fetch theo loại URL"]
   L --> M["IOC Extractor tìm hash/email/phone/domain/url/address"]
   M --> N["Lưu IOC duy nhất và nguồn IOC"]
   M --> O["Domain/URL mới quay lại danh sách review"]
@@ -392,7 +392,7 @@ status = pending
 payload = { url_id }
 ```
 
-### Bước 4: CloakBrowser truy cập từng URL/domain đã approve
+### Bước 4: Worker truy cập từng URL/domain đã approve
 
 Worker lấy job `crawl_url`.
 
@@ -402,7 +402,7 @@ Trước khi truy cập, worker kiểm tra:
 Nếu review_status != approved:
   bỏ qua
 
-Nếu crawl_status = crawled:
+Nếu crawl_status = crawled hoặc metadata_only:
   bỏ qua
 
 Nếu URL đã có job crawl_url pending/running:
@@ -416,14 +416,19 @@ Quy tắc đúng theo yêu cầu:
 - Ví dụ `https://a.com` và `https://a.com/promo` là 2 target khác nhau.
 - Nếu cả hai đều chưa crawl và đều được approve thì vẫn crawl cả hai.
 
-Khi crawl:
+Khi crawl, worker chọn fetch strategy theo loại URL:
 
-- Mở URL bằng CloakBrowser.
-- Lấy final URL sau redirect.
-- Lấy HTML/rendered text.
-- Có thể lấy thêm toàn bộ link trong DOM: `a[href]`, `script[src]`, `iframe[src]`, `form[action]`, `img[src]`.
-- Lưu `status_code`, `final_url`, `html`, `crawled_at`, `crawl_status`.
-- Chuyển nội dung cho IOC Extractor.
+- `cloak_browser`: dùng cho HTML/rendered page, vẫn ưu tiên CloakBrowser để lấy DOM sau render.
+- `http_text`: dùng cho `.css`, `.js`, `.json`, `.xml`, `.txt`, `.map`, `.csv`, `.svg`, `/feed/`, `/wp-json/`, `sitemap.xml`, `robots.txt`. Nội dung text vẫn được đưa vào IOC Extractor.
+- `http_text_fallback`: dùng khi CloakBrowser lỗi runtime nhưng URL vẫn có thể fetch bằng HTTP text. Job không bị đánh fail giả; lỗi CloakBrowser được lưu vào `crawl_error` như ghi chú.
+- `http_binary_metadata`: dùng cho file nhị phân như image, font, pdf, archive, video. Hệ thống lưu metadata và đánh `metadata_only`, không parse IOC từ body nhị phân.
+
+Thông tin lưu sau fetch:
+
+- `status_code`, `final_url`, `content_type`, `content_length`, `fetch_method`.
+- `html` hoặc raw text với content dạng text.
+- `crawled_at`, `crawl_status`, `crawl_error` nếu có cảnh báo hoặc lỗi.
+- Link phát hiện trong DOM hoặc trong text asset như CSS/JS/JSON/XML.
 
 Kết quả sau bước này:
 
@@ -434,6 +439,19 @@ urls:
   crawl_status = crawled
   final_url = https://a.com/home
   status_code = 200
+  fetch_method = cloak_browser
+
+- url_norm = https://a.com/wp-json/
+  review_status = approved
+  crawl_status = crawled
+  status_code = 200
+  fetch_method = http_text
+
+- url_norm = https://a.com/logo.png
+  review_status = approved
+  crawl_status = metadata_only
+  status_code = 200
+  fetch_method = http_binary_metadata
 ```
 
 ### Bước 5: Extract IOC từ từng URL đã crawl
@@ -636,6 +654,10 @@ CREATE TABLE urls (
   crawl_status TEXT NOT NULL DEFAULT 'not_crawled',
   final_url TEXT,
   status_code INT,
+  content_type TEXT,
+  content_length INT,
+  fetch_method TEXT,
+  crawl_error TEXT,
   html TEXT,
   crawled_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -904,7 +926,7 @@ Trước khi tạo job crawl:
 
 ```text
 Tìm url_norm trong bảng urls.
-Nếu đã có và crawl_status = crawled thì không tạo job mới.
+Nếu đã có và crawl_status = crawled hoặc metadata_only thì không tạo job mới.
 Nếu đã có job pending/running thì không tạo job mới.
 ```
 
@@ -1298,29 +1320,45 @@ def run_crawl_url(url_id):
     if target.review_status != "approved":
         return
 
-    if target.crawl_status == "crawled":
+    if target.crawl_status in {"crawled", "metadata_only"}:
         return
 
-    page = cloakbrowser.new_page()
-    response = page.goto(target.url_norm)
+    strategy = classify_crawl_strategy(target.url_norm)
 
-    html = page.content()
-    text = page.inner_text("body")
+    if strategy == "http_text":
+        result = http_fetch_text(target.url_norm)
+    elif strategy == "http_binary_metadata":
+        result = http_fetch_metadata(target.url_norm)
+    else:
+        try:
+            result = cloakbrowser_fetch_rendered(target.url_norm)
+        except BrowserRuntimeError as exc:
+            result = http_fetch_text(target.url_norm)
+            result.fetch_method = "http_text_fallback"
+            result.crawl_error = f"CloakBrowser failed; HTTP fallback used: {exc}"
 
     db.mark_crawled(
         url_id=url_id,
-        final_url=page.url,
-        status_code=response.status,
-        html=html,
+        crawl_status="crawled" if result.is_text else "metadata_only",
+        final_url=result.final_url,
+        status_code=result.status_code,
+        content_type=result.content_type,
+        content_length=result.content_length,
+        fetch_method=result.fetch_method,
+        crawl_error=result.crawl_error,
+        html=result.html if result.is_text else "",
     )
 
+    if not result.is_text:
+        return
+
     extraction_input = {
-        "text": text,
-        "html": html,
-        "links": extract_links_from_dom(page),
-        "final_url": page.url,
-        "redirects": get_redirect_chain(response),
-        "all": html + "\n" + text,
+        "text": result.text,
+        "html": result.html,
+        "links": result.links,
+        "final_url": result.final_url,
+        "redirects": result.redirects,
+        "all": result.html + "\n" + result.text,
     }
 
     rules = db.get_enabled_extraction_rules()

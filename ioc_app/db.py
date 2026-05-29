@@ -44,6 +44,10 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "url_queue_items", "source_search_query_id", "INTEGER REFERENCES search_queries(id)")
     ensure_column(conn, "url_queue_items", "source_search_queue_item_id", "INTEGER REFERENCES search_queue_items(id)")
     ensure_column(conn, "url_queue_items", "source_url_queue_item_id", "INTEGER REFERENCES url_queue_items(id)")
+    ensure_column(conn, "urls", "content_type", "TEXT")
+    ensure_column(conn, "urls", "content_length", "INTEGER")
+    ensure_column(conn, "urls", "fetch_method", "TEXT")
+    ensure_column(conn, "urls", "crawl_error", "TEXT")
     conn.executescript(
         """
         CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(queue_id, status, id);
@@ -384,6 +388,10 @@ CREATE TABLE IF NOT EXISTS urls (
   crawl_status TEXT NOT NULL DEFAULT 'not_crawled',
   final_url TEXT,
   status_code INTEGER,
+  content_type TEXT,
+  content_length INTEGER,
+  fetch_method TEXT,
+  crawl_error TEXT,
   html TEXT,
   crawled_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

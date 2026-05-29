@@ -47,6 +47,11 @@ class FetchResult:
     text: str
     links: list[str]
     redirects: list[str]
+    content_type: str | None = None
+    content_length: int | None = None
+    fetch_method: str = "cloak_browser"
+    is_text: bool = True
+    error: str | None = None
 
 
 class TextAndLinkParser(HTMLParser):
@@ -109,6 +114,15 @@ class BrowserClient:
         if self.provider == "http":
             return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_url(url)
         return self._fetch_url_with_cloak(url)
+
+    def fetch_text_resource(self, url: str, fetch_method: str = "http_text") -> FetchResult:
+        return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_text_resource(
+            url,
+            fetch_method=fetch_method,
+        )
+
+    def fetch_binary_metadata(self, url: str) -> FetchResult:
+        return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_binary_metadata(url)
 
     def _search_google_with_cloak(self, query_text: str) -> list[SearchResult]:
         results: list[SearchResult] = []
@@ -240,6 +254,9 @@ class BrowserClient:
                 text=text,
                 links=normalized_links,
                 redirects=dedupe_keep_order(redirects),
+                content_type=(response.headers.get("content-type") if response else None),
+                content_length=parse_int(response.headers.get("content-length")) if response else len(html_text),
+                fetch_method="cloak_browser",
             )
         finally:
             ctx.close()
@@ -464,6 +481,7 @@ class HttpFallbackClient:
     def __init__(self, max_pages: int, timeout_ms: int) -> None:
         self.max_pages = max_pages
         self.timeout = max(1, timeout_ms // 1000)
+        self.max_body_bytes = int(os.environ.get("HTTP_FETCH_MAX_BYTES", "5000000"))
 
     def search_google(self, query_text: str) -> list[SearchResult]:
         results: list[SearchResult] = []
@@ -486,36 +504,66 @@ class HttpFallbackClient:
         return results
 
     def fetch_url(self, url: str) -> FetchResult:
-        html_text, final_url, status_code = self._open(url)
-        parser = TextAndLinkParser()
-        parser.feed(html_text)
+        return self.fetch_text_resource(url, fetch_method="http_text")
 
-        normalized_links: list[str] = []
-        for link in parser.links:
-            absolute = urllib.parse.urljoin(final_url or url, link)
-            norm = normalize_url(absolute)
-            if norm and norm not in normalized_links:
-                normalized_links.append(norm)
+    def fetch_text_resource(self, url: str, fetch_method: str = "http_text") -> FetchResult:
+        body, final_url, status_code, content_type, content_length = self._open_bytes(url)
+        text = decode_http_body(body, content_type)
+        final = final_url or url
+        html_text, extracted_text, links = parse_text_resource(text, final)
+        effective_length = content_length if content_length is not None else len(body)
+        return FetchResult(
+            final_url=final,
+            status_code=status_code,
+            html=html_text,
+            text=extracted_text,
+            links=links,
+            redirects=[],
+            content_type=content_type,
+            content_length=effective_length,
+            fetch_method=fetch_method,
+            is_text=True,
+        )
 
+    def fetch_binary_metadata(self, url: str) -> FetchResult:
+        body, final_url, status_code, content_type, content_length = self._open_bytes(url, read_limit=0)
         return FetchResult(
             final_url=final_url or url,
             status_code=status_code,
-            html=html_text,
-            text=parser.text,
-            links=normalized_links,
+            html="",
+            text="",
+            links=[],
             redirects=[],
+            content_type=content_type,
+            content_length=content_length if content_length is not None else len(body),
+            fetch_method="http_binary_metadata",
+            is_text=False,
         )
 
     def _open(self, url: str) -> tuple[str, str, int | None]:
+        body, final_url, status_code, content_type, _ = self._open_bytes(url)
+        return decode_http_body(body, content_type), final_url, status_code
+
+    def _open_bytes(
+        self,
+        url: str,
+        read_limit: int | None = None,
+    ) -> tuple[bytes, str, int | None, str | None, int | None]:
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        limit = self.max_body_bytes if read_limit is None else max(0, read_limit)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                content_type = response.headers.get_content_charset() or "utf-8"
-                body = response.read().decode(content_type, errors="replace")
-                return body, response.geturl(), response.status
+                body = response.read(limit + 1) if limit > 0 else b""
+                content_type = response.headers.get("Content-Type")
+                content_length = parse_int(response.headers.get("Content-Length"))
+                body = body[:limit] if limit > 0 else body
+                return body, response.geturl(), response.status, content_type, content_length
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            return body, exc.geturl(), exc.code
+            body = exc.read(limit + 1) if limit > 0 else b""
+            content_type = exc.headers.get("Content-Type") if exc.headers else None
+            content_length = parse_int(exc.headers.get("Content-Length")) if exc.headers else None
+            body = body[:limit] if limit > 0 else body
+            return body, exc.geturl(), exc.code, content_type, content_length
         except Exception as exc:
             raise RuntimeError(f"HTTP fallback fetch failed for {url}: {exc}") from exc
 
@@ -572,6 +620,66 @@ class LinkTextParser(HTMLParser):
             self.anchors.append({"href": self._href, "text": html.unescape(text)})
             self._href = None
             self._text = []
+
+
+def parse_text_resource(text: str, final_url: str) -> tuple[str, str, list[str]]:
+    is_html = looks_like_html(text)
+    parser = TextAndLinkParser()
+    parser.feed(text)
+    parser_links = parser.links if is_html else []
+    links = extract_resource_links(text, final_url, parser_links)
+    extracted_text = parser.text if is_html else text
+    return text, extracted_text, links
+
+
+def extract_resource_links(text: str, base_url: str, seed_links: list[str] | None = None) -> list[str]:
+    candidates: list[str] = list(seed_links or [])
+
+    for match in re.finditer(r"(?i)\bhttps?://[^\s\"'<>()]+", text):
+        candidates.append(match.group(0))
+
+    for match in re.finditer(r"(?i)(?<!:)//[a-z0-9][a-z0-9.-]+[^\s\"'<>()]*", text):
+        candidates.append(match.group(0))
+
+    for match in re.finditer(r"(?is)\burl\(\s*['\"]?([^'\")]+)['\"]?\s*\)", text):
+        candidates.append(match.group(1))
+
+    normalized_links: list[str] = []
+    for candidate in candidates:
+        cleaned = html.unescape((candidate or "").strip().strip(".,;:)]}'\""))
+        if not cleaned or cleaned.startswith(("data:", "mailto:", "tel:", "#")):
+            continue
+        if cleaned.startswith("//"):
+            scheme = urllib.parse.urlsplit(base_url).scheme or "https"
+            cleaned = f"{scheme}:{cleaned}"
+        absolute = urllib.parse.urljoin(base_url, cleaned)
+        norm = normalize_url(absolute)
+        if norm and norm not in normalized_links:
+            normalized_links.append(norm)
+    return normalized_links
+
+
+def looks_like_html(text: str) -> bool:
+    sample = text[:1000].lower()
+    return "<html" in sample or "<body" in sample or "<a " in sample
+
+
+def decode_http_body(body: bytes, content_type: str | None) -> str:
+    charset = "utf-8"
+    if content_type:
+        match = re.search(r"charset=([^\s;]+)", content_type, re.IGNORECASE)
+        if match:
+            charset = match.group(1).strip("\"'")
+    return body.decode(charset, errors="replace")
+
+
+def parse_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def clean_google_href(href: str) -> str | None:

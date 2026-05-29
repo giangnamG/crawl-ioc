@@ -140,7 +140,22 @@
             <th>Domain</th>
             <th>Sources</th>
             <th>Status</th>
-            <th>URLs</th>
+            <th>
+              <span class="helper-title">
+                <span>URLs</span>
+                <span class="helper-tip">
+                  <button
+                    class="helper-icon"
+                    type="button"
+                    aria-label="Explain URLs count"
+                    aria-describedby="domain-url-count-help"
+                  >?</button>
+                  <span class="helper-popover helper-popover-wide" id="domain-url-count-help" role="tooltip">
+                    Đây là số lượng URL duy nhất đang được hệ thống lưu dưới domain này. Khi bấm Approve hoặc Reject ở dòng domain, thao tác sẽ áp dụng cho tất cả URL thuộc domain này vẫn còn ở trạng thái Need Action; các URL đã Approved hoặc Rejected sẽ chỉ được giữ read-only và không bị đổi lại.
+                  </span>
+                </span>
+              </span>
+            </th>
             <th class="actions-col">Actions</th>
           </tr>
         </thead>

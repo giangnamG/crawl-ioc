@@ -11,7 +11,20 @@
       <a href="{{ url_for('jobs') }}">Run jobs</a>
     </div>
     <div class="table-wrap">
-      <table>
+      <table class="crawl-table">
+        <colgroup>
+          <col class="crawl-col-id">
+          <col class="crawl-col-domain">
+          <col class="crawl-col-url">
+          <col class="crawl-col-status">
+          <col class="crawl-col-status">
+          <col class="crawl-col-code">
+          <col class="crawl-col-method">
+          <col class="crawl-col-type">
+          <col class="crawl-col-size">
+          <col class="crawl-col-error">
+          <col class="crawl-col-time">
+        </colgroup>
         <thead>
           <tr>
             <th>ID</th>
@@ -20,6 +33,10 @@
             <th>Review</th>
             <th>Crawl</th>
             <th>Status Code</th>
+            <th>Fetch Method</th>
+            <th>Content Type</th>
+            <th>Size</th>
+            <th>Error / Note</th>
             <th>Crawled At</th>
           </tr>
         </thead>
@@ -37,10 +54,18 @@
               <td><span class="badge {{ row.review_status }}">{{ row.review_status|status_label }}</span></td>
               <td><span class="badge {{ row.crawl_status }}">{{ row.crawl_status|status_label }}</span></td>
               <td>{{ row.status_code or "" }}</td>
+              <td><code>{{ row.fetch_method or "" }}</code></td>
+              <td>{{ (row.content_type or "")|truncate_middle(42) }}</td>
+              <td>{{ row.content_length|bytes_label }}</td>
+              <td>
+                {% if row.crawl_error %}
+                  <span title="{{ row.crawl_error }}">{{ row.crawl_error|truncate_middle(60) }}</span>
+                {% endif %}
+              </td>
               <td>{{ row.crawled_at or "" }}</td>
             </tr>
           {% else %}
-            <tr><td colspan="7" class="empty">No approved or crawled URLs yet.</td></tr>
+            <tr><td colspan="11" class="empty">No approved or crawled URLs yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>

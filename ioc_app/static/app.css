@@ -252,6 +252,10 @@ h2 {
   visibility: hidden;
 }
 
+.helper-popover-wide {
+  width: min(420px, calc(100vw - 56px));
+}
+
 .helper-tip:hover .helper-popover,
 .helper-tip:focus-within .helper-popover {
   opacity: 1;
@@ -471,6 +475,51 @@ tbody tr:hover .review-url-actions-cell {
 
 .domain-review-table {
   min-width: 860px;
+}
+
+.crawl-table {
+  min-width: 1540px;
+  table-layout: fixed;
+}
+
+.crawl-col-id {
+  width: 70px;
+}
+
+.crawl-col-domain {
+  width: 180px;
+}
+
+.crawl-col-url {
+  width: 360px;
+}
+
+.crawl-col-status {
+  width: 132px;
+}
+
+.crawl-col-code {
+  width: 96px;
+}
+
+.crawl-col-method {
+  width: 152px;
+}
+
+.crawl-col-type {
+  width: 190px;
+}
+
+.crawl-col-size {
+  width: 90px;
+}
+
+.crawl-col-error {
+  width: 210px;
+}
+
+.crawl-col-time {
+  width: 170px;
 }
 
 .keyword-table {
@@ -827,7 +876,8 @@ td small {
 }
 
 .badge.skipped,
-.badge.draft {
+.badge.draft,
+.badge.metadata_only {
   background: #e5e7eb;
   color: #374151;
 }

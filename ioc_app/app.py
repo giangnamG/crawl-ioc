@@ -58,6 +58,17 @@ def create_app(start_worker: bool = False) -> Flask:
         side = max(8, (size - 3) // 2)
         return f"{text[:side]}...{text[-side:]}"
 
+    @app.template_filter("bytes_label")
+    def bytes_label(value: int | None) -> str:
+        if value is None:
+            return ""
+        size = float(value)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+            size /= 1024
+        return ""
+
     @app.get("/")
     def dashboard():
         with connect() as conn:
@@ -70,7 +81,10 @@ def create_app(start_worker: bool = False) -> Flask:
                     conn, "SELECT COUNT(*) FROM urls WHERE review_status = 'pending_review'"
                 ),
                 "approved_urls": scalar(conn, "SELECT COUNT(*) FROM urls WHERE review_status = 'approved'"),
-                "crawled_urls": scalar(conn, "SELECT COUNT(*) FROM urls WHERE crawl_status = 'crawled'"),
+                "crawled_urls": scalar(
+                    conn,
+                    "SELECT COUNT(*) FROM urls WHERE crawl_status IN ('crawled', 'metadata_only')",
+                ),
                 "iocs": scalar(conn, "SELECT COUNT(*) FROM iocs"),
                 "domains": scalar(conn, "SELECT COUNT(*) FROM domains"),
             }

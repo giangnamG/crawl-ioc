@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import traceback
+import urllib.parse
 from sqlite3 import Connection
 
 from .browser import BrowserClient
@@ -12,6 +14,48 @@ from .normalizers import get_domain, normalize_domain, normalize_url
 
 class PausedJob(Exception):
     """Raised when a queued job has been paused before execution."""
+
+
+TERMINAL_CRAWL_STATUSES = {"crawled", "metadata_only"}
+
+HTTP_TEXT_EXTENSIONS = {
+    ".atom",
+    ".css",
+    ".csv",
+    ".js",
+    ".json",
+    ".map",
+    ".mjs",
+    ".rss",
+    ".svg",
+    ".tsv",
+    ".txt",
+    ".xml",
+}
+
+HTTP_BINARY_EXTENSIONS = {
+    ".7z",
+    ".avif",
+    ".bmp",
+    ".eot",
+    ".gif",
+    ".gz",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".mp3",
+    ".mp4",
+    ".pdf",
+    ".png",
+    ".rar",
+    ".tar",
+    ".ttf",
+    ".webm",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".zip",
+}
 
 
 def enqueue_job(
@@ -442,6 +486,33 @@ def process_search_query(
         raise
 
 
+def classify_crawl_strategy(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    path = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+    filename = path.rsplit("/", 1)[-1]
+    extension = f".{filename.rsplit('.', 1)[-1]}" if "." in filename else ""
+
+    if extension in HTTP_TEXT_EXTENSIONS:
+        return "http_text"
+    if extension in HTTP_BINARY_EXTENSIONS:
+        return "http_binary_metadata"
+    if path.endswith(("/feed", "/feed/", "/wp-json", "/wp-json/", "/robots.txt")):
+        return "http_text"
+    if "/feed/" in path or "/wp-json/" in path or path.endswith("sitemap.xml"):
+        return "http_text"
+    if "feed=" in query or "rest_route=" in query:
+        return "http_text"
+    return "cloak_browser"
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def process_crawl_url(
     conn: Connection,
     url_id: int,
@@ -458,29 +529,79 @@ def process_crawl_url(
                 (url_queue_item_id,),
             )
         raise PausedJob(f"URL is waiting for review approval: {target['url_norm']}")
-    if target["crawl_status"] == "crawled":
+    if target["crawl_status"] in TERMINAL_CRAWL_STATUSES:
         return
 
-    conn.execute("UPDATE urls SET crawl_status = 'crawling' WHERE id = ?", (url_id,))
-    conn.commit()
-    browser = BrowserClient()
-    try:
-        result = browser.fetch_url(target["url_norm"])
-    except Exception:
-        conn.execute("UPDATE urls SET crawl_status = 'failed' WHERE id = ?", (url_id,))
-        raise
     conn.execute(
         """
         UPDATE urls
-        SET crawl_status = 'crawled',
+        SET crawl_status = 'crawling',
+            crawl_error = NULL
+        WHERE id = ?
+        """,
+        (url_id,),
+    )
+    conn.commit()
+    browser = BrowserClient()
+    strategy = classify_crawl_strategy(target["url_norm"])
+    try:
+        if strategy == "http_text":
+            result = browser.fetch_text_resource(target["url_norm"])
+        elif strategy == "http_binary_metadata":
+            result = browser.fetch_binary_metadata(target["url_norm"])
+        else:
+            try:
+                result = browser.fetch_url(target["url_norm"])
+            except Exception as exc:
+                if not env_bool("CRAWL_CLOAK_HTTP_FALLBACK", True):
+                    raise
+                result = browser.fetch_text_resource(
+                    target["url_norm"],
+                    fetch_method="http_text_fallback",
+                )
+                result.error = f"CloakBrowser failed; HTTP text fallback used: {exc}"
+    except Exception:
+        error_text = traceback.format_exc(limit=5)
+        conn.execute(
+            """
+            UPDATE urls
+            SET crawl_status = 'failed',
+                crawl_error = ?
+            WHERE id = ?
+            """,
+            (error_text, url_id),
+        )
+        raise
+    next_crawl_status = "crawled" if result.is_text else "metadata_only"
+    conn.execute(
+        """
+        UPDATE urls
+        SET crawl_status = ?,
             final_url = ?,
             status_code = ?,
+            content_type = ?,
+            content_length = ?,
+            fetch_method = ?,
+            crawl_error = ?,
             html = ?,
             crawled_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        (result.final_url, result.status_code, result.html, url_id),
+        (
+            next_crawl_status,
+            result.final_url,
+            result.status_code,
+            result.content_type,
+            result.content_length,
+            result.fetch_method,
+            result.error,
+            result.html if result.is_text else "",
+            url_id,
+        ),
     )
+
+    if not result.is_text:
+        return
 
     rules = conn.execute(
         "SELECT * FROM extraction_rules WHERE enabled = 1 ORDER BY priority, id"
@@ -812,7 +933,7 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
         enqueue_url_to_queue(conn, queue_id, url_id)
         return True
 
-    if target["crawl_status"] != "crawled":
+    if target["crawl_status"] not in TERMINAL_CRAWL_STATUSES:
         enqueue_job(conn, "crawl_url", {"url_id": url_id}, f"crawl:{url_id}")
     return True
 
