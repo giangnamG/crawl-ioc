@@ -9,7 +9,7 @@ from flask import Flask, flash, redirect, render_template, request, url_for
 
 from .db import connect, db_path, init_db
 from .extractor import test_rule, validate_rule
-from .normalizers import get_domain, normalize_url
+from .normalizers import get_domain, is_media_asset_url, normalize_url
 from .worker import (
     approve_url_and_enqueue,
     enqueue_job,
@@ -119,12 +119,12 @@ def create_app(start_worker: bool = False) -> Flask:
                     if not queue:
                         flash("URL queue is required.", "error")
                     else:
-                        added, skipped = add_urls_to_queue(
+                        added, requeued, skipped = add_urls_to_queue(
                             conn, queue_id, request.form.get("targets", "")
                         )
                         flash(
-                            f"Added {added} URL/domain targets to queue '{queue['name']}'. Skipped {skipped}. Start the queue when ready.",
-                            "success" if added else "error",
+                            f"Added {added} URL/domain targets and requeued {requeued} existing targets in queue '{queue['name']}'. Skipped {skipped}. Start the queue when ready.",
+                            "success" if added or requeued else "error",
                         )
                         return redirect(url_for("queues", queue_id=queue_id))
 
@@ -215,6 +215,12 @@ def create_app(start_worker: bool = False) -> Flask:
                 flash("Bind this Keyword Search Queue to a specific URL Crawl Queue before starting it.", "error")
                 return redirect(url_for("queues", queue_id=queue_id))
             jobs_started, items_started = start_queue_work(conn, queue_id)
+        if queue["queue_type"] == "url_crawl" and jobs_started == 0 and items_started == 0:
+            flash(
+                f"No approved URL/domain items are ready in queue '{queue['name']}'. Approve items in Review first, then start the queue again.",
+                "error",
+            )
+            return redirect(url_for("queues", queue_id=queue_id))
         flash(
             f"Started queue '{queue['name']}'. Requeued {jobs_started} jobs and {items_started} items.",
             "success",
@@ -239,6 +245,19 @@ def create_app(start_worker: bool = False) -> Flask:
     @app.post("/queues/<int:queue_id>/resume")
     def resume_queue(queue_id: int):
         return start_queue(queue_id)
+
+    @app.post("/url-queue-items/<int:item_id>/delete")
+    def delete_url_queue_item_route(item_id: int):
+        with connect() as conn:
+            deleted, queue_id, job_count, error = delete_url_queue_item(conn, item_id)
+        if not deleted:
+            flash(error, "error")
+            return redirect(request.referrer or url_for("queues"))
+        flash(
+            f"Removed URL item #{item_id} from queue. Removed {job_count} crawl jobs. URL/domain/IOC records were kept.",
+            "success",
+        )
+        return redirect(url_for("queues", queue_id=queue_id))
 
     @app.route("/keywords", methods=["GET", "POST"])
     def keywords():
@@ -1342,7 +1361,7 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
                 finished_at = NULL,
                 error = NULL
             WHERE queue_id = ?
-              AND status IN ('paused', 'failed')
+              AND status IN ('pending_review', 'pending', 'paused', 'failed')
               AND EXISTS (
                 SELECT 1 FROM urls u
                 WHERE u.id = url_queue_items.url_id
@@ -1388,6 +1407,8 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
             """,
             (queue_id,),
         ).rowcount
+        if jobs_started == 0 and url_count == 0:
+            refresh_queue_status(conn, queue_id)
     return max(jobs_started, 0), max(query_count, 0) + max(url_count, 0)
 
 
@@ -1430,12 +1451,81 @@ def stop_queue_work(conn, queue_id: int) -> tuple[int, int, int]:
     return max(jobs_paused, 0), max(query_count, 0) + max(url_count, 0), running_jobs
 
 
-def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int]:
+def crawl_job_dedupe_key(queue_id: int, url_id: int) -> str:
+    return f"queue:{queue_id}:crawl:{url_id}"
+
+
+def reset_url_for_manual_rerun(conn, url_id: int) -> None:
+    conn.execute(
+        """
+        UPDATE urls
+        SET crawl_status = 'not_crawled',
+            final_url = NULL,
+            status_code = NULL,
+            content_type = NULL,
+            content_length = NULL,
+            fetch_method = NULL,
+            crawl_error = NULL,
+            html = NULL,
+            crawled_at = NULL
+        WHERE id = ?
+          AND crawl_status != 'crawling'
+        """,
+        (url_id,),
+    )
+
+
+def requeue_url_queue_item(conn, queue_id: int, url_id: int, queue_item_id: int) -> bool:
+    row = conn.execute(
+        "SELECT status FROM url_queue_items WHERE id = ?",
+        (queue_item_id,),
+    ).fetchone()
+    if not row or row["status"] == "running":
+        return False
+
+    running_job = conn.execute(
+        """
+        SELECT id
+        FROM jobs
+        WHERE type = 'crawl_url'
+          AND dedupe_key = ?
+          AND status = 'running'
+        """,
+        (crawl_job_dedupe_key(queue_id, url_id),),
+    ).fetchone()
+    if running_job:
+        return False
+
+    reset_url_for_manual_rerun(conn, url_id)
+    conn.execute(
+        """
+        UPDATE url_queue_items
+        SET status = 'paused',
+            error = NULL,
+            started_at = NULL,
+            finished_at = NULL
+        WHERE id = ?
+        """,
+        (queue_item_id,),
+    )
+    enqueue_job(
+        conn,
+        "crawl_url",
+        {"url_id": url_id, "url_queue_item_id": queue_item_id},
+        crawl_job_dedupe_key(queue_id, url_id),
+        queue_id=queue_id,
+        initial_status="paused",
+    )
+    return True
+
+
+def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int, int]:
     added = 0
+    requeued = 0
     skipped = 0
     for item in parse_lines(raw_targets):
         url_norm = normalize_url(item)
-        if not url_norm:
+        if not url_norm or is_media_asset_url(url_norm):
             skipped += 1
             continue
         domain = get_domain(url_norm)
@@ -1450,6 +1540,21 @@ def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int]:
             "UPDATE domains SET review_status = 'approved' WHERE domain = ? AND review_status != 'rejected'",
             (domain,),
         )
+        existing_item = conn.execute(
+            """
+            SELECT id
+            FROM url_queue_items
+            WHERE queue_id = ? AND url_id = ?
+            """,
+            (queue_id, url_id),
+        ).fetchone()
+        if existing_item:
+            if requeue_url_queue_item(conn, queue_id, url_id, int(existing_item["id"])):
+                requeued += 1
+            else:
+                skipped += 1
+            continue
+
         before = conn.total_changes
         conn.execute(
             """
@@ -1468,18 +1573,75 @@ def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int]:
         ).fetchone()
         if conn.total_changes > before:
             added += 1
+            if item_row:
+                requeue_url_queue_item(conn, queue_id, url_id, int(item_row["id"]))
         else:
             skipped += 1
-        if item_row:
-            enqueue_job(
-                conn,
-                "crawl_url",
-                {"url_id": url_id, "url_queue_item_id": int(item_row["id"])},
-                f"queue:{queue_id}:crawl:{url_id}",
-                queue_id=queue_id,
-                initial_status="paused",
-            )
-    return added, skipped
+    refresh_queue_status(conn, queue_id)
+    return added, requeued, skipped
+
+
+def delete_url_queue_item(conn, item_id: int) -> tuple[bool, int | None, int, str]:
+    item = conn.execute(
+        """
+        SELECT qi.*, u.url_norm
+        FROM url_queue_items qi
+        JOIN urls u ON u.id = qi.url_id
+        WHERE qi.id = ?
+        """,
+        (item_id,),
+    ).fetchone()
+    if not item:
+        return False, None, 0, "URL queue item not found."
+    queue_id = int(item["queue_id"])
+    url_id = int(item["url_id"])
+    if item["status"] == "running":
+        return (
+            False,
+            queue_id,
+            0,
+            "Cannot remove this URL item while it is running. Stop the queue and wait for the current crawl job to finish.",
+        )
+
+    dedupe_key = crawl_job_dedupe_key(queue_id, url_id)
+    running_job = conn.execute(
+        """
+        SELECT id
+        FROM jobs
+        WHERE type = 'crawl_url'
+          AND dedupe_key = ?
+          AND status = 'running'
+        """,
+        (dedupe_key,),
+    ).fetchone()
+    if running_job:
+        return (
+            False,
+            queue_id,
+            0,
+            "Cannot remove this URL item while its crawl job is running. Stop the queue and wait for the current job to finish.",
+        )
+
+    conn.execute(
+        """
+        UPDATE url_queue_items
+        SET source_url_queue_item_id = NULL
+        WHERE source_url_queue_item_id = ?
+        """,
+        (item_id,),
+    )
+    job_count = conn.execute(
+        """
+        DELETE FROM jobs
+        WHERE type = 'crawl_url'
+          AND dedupe_key = ?
+          AND status != 'running'
+        """,
+        (dedupe_key,),
+    ).rowcount
+    conn.execute("DELETE FROM url_queue_items WHERE id = ?", (item_id,))
+    refresh_queue_status(conn, queue_id)
+    return True, queue_id, max(job_count, 0), ""
 
 
 def upsert_search_queue_item(
@@ -1753,7 +1915,7 @@ def query_review_urls(conn, status: str, q: str):
         where.append("(u.url_norm LIKE ? OR u.domain LIKE ?)")
         params.extend([f"%{q}%", f"%{q}%"])
     where_sql = "WHERE " + " AND ".join(where) if where else ""
-    return conn.execute(
+    rows = conn.execute(
         f"""
         SELECT u.*,
                GROUP_CONCAT(DISTINCT ds.source_type) AS domain_sources,
@@ -1768,10 +1930,11 @@ def query_review_urls(conn, status: str, q: str):
         {where_sql}
         GROUP BY u.id
         ORDER BY u.created_at DESC
-        LIMIT 500
+        LIMIT 2000
         """,
         params,
     ).fetchall()
+    return [row for row in rows if not is_media_asset_url(row["url_norm"])][:500]
 
 
 def query_review_domains(conn, status: str, q: str):

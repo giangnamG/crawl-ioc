@@ -270,6 +270,7 @@
                 <th>Source Queue</th>
                 <th>Crawl Status</th>
                 <th>Error</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -288,9 +289,18 @@
                   </td>
                   <td><span class="badge {{ item.crawl_status }}">{{ item.crawl_status|status_label }}</span></td>
                   <td><code class="truncate-line" title="{{ item.error or '' }}">{{ item.error or "" }}</code></td>
+                  <td class="cell-actions">
+                    {% if item.status == "running" %}
+                      <span class="muted">Running</span>
+                    {% else %}
+                      <form method="post" action="/url-queue-items/{{ item.id }}/delete">
+                        <button class="button small danger" type="submit">Remove</button>
+                      </form>
+                    {% endif %}
+                  </td>
                 </tr>
               {% else %}
-                <tr><td colspan="7" class="empty">No URL/domain items in this queue.</td></tr>
+                <tr><td colspan="8" class="empty">No URL/domain items in this queue.</td></tr>
               {% endfor %}
             </tbody>
           </table>

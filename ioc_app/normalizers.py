@@ -3,6 +3,37 @@ import ipaddress
 from urllib.parse import urlsplit, urlunsplit
 
 
+MEDIA_ASSET_EXTENSIONS = {
+    ".3g2",
+    ".3gp",
+    ".apng",
+    ".av1",
+    ".avif",
+    ".avi",
+    ".bmp",
+    ".flv",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".ogv",
+    ".png",
+    ".svg",
+    ".tif",
+    ".tiff",
+    ".webm",
+    ".webp",
+    ".wmv",
+}
+
 TRACKING_PARAMS = {
     "fbclid",
     "gclid",
@@ -126,6 +157,17 @@ def normalize_url(value: str) -> str | None:
     query = parts.query
     path = parts.path
     return urlunsplit((parts.scheme.lower(), netloc, path, query, ""))
+
+
+def is_media_asset_url(value: str) -> bool:
+    if not value:
+        return False
+    path = (urlsplit(value if "://" in value else f"https://{value}").path or "").lower()
+    filename = path.rsplit("/", 1)[-1]
+    if "." not in filename:
+        return False
+    extension = f".{filename.rsplit('.', 1)[-1]}"
+    return extension in MEDIA_ASSET_EXTENSIONS
 
 
 def get_domain(value: str) -> str | None:

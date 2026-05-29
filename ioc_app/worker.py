@@ -9,7 +9,7 @@ from sqlite3 import Connection
 from .browser import BrowserClient
 from .db import connect
 from .extractor import extract_iocs_by_rules
-from .normalizers import get_domain, normalize_domain, normalize_url
+from .normalizers import get_domain, is_media_asset_url, normalize_domain, normalize_url
 
 
 class PausedJob(Exception):
@@ -415,6 +415,21 @@ def process_search_query(
             if not domain:
                 continue
 
+            if is_media_asset_url(url_norm):
+                upsert_domain(conn, domain, "google_search")
+                upsert_domain_source(
+                    conn,
+                    domain=domain,
+                    source_type="google_search",
+                    dedupe_key=f"domain:google:{effective_queue_id or 'global'}:{search_query_id}:{item.page_no}:{item.rank}:{domain}",
+                    queue_id=effective_queue_id,
+                    keyword_id=search_query["keyword_id"],
+                    search_query_id=search_query_id,
+                    rank=item.rank,
+                    page_no=item.page_no,
+                )
+                continue
+
             url_id = upsert_url(conn, item.url, url_norm, domain, "google_search")
             saved_urls += 1
             upsert_domain(conn, domain, "google_search")
@@ -669,6 +684,17 @@ def process_crawl_url(
             if discovered_url:
                 discovered_domain = get_domain(discovered_url)
                 if discovered_domain:
+                    if is_media_asset_url(discovered_url):
+                        upsert_domain(conn, discovered_domain, "extracted_from_crawl")
+                        upsert_domain_source(
+                            conn,
+                            domain=discovered_domain,
+                            source_type="extracted_from_crawl",
+                            dedupe_key=f"domain:crawl-media:{queue_id or 'global'}:{url_id}:{discovered_domain}:{discovered_url}",
+                            queue_id=queue_id,
+                            source_url_id=url_id,
+                        )
+                        continue
                     discovered_url_id = upsert_url(
                         conn, discovered_url, discovered_url, discovered_domain, "extracted_from_crawl"
                     )
@@ -784,6 +810,8 @@ def enqueue_url_to_queue(
     ).fetchone()
     target = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
     if not queue or not target:
+        return None
+    if is_media_asset_url(target["url_norm"]):
         return None
 
     if target["review_status"] == "approved":
@@ -917,6 +945,12 @@ def upsert_ioc(conn: Connection, ioc_type: str, value_raw: str, value_norm: str)
 def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None = None) -> bool:
     target = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
     if not target:
+        return False
+    if is_media_asset_url(target["url_norm"]):
+        conn.execute(
+            "UPDATE urls SET review_status = 'ignored_media' WHERE id = ?",
+            (url_id,),
+        )
         return False
     if target["review_status"] != "pending_review":
         return False
