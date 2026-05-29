@@ -7,7 +7,7 @@ import time
 
 from flask import Flask, flash, redirect, render_template, request, url_for
 
-from .db import connect, db_path, init_db
+from .db import connect, db_path, init_db, is_url_whitelisted
 from .extractor import test_rule, validate_rule
 from .normalizers import get_domain, is_media_asset_url, normalize_url
 from .worker import (
@@ -15,6 +15,7 @@ from .worker import (
     enqueue_job,
     refresh_keyword_status,
     refresh_queue_status,
+    remove_url_from_queue_items,
     reject_domain,
     reject_url,
     run_all,
@@ -95,6 +96,75 @@ def create_app(start_worker: bool = False) -> Flask:
                 "SELECT * FROM iocs ORDER BY id DESC LIMIT 8"
             ).fetchall()
         return render_template("dashboard.html", counts=counts, recent_jobs=recent_jobs, recent_iocs=recent_iocs)
+
+    @app.route("/whitelist", methods=["GET", "POST"])
+    def whitelist():
+        with connect() as conn:
+            if request.method == "POST":
+                raw_urls = request.form.get("urls", "")
+                note = request.form.get("note", "").strip() or None
+                added = 0
+                skipped = 0
+                removed_items = 0
+                removed_jobs = 0
+                ignored_urls = 0
+                for item in parse_lines(raw_urls):
+                    url_norm = normalize_url(item)
+                    if not url_norm:
+                        skipped += 1
+                        continue
+                    before = conn.total_changes
+                    conn.execute(
+                        """
+                        INSERT INTO whitelist_urls(url_raw, url_norm, note, enabled)
+                        VALUES (?, ?, ?, 1)
+                        ON CONFLICT(url_norm) DO UPDATE SET
+                            url_raw = excluded.url_raw,
+                            note = COALESCE(excluded.note, whitelist_urls.note),
+                            enabled = 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (item, url_norm, note),
+                    )
+                    if conn.total_changes > before:
+                        added += 1
+                    cleanup = apply_url_whitelist(conn, url_norm)
+                    ignored_urls += cleanup["ignored_urls"]
+                    removed_items += cleanup["removed_items"]
+                    removed_jobs += cleanup["removed_jobs"]
+                flash(
+                    f"Whitelist updated. Added/updated {added} URLs, skipped {skipped}. Ignored {ignored_urls} existing URL rows, removed {removed_items} queue items and {removed_jobs} jobs.",
+                    "success" if added or ignored_urls or removed_items else "error",
+                )
+                return redirect(url_for("whitelist"))
+
+            rows = conn.execute(
+                """
+                SELECT wu.*,
+                       u.id AS url_id,
+                       u.review_status,
+                       u.crawl_status,
+                       COUNT(DISTINCT qi.id) AS queue_item_count
+                FROM whitelist_urls wu
+                LEFT JOIN urls u ON u.url_norm = wu.url_norm
+                LEFT JOIN url_queue_items qi ON qi.url_id = u.id
+                GROUP BY wu.id
+                ORDER BY wu.enabled DESC, wu.id DESC
+                LIMIT 500
+                """
+            ).fetchall()
+        return render_template("whitelist.html", rows=rows)
+
+    @app.post("/whitelist/<int:item_id>/delete")
+    def delete_whitelist_url(item_id: int):
+        with connect() as conn:
+            row = conn.execute("SELECT url_norm FROM whitelist_urls WHERE id = ?", (item_id,)).fetchone()
+            if not row:
+                flash("Whitelist URL not found.", "error")
+            else:
+                conn.execute("DELETE FROM whitelist_urls WHERE id = ?", (item_id,))
+                flash(f"Removed whitelist URL: {row['url_norm']}", "success")
+        return redirect(url_for("whitelist"))
 
     @app.route("/queues", methods=["GET", "POST"])
     def queues():
@@ -621,6 +691,12 @@ def create_app(start_worker: bool = False) -> Flask:
                     FROM urls
                     WHERE domain = ?
                       AND review_status = 'pending_review'
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM whitelist_urls wu
+                        WHERE wu.url_norm = urls.url_norm
+                          AND wu.enabled = 1
+                      )
                     """,
                     (domain,),
                 ).fetchall()
@@ -740,6 +816,7 @@ NAV = [
     ("Queues", "queues"),
     ("Keywords", "keywords"),
     ("Search Dorks", "dorks"),
+    ("Whitelist", "whitelist"),
     ("Review", "review"),
     ("Rules", "rules"),
     ("Crawl", "crawl_status"),
@@ -1525,7 +1602,7 @@ def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int, 
     skipped = 0
     for item in parse_lines(raw_targets):
         url_norm = normalize_url(item)
-        if not url_norm or is_media_asset_url(url_norm):
+        if not url_norm or is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm):
             skipped += 1
             continue
         domain = get_domain(url_norm)
@@ -1579,6 +1656,28 @@ def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int, 
             skipped += 1
     refresh_queue_status(conn, queue_id)
     return added, requeued, skipped
+
+
+def apply_url_whitelist(conn, url_norm: str) -> dict[str, int]:
+    row = conn.execute("SELECT id FROM urls WHERE url_norm = ?", (url_norm,)).fetchone()
+    if not row:
+        return {"ignored_urls": 0, "removed_items": 0, "removed_jobs": 0}
+    url_id = int(row["id"])
+    ignored_urls = conn.execute(
+        """
+        UPDATE urls
+        SET review_status = 'ignored_whitelist'
+        WHERE id = ?
+          AND review_status != 'ignored_whitelist'
+        """,
+        (url_id,),
+    ).rowcount
+    removed_items, removed_jobs = remove_url_from_queue_items(conn, url_id)
+    return {
+        "ignored_urls": max(ignored_urls, 0),
+        "removed_items": removed_items,
+        "removed_jobs": removed_jobs,
+    }
 
 
 def delete_url_queue_item(conn, item_id: int) -> tuple[bool, int | None, int, str]:
@@ -1911,6 +2010,17 @@ def query_review_urls(conn, status: str, q: str):
     if status:
         where.append("u.review_status = ?")
         params.append(status)
+    where.append("u.review_status != 'ignored_whitelist'")
+    where.append(
+        """
+        NOT EXISTS (
+          SELECT 1
+          FROM whitelist_urls wu
+          WHERE wu.url_norm = u.url_norm
+            AND wu.enabled = 1
+        )
+        """
+    )
     if q:
         where.append("(u.url_norm LIKE ? OR u.domain LIKE ?)")
         params.extend([f"%{q}%", f"%{q}%"])
@@ -1951,7 +2061,18 @@ def query_review_domains(conn, status: str, q: str):
         f"""
         SELECT d.*,
                GROUP_CONCAT(DISTINCT ds.source_type) AS sources,
-               COUNT(DISTINCT u.id) AS url_count
+               COUNT(
+                 DISTINCT CASE
+                   WHEN u.review_status != 'ignored_whitelist'
+                    AND NOT EXISTS (
+                      SELECT 1
+                      FROM whitelist_urls wu
+                      WHERE wu.url_norm = u.url_norm
+                        AND wu.enabled = 1
+                    )
+                   THEN u.id
+                 END
+               ) AS url_count
         FROM domains d
         LEFT JOIN domain_sources ds ON ds.domain_id = d.id
         LEFT JOIN urls u ON u.domain = d.domain

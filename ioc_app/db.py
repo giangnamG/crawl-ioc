@@ -24,6 +24,21 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def is_url_whitelisted(conn: sqlite3.Connection, url_norm: str) -> bool:
+    return bool(
+        conn.execute(
+            """
+            SELECT 1
+            FROM whitelist_urls
+            WHERE url_norm = ?
+              AND enabled = 1
+            LIMIT 1
+            """,
+            (url_norm,),
+        ).fetchone()
+    )
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
@@ -60,6 +75,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_url_queue_items_queue ON url_queue_items(queue_id, status);
         CREATE INDEX IF NOT EXISTS idx_queue_routes_keyword ON queue_routes(keyword_queue_id);
         CREATE INDEX IF NOT EXISTS idx_queue_routes_url ON queue_routes(url_queue_id);
+        CREATE INDEX IF NOT EXISTS idx_whitelist_urls_enabled ON whitelist_urls(enabled, url_norm);
         """
     )
 
@@ -560,6 +576,16 @@ CREATE TABLE IF NOT EXISTS urls (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS whitelist_urls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  url_raw TEXT NOT NULL,
+  url_norm TEXT NOT NULL UNIQUE,
+  note TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS url_queue_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   queue_id INTEGER NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
@@ -657,5 +683,6 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id);
 CREATE INDEX IF NOT EXISTS idx_urls_review ON urls(review_status);
 CREATE INDEX IF NOT EXISTS idx_urls_crawl ON urls(crawl_status);
 CREATE INDEX IF NOT EXISTS idx_urls_domain ON urls(domain);
+CREATE INDEX IF NOT EXISTS idx_whitelist_urls_norm ON whitelist_urls(url_norm);
 CREATE INDEX IF NOT EXISTS idx_iocs_type ON iocs(type);
 """

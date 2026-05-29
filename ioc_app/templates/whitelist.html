@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+
+{% block title %}Whitelist URLs · IOC Investigator{% endblock %}
+{% block heading %}Whitelist URLs{% endblock %}
+{% block eyebrow %}Queue exclusion rules{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-head">
+      <div class="helper-title">
+        <h2>Add URLs</h2>
+        <span class="helper-tip">
+          <button
+            class="helper-icon"
+            type="button"
+            aria-label="Giải thích whitelist URL"
+            aria-describedby="whitelist-url-help"
+          >?</button>
+          <span class="helper-popover helper-popover-wide" id="whitelist-url-help" role="tooltip">
+            Whitelist dùng URL chính xác sau normalize. Nếu URL collect được trùng whitelist, hệ thống sẽ không đưa URL đó vào URL Review Queue hoặc URL Crawl Queue. URL đã có sẵn sẽ được đánh dấu ignored_whitelist và gỡ khỏi queue/job nếu chưa chạy.
+          </span>
+        </span>
+      </div>
+      <span class="muted">One URL per line. Fragments after # are ignored.</span>
+    </div>
+    <form method="post" class="stacked-form">
+      <label>
+        <span>URLs</span>
+        <textarea name="urls" rows="7" placeholder="https://example.com/blocked-path&#10;https://example.com/tracker?x=1"></textarea>
+      </label>
+      <label>
+        <span>Note</span>
+        <input name="note" placeholder="Reason or source for this whitelist entry">
+      </label>
+      <div class="form-actions">
+        <button class="button primary" type="submit">Add To Whitelist</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Whitelist URL Table</h2>
+      <span class="muted">{{ rows|length }} rows</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Normalized URL</th>
+            <th>Note</th>
+            <th>Status</th>
+            <th>Existing URL</th>
+            <th>Queue Items</th>
+            <th>Created</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td class="cell-id">#{{ row.id }}</td>
+              <td>
+                <a class="truncate-line" href="{{ row.url_norm }}" target="_blank" rel="noreferrer" title="{{ row.url_norm }}">{{ row.url_norm }}</a>
+              </td>
+              <td><span class="truncate-line" title="{{ row.note or '' }}">{{ row.note or "-" }}</span></td>
+              <td>
+                {% if row.enabled %}
+                  <span class="badge done">Enabled</span>
+                {% else %}
+                  <span class="badge paused">Disabled</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if row.url_id %}
+                  <span class="badge {{ row.review_status }}">{{ row.review_status|status_label }}</span>
+                  <span class="badge {{ row.crawl_status }}">{{ row.crawl_status|status_label }}</span>
+                {% else %}
+                  <span class="muted">Not collected</span>
+                {% endif %}
+              </td>
+              <td>{{ row.queue_item_count }}</td>
+              <td>{{ row.created_at }}</td>
+              <td class="cell-actions">
+                <form method="post" action="{{ url_for('delete_whitelist_url', item_id=row.id) }}">
+                  <button class="button small danger" type="submit">Delete</button>
+                </form>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="8" class="empty">No whitelist URLs yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

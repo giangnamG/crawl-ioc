@@ -7,7 +7,7 @@ import urllib.parse
 from sqlite3 import Connection
 
 from .browser import BrowserClient
-from .db import connect
+from .db import connect, is_url_whitelisted
 from .extractor import extract_iocs_by_rules
 from .normalizers import get_domain, is_media_asset_url, normalize_domain, normalize_url
 
@@ -415,7 +415,7 @@ def process_search_query(
             if not domain:
                 continue
 
-            if is_media_asset_url(url_norm):
+            if is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm):
                 upsert_domain(conn, domain, "google_search")
                 upsert_domain_source(
                     conn,
@@ -684,13 +684,13 @@ def process_crawl_url(
             if discovered_url:
                 discovered_domain = get_domain(discovered_url)
                 if discovered_domain:
-                    if is_media_asset_url(discovered_url):
+                    if is_media_asset_url(discovered_url) or is_url_whitelisted(conn, discovered_url):
                         upsert_domain(conn, discovered_domain, "extracted_from_crawl")
                         upsert_domain_source(
                             conn,
                             domain=discovered_domain,
                             source_type="extracted_from_crawl",
-                            dedupe_key=f"domain:crawl-media:{queue_id or 'global'}:{url_id}:{discovered_domain}:{discovered_url}",
+                            dedupe_key=f"domain:crawl-ignored-url:{queue_id or 'global'}:{url_id}:{discovered_domain}:{discovered_url}",
                             queue_id=queue_id,
                             source_url_id=url_id,
                         )
@@ -811,7 +811,7 @@ def enqueue_url_to_queue(
     target = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
     if not queue or not target:
         return None
-    if is_media_asset_url(target["url_norm"]):
+    if is_media_asset_url(target["url_norm"]) or is_url_whitelisted(conn, target["url_norm"]):
         return None
 
     if target["review_status"] == "approved":
@@ -942,15 +942,73 @@ def upsert_ioc(conn: Connection, ioc_type: str, value_raw: str, value_norm: str)
     return int(row["id"])
 
 
+def remove_url_from_queue_items(conn: Connection, url_id: int) -> tuple[int, int]:
+    item_rows = conn.execute(
+        """
+        SELECT id, queue_id, status
+        FROM url_queue_items
+        WHERE url_id = ?
+          AND status != 'running'
+        """,
+        (url_id,),
+    ).fetchall()
+    item_ids = [int(row["id"]) for row in item_rows]
+    affected_queue_ids = {int(row["queue_id"]) for row in item_rows}
+    job_count = 0
+    for row in item_rows:
+        cursor = conn.execute(
+            """
+            DELETE FROM jobs
+            WHERE type = 'crawl_url'
+              AND dedupe_key = ?
+              AND status != 'running'
+            """,
+            (f"queue:{row['queue_id']}:crawl:{url_id}",),
+        )
+        job_count += max(cursor.rowcount, 0)
+    if item_ids:
+        placeholders = ",".join("?" for _ in item_ids)
+        conn.execute(
+            f"""
+            UPDATE url_queue_items
+            SET source_url_queue_item_id = NULL
+            WHERE source_url_queue_item_id IN ({placeholders})
+            """,
+            item_ids,
+        )
+        conn.execute(
+            f"DELETE FROM url_queue_items WHERE id IN ({placeholders})",
+            item_ids,
+        )
+    for queue_id in affected_queue_ids:
+        refresh_queue_status(conn, queue_id)
+    return len(item_ids), job_count
+
+
 def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None = None) -> bool:
     target = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
     if not target:
         return False
-    if is_media_asset_url(target["url_norm"]):
+    whitelisted = is_url_whitelisted(conn, target["url_norm"])
+    if is_media_asset_url(target["url_norm"]) or whitelisted:
         conn.execute(
-            "UPDATE urls SET review_status = 'ignored_media' WHERE id = ?",
-            (url_id,),
+            """
+            UPDATE urls
+            SET review_status = CASE
+                WHEN ? = 1 THEN 'ignored_whitelist'
+                ELSE 'ignored_media'
+            END
+            WHERE id = ?
+            """,
+            (1 if whitelisted else 0, url_id),
         )
+        if whitelisted:
+            remove_url_from_queue_items(conn, url_id)
+        else:
+            conn.execute(
+                "UPDATE url_queue_items SET status = 'paused' WHERE url_id = ? AND status IN ('pending', 'running')",
+                (url_id,),
+            )
         return False
     if target["review_status"] != "pending_review":
         return False
@@ -1041,6 +1099,12 @@ def reject_domain(conn: Connection, domain: str) -> bool:
         SET review_status = 'rejected'
         WHERE domain = ?
           AND review_status = 'pending_review'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM whitelist_urls wu
+            WHERE wu.url_norm = urls.url_norm
+              AND wu.enabled = 1
+          )
         """,
         (domain,),
     )
