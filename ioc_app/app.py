@@ -655,6 +655,30 @@ def create_app(start_worker: bool = False) -> Flask:
         )
         return redirect(request.referrer or url_for("review"))
 
+    @app.post("/urls/bulk")
+    def bulk_review_urls():
+        action = request.form.get("bulk_action", "")
+        url_ids = unique_ints(request.form.getlist("url_ids"))
+        if not url_ids:
+            flash("Select at least one URL row.", "error")
+            return redirect(request.referrer or url_for("review"))
+        changed = 0
+        with connect() as conn:
+            if action == "approve":
+                for url_id in url_ids:
+                    if approve_url_and_enqueue(conn, url_id):
+                        changed += 1
+            elif action == "reject":
+                for url_id in url_ids:
+                    if reject_url(conn, url_id):
+                        changed += 1
+            else:
+                flash("Bulk URL action is invalid.", "error")
+                return redirect(request.referrer or url_for("review"))
+        label = "approved" if action == "approve" else "rejected"
+        flash(f"Bulk URL action completed: {changed} of {len(url_ids)} selected URLs {label}.", "success")
+        return redirect(request.referrer or url_for("review"))
+
     @app.post("/domains/reject")
     def reject_domain_route():
         domain = request.form.get("domain", "")
@@ -670,45 +694,48 @@ def create_app(start_worker: bool = False) -> Flask:
     def approve_domain_route():
         domain = request.form.get("domain", "")
         with connect() as conn:
-            domain_row = conn.execute(
-                "SELECT review_status FROM domains WHERE domain = ?", (domain,)
-            ).fetchone()
-            if not domain_row or domain_row["review_status"] != "pending_review":
-                changed = False
-            else:
-                conn.execute(
-                    """
-                    UPDATE domains
-                    SET review_status = 'approved'
-                    WHERE domain = ?
-                      AND review_status = 'pending_review'
-                    """,
-                    (domain,),
-                )
-                pending_urls = conn.execute(
-                    """
-                    SELECT id
-                    FROM urls
-                    WHERE domain = ?
-                      AND review_status = 'pending_review'
-                      AND NOT EXISTS (
-                        SELECT 1
-                        FROM whitelist_urls wu
-                        WHERE wu.url_norm = urls.url_norm
-                          AND wu.enabled = 1
-                      )
-                    """,
-                    (domain,),
-                ).fetchall()
-                for row in pending_urls:
-                    approve_url_and_enqueue(conn, int(row["id"]))
-                changed = True
+            changed, url_count = approve_domain_and_enqueue(conn, domain)
         flash(
-            f"Domain approved and pending URL crawl jobs queued: {domain}"
+            f"Domain approved and queued {url_count} pending URLs: {domain}"
             if changed
             else f"Domain is already reviewed and is read-only: {domain}",
             "success" if changed else "error",
         )
+        return redirect(request.referrer or url_for("review"))
+
+    @app.post("/domains/bulk")
+    def bulk_review_domains():
+        action = request.form.get("bulk_action", "")
+        domains = unique_strings(request.form.getlist("domains"))
+        if not domains:
+            flash("Select at least one domain row.", "error")
+            return redirect(request.referrer or url_for("review"))
+        changed = 0
+        affected_urls = 0
+        with connect() as conn:
+            if action == "approve":
+                for domain in domains:
+                    ok, url_count = approve_domain_and_enqueue(conn, domain)
+                    if ok:
+                        changed += 1
+                        affected_urls += url_count
+            elif action == "reject":
+                for domain in domains:
+                    if reject_domain(conn, domain):
+                        changed += 1
+            else:
+                flash("Bulk domain action is invalid.", "error")
+                return redirect(request.referrer or url_for("review"))
+        if action == "approve":
+            flash(
+                f"Bulk domain action completed: {changed} of {len(domains)} domains approved, {affected_urls} pending URLs queued.",
+                "success",
+            )
+        else:
+            flash(
+                f"Bulk domain action completed: {changed} of {len(domains)} domains rejected.",
+                "success",
+            )
         return redirect(request.referrer or url_for("review"))
 
     @app.get("/crawl")
@@ -849,6 +876,33 @@ def parse_lines(value: str) -> list[str]:
         if item and item not in seen:
             seen.add(item)
             rows.append(item)
+    return rows
+
+
+def unique_ints(values: list[str]) -> list[int]:
+    seen = set()
+    rows = []
+    for value in values:
+        try:
+            item = int(value)
+        except (TypeError, ValueError):
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        rows.append(item)
+    return rows
+
+
+def unique_strings(values: list[str]) -> list[str]:
+    seen = set()
+    rows = []
+    for value in values:
+        item = (value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        rows.append(item)
     return rows
 
 
@@ -1678,6 +1732,43 @@ def apply_url_whitelist(conn, url_norm: str) -> dict[str, int]:
         "removed_items": removed_items,
         "removed_jobs": removed_jobs,
     }
+
+
+def approve_domain_and_enqueue(conn, domain: str) -> tuple[bool, int]:
+    domain_row = conn.execute(
+        "SELECT review_status FROM domains WHERE domain = ?", (domain,)
+    ).fetchone()
+    if not domain_row or domain_row["review_status"] != "pending_review":
+        return False, 0
+    conn.execute(
+        """
+        UPDATE domains
+        SET review_status = 'approved'
+        WHERE domain = ?
+          AND review_status = 'pending_review'
+        """,
+        (domain,),
+    )
+    pending_urls = conn.execute(
+        """
+        SELECT id
+        FROM urls
+        WHERE domain = ?
+          AND review_status = 'pending_review'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM whitelist_urls wu
+            WHERE wu.url_norm = urls.url_norm
+              AND wu.enabled = 1
+          )
+        """,
+        (domain,),
+    ).fetchall()
+    queued_count = 0
+    for row in pending_urls:
+        if approve_url_and_enqueue(conn, int(row["id"])):
+            queued_count += 1
+    return True, queued_count
 
 
 def delete_url_queue_item(conn, item_id: int) -> tuple[bool, int | None, int, str]:

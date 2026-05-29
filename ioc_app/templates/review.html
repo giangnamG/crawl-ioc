@@ -57,9 +57,40 @@
         >{{ tab.label }}</a>
       {% endfor %}
     </nav>
+    {% if url_status == "pending_review" %}
+      <form id="bulk-url-review-form" method="post" action="{{ url_for('bulk_review_urls') }}" class="bulk-action-bar">
+        <span class="muted">Select URL rows, then apply one action.</span>
+        <button class="button small primary" type="submit" name="bulk_action" value="approve">Approve Selected</button>
+        <button class="button small" type="submit" name="bulk_action" value="reject">Reject Selected</button>
+      </form>
+      <div class="bulk-pattern-bar" data-pattern-scope="url">
+        <label>
+          <span>Auto tick field</span>
+          <select data-pattern-field>
+            <option value="all">All visible text</option>
+            <option value="domain">Domain</option>
+            <option value="url">URL</option>
+            <option value="source">Source</option>
+            <option value="query">Query</option>
+          </select>
+        </label>
+        <label class="grow">
+          <span>Pattern</span>
+          <input data-pattern-input placeholder="88i.co.uk or ^https://.*casino">
+        </label>
+        <button class="button small" type="button" data-pattern-apply>Auto Tick</button>
+        <button class="button small" type="button" data-pattern-clear>Clear Ticks</button>
+        <span class="muted" data-pattern-feedback></span>
+      </div>
+    {% else %}
+      <div class="bulk-action-bar">
+        <span class="muted">This tab is read-only. Bulk actions are available only in Need Action.</span>
+      </div>
+    {% endif %}
     <div class="table-wrap scroll-y review-url-wrap">
       <table class="review-table url-review-table">
         <colgroup>
+          <col class="review-col-select">
           <col class="review-url-col-id">
           <col class="review-url-col-domain">
           <col class="review-url-col-source">
@@ -71,6 +102,9 @@
         </colgroup>
         <thead>
           <tr>
+            <th class="select-col">
+              <input class="bulk-toggle" type="checkbox" data-bulk-target="url_ids" aria-label="Select all visible URL rows" {% if url_status != "pending_review" %}disabled{% endif %}>
+            </th>
             <th>ID</th>
             <th>Domain</th>
             <th>Source</th>
@@ -83,7 +117,19 @@
         </thead>
         <tbody>
           {% for row in urls %}
-            <tr>
+            <tr
+              data-pattern-domain="{{ row.domain }}"
+              data-pattern-url="{{ row.url_norm }}"
+              data-pattern-source="{{ row.domain_sources or '' }}"
+              data-pattern-query="{{ row.queries or '' }}"
+            >
+              <td class="cell-select">
+                {% if row.review_status == "pending_review" %}
+                  <input type="checkbox" name="url_ids" value="{{ row.id }}" form="bulk-url-review-form" aria-label="Select URL #{{ row.id }}">
+                {% else %}
+                  <span class="readonly-note">-</span>
+                {% endif %}
+              </td>
               <td class="cell-id">#{{ row.id }}</td>
               <td class="cell-domain"><strong title="{{ row.domain }}">{{ row.domain }}</strong></td>
               <td class="cell-tags">
@@ -118,7 +164,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="8" class="empty">No URLs in this tab.</td></tr>
+            <tr><td colspan="9" class="empty">No URLs in this tab.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -152,9 +198,38 @@
         >{{ tab.label }}</a>
       {% endfor %}
     </nav>
+    {% if domain_status == "pending_review" %}
+      <form id="bulk-domain-review-form" method="post" action="{{ url_for('bulk_review_domains') }}" class="bulk-action-bar">
+        <span class="muted">Select domain rows, then apply one action to matching Need Action URLs.</span>
+        <button class="button small primary" type="submit" name="bulk_action" value="approve">Approve Selected</button>
+        <button class="button small danger" type="submit" name="bulk_action" value="reject">Reject Selected</button>
+      </form>
+      <div class="bulk-pattern-bar" data-pattern-scope="domain">
+        <label>
+          <span>Auto tick field</span>
+          <select data-pattern-field>
+            <option value="all">All visible text</option>
+            <option value="domain">Domain</option>
+            <option value="source">Source</option>
+          </select>
+        </label>
+        <label class="grow">
+          <span>Pattern</span>
+          <input data-pattern-input placeholder="88i.co.uk or \\.co\\.uk$">
+        </label>
+        <button class="button small" type="button" data-pattern-apply>Auto Tick</button>
+        <button class="button small" type="button" data-pattern-clear>Clear Ticks</button>
+        <span class="muted" data-pattern-feedback></span>
+      </div>
+    {% else %}
+      <div class="bulk-action-bar">
+        <span class="muted">This tab is read-only. Bulk actions are available only in Need Action.</span>
+      </div>
+    {% endif %}
     <div class="table-wrap compact scroll-y review-domain-wrap">
       <table class="review-table domain-review-table">
         <colgroup>
+          <col class="review-col-select">
           <col class="col-domain-wide">
           <col class="col-source-wide">
           <col class="col-status">
@@ -163,6 +238,9 @@
         </colgroup>
         <thead>
           <tr>
+            <th class="select-col">
+              <input class="bulk-toggle" type="checkbox" data-bulk-target="domains" aria-label="Select all visible domain rows" {% if domain_status != "pending_review" %}disabled{% endif %}>
+            </th>
             <th>Domain</th>
             <th>Sources</th>
             <th>Status</th>
@@ -187,7 +265,17 @@
         </thead>
         <tbody>
           {% for row in domains %}
-            <tr>
+            <tr
+              data-pattern-domain="{{ row.domain }}"
+              data-pattern-source="{{ row.sources or '' }}"
+            >
+              <td class="cell-select">
+                {% if row.review_status == "pending_review" %}
+                  <input type="checkbox" name="domains" value="{{ row.domain }}" form="bulk-domain-review-form" aria-label="Select domain {{ row.domain }}">
+                {% else %}
+                  <span class="readonly-note">-</span>
+                {% endif %}
+              </td>
               <td class="cell-domain"><strong title="{{ row.domain }}">{{ row.domain }}</strong></td>
               <td class="cell-tags">
                 {% for item in (row.sources or "").split(",") if item %}
@@ -214,7 +302,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="5" class="empty">No domains in this tab.</td></tr>
+            <tr><td colspan="6" class="empty">No domains in this tab.</td></tr>
           {% endfor %}
         </tbody>
       </table>
