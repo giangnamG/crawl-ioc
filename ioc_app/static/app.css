@@ -197,6 +197,67 @@ h2 {
   margin-bottom: 12px;
 }
 
+.helper-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.helper-tip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.helper-icon {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: #f8fafc;
+  color: var(--muted);
+  padding: 0;
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 700;
+  cursor: help;
+}
+
+.helper-icon:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.helper-popover {
+  position: absolute;
+  z-index: 20;
+  left: 50%;
+  top: calc(100% + 8px);
+  width: min(320px, calc(100vw - 56px));
+  transform: translateX(-50%);
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #0f172a;
+  color: #f8fafc;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.18);
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.helper-tip:hover .helper-popover,
+.helper-tip:focus-within .helper-popover {
+  opacity: 1;
+  visibility: visible;
+}
+
 .muted,
 small {
   color: var(--muted);
@@ -375,8 +436,86 @@ th {
 }
 
 .queue-table {
-  min-width: 1180px;
+  min-width: 1360px;
   table-layout: fixed;
+}
+
+.queue-management-wrap {
+  overflow: auto;
+  max-width: 100%;
+}
+
+.queue-col-id {
+  width: 58px;
+}
+
+.queue-col-name {
+  width: 150px;
+}
+
+.queue-col-type {
+  width: 132px;
+}
+
+.queue-col-output {
+  width: 190px;
+}
+
+.queue-col-status {
+  width: 112px;
+}
+
+.queue-col-number {
+  width: 70px;
+}
+
+.queue-col-actions {
+  width: 292px;
+}
+
+.queue-table th,
+.queue-table td {
+  vertical-align: middle;
+}
+
+.queue-cell-id,
+.queue-cell-number {
+  text-align: center;
+  white-space: nowrap;
+}
+
+.queue-actions-head,
+.queue-actions-cell {
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  box-shadow: -10px 0 14px rgba(15, 23, 42, 0.06);
+}
+
+.queue-actions-head {
+  background: var(--surface-2);
+  z-index: 4;
+}
+
+.queue-actions-cell {
+  background: var(--surface);
+}
+
+tbody tr:hover .queue-actions-cell {
+  background: #f8fbff;
+}
+
+.queue-table .cell-actions .row-actions {
+  display: grid;
+  grid-template-columns: 86px 72px minmax(110px, 1fr);
+  align-items: center;
+  gap: 6px;
+}
+
+.queue-table .cell-actions .button {
+  min-width: 0;
+  width: 100%;
+  white-space: nowrap;
 }
 
 .queue-detail-wrap {

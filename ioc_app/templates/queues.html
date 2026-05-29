@@ -36,7 +36,20 @@
 
     <section class="panel">
       <div class="panel-head">
-        <h2>Bind Keyword To URL Queue</h2>
+        <div class="helper-title">
+          <h2>Bind Keyword To URL Queue</h2>
+          <span class="helper-tip">
+            <button
+              class="helper-icon"
+              type="button"
+              aria-label="Explain queue binding"
+              aria-describedby="bind-queue-help"
+            >?</button>
+            <span class="helper-popover" id="bind-queue-help" role="tooltip">
+              Select one keyword search queue and one output URL crawl queue. Press Bind Queues to save or update that mapping. After binding, this keyword queue can start, and every Google result it finds will be inserted only into the selected URL queue.
+            </span>
+          </span>
+        </div>
         <span class="muted">Search results from queue_keyword go only to its bound queue_url.</span>
       </div>
       <form method="post" class="stacked-form">
@@ -97,28 +110,42 @@
       <h2>Queue Management</h2>
       <span class="muted">Start, stop, and resume each queue independently.</span>
     </div>
-    <div class="table-wrap">
+    <div class="table-wrap queue-management-wrap">
       <table class="queue-table">
+        <colgroup>
+          <col class="queue-col-id">
+          <col class="queue-col-name">
+          <col class="queue-col-type">
+          <col class="queue-col-output">
+          <col class="queue-col-status">
+          <col class="queue-col-number">
+          <col class="queue-col-number">
+          <col class="queue-col-number">
+          <col class="queue-col-number">
+          <col class="queue-col-number">
+          <col class="queue-col-number">
+          <col class="queue-col-actions">
+        </colgroup>
         <thead>
           <tr>
-            <th>ID</th>
+            <th class="queue-cell-id">ID</th>
             <th>Name</th>
             <th>Type</th>
             <th>Output URL Queue</th>
             <th>Status</th>
-            <th>Items</th>
-            <th>Jobs</th>
-            <th>Pending</th>
-            <th>Running</th>
-            <th>Done</th>
-            <th>Failed</th>
-            <th>Actions</th>
+            <th class="queue-cell-number">Items</th>
+            <th class="queue-cell-number">Jobs</th>
+            <th class="queue-cell-number">Pending</th>
+            <th class="queue-cell-number">Running</th>
+            <th class="queue-cell-number">Done</th>
+            <th class="queue-cell-number">Failed</th>
+            <th class="queue-actions-head">Actions</th>
           </tr>
         </thead>
         <tbody>
           {% for row in rows %}
             <tr>
-              <td class="cell-id">#{{ row.id }}</td>
+              <td class="cell-id queue-cell-id">#{{ row.id }}</td>
               <td class="cell-keyword">
                 <a href="{{ url_for('queues', queue_id=row.id) }}"><strong title="{{ row.name }}">{{ row.name }}</strong></a>
               </td>
@@ -135,13 +162,13 @@
                 {% endif %}
               </td>
               <td><span class="badge {{ row.status }}">{{ row.status|status_label }}</span></td>
-              <td>{{ row.search_query_count if row.queue_type == "keyword_search" else row.url_item_count }}</td>
-              <td>{{ row.job_count }}</td>
-              <td>{{ row.pending_jobs }}</td>
-              <td>{{ row.running_jobs }}</td>
-              <td>{{ row.done_jobs }}</td>
-              <td>{{ row.failed_jobs }}</td>
-              <td class="cell-actions">
+              <td class="queue-cell-number">{{ row.search_query_count if row.queue_type == "keyword_search" else row.url_item_count }}</td>
+              <td class="queue-cell-number">{{ row.job_count }}</td>
+              <td class="queue-cell-number">{{ row.pending_jobs }}</td>
+              <td class="queue-cell-number">{{ row.running_jobs }}</td>
+              <td class="queue-cell-number">{{ row.done_jobs }}</td>
+              <td class="queue-cell-number">{{ row.failed_jobs }}</td>
+              <td class="cell-actions queue-actions-cell">
                 <div class="row-actions">
                   {% if row.status == "running" %}
                     <form method="post" action="{{ url_for('stop_queue', queue_id=row.id) }}">
