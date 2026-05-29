@@ -716,6 +716,16 @@ td small {
   width: 220px;
 }
 
+.readonly-note {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
 .empty {
   color: var(--muted);
   text-align: center;

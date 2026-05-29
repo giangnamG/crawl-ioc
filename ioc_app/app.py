@@ -522,39 +522,71 @@ def create_app(start_worker: bool = False) -> Flask:
     @app.post("/urls/<int:url_id>/approve")
     def approve_url(url_id: int):
         with connect() as conn:
-            approve_url_and_enqueue(conn, url_id)
-        flash("URL approved and crawl job queued if needed.", "success")
+            changed = approve_url_and_enqueue(conn, url_id)
+        flash(
+            "URL approved and crawl job queued if needed." if changed else "URL is already reviewed and is read-only.",
+            "success" if changed else "error",
+        )
         return redirect(request.referrer or url_for("review"))
 
     @app.post("/urls/<int:url_id>/reject")
     def reject_url_route(url_id: int):
         with connect() as conn:
-            reject_url(conn, url_id)
-        flash("URL rejected.", "success")
+            changed = reject_url(conn, url_id)
+        flash(
+            "URL rejected." if changed else "URL is already reviewed and is read-only.",
+            "success" if changed else "error",
+        )
         return redirect(request.referrer or url_for("review"))
 
     @app.post("/domains/reject")
     def reject_domain_route():
         domain = request.form.get("domain", "")
         with connect() as conn:
-            reject_domain(conn, domain)
-        flash(f"Domain rejected: {domain}", "success")
+            changed = reject_domain(conn, domain)
+        flash(
+            f"Domain rejected: {domain}" if changed else f"Domain is already reviewed and is read-only: {domain}",
+            "success" if changed else "error",
+        )
         return redirect(request.referrer or url_for("review"))
 
     @app.post("/domains/approve")
     def approve_domain_route():
         domain = request.form.get("domain", "")
         with connect() as conn:
-            conn.execute("UPDATE domains SET review_status = 'approved' WHERE domain = ?", (domain,))
-            conn.execute(
-                "UPDATE urls SET review_status = 'approved' WHERE domain = ? AND review_status != 'rejected'",
-                (domain,),
-            )
-            for row in conn.execute(
-                "SELECT id FROM urls WHERE domain = ? AND review_status = 'approved'", (domain,)
-            ).fetchall():
-                approve_url_and_enqueue(conn, int(row["id"]))
-        flash(f"Domain approved and URL crawl jobs queued: {domain}", "success")
+            domain_row = conn.execute(
+                "SELECT review_status FROM domains WHERE domain = ?", (domain,)
+            ).fetchone()
+            if not domain_row or domain_row["review_status"] != "pending_review":
+                changed = False
+            else:
+                conn.execute(
+                    """
+                    UPDATE domains
+                    SET review_status = 'approved'
+                    WHERE domain = ?
+                      AND review_status = 'pending_review'
+                    """,
+                    (domain,),
+                )
+                pending_urls = conn.execute(
+                    """
+                    SELECT id
+                    FROM urls
+                    WHERE domain = ?
+                      AND review_status = 'pending_review'
+                    """,
+                    (domain,),
+                ).fetchall()
+                for row in pending_urls:
+                    approve_url_and_enqueue(conn, int(row["id"]))
+                changed = True
+        flash(
+            f"Domain approved and pending URL crawl jobs queued: {domain}"
+            if changed
+            else f"Domain is already reviewed and is read-only: {domain}",
+            "success" if changed else "error",
+        )
         return redirect(request.referrer or url_for("review"))
 
     @app.get("/crawl")

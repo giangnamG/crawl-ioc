@@ -86,18 +86,22 @@
               <td class="cell-status"><span class="badge {{ row.review_status }}">{{ row.review_status|status_label }}</span></td>
               <td class="cell-status"><span class="badge {{ row.crawl_status }}">{{ row.crawl_status|status_label }}</span></td>
               <td class="cell-actions review-url-actions-cell">
-                <div class="row-actions">
-                  <form method="post" action="{{ url_for('approve_url', url_id=row.id) }}">
-                    <button class="button small primary" type="submit">Approve</button>
-                  </form>
-                  <form method="post" action="{{ url_for('reject_url_route', url_id=row.id) }}">
-                    <button class="button small" type="submit">Reject URL</button>
-                  </form>
-                  <form method="post" action="{{ url_for('reject_domain_route') }}">
-                    <input type="hidden" name="domain" value="{{ row.domain }}">
-                    <button class="button small danger compact-action" type="submit">Reject Domain</button>
-                  </form>
-                </div>
+                {% if row.review_status == "pending_review" %}
+                  <div class="row-actions">
+                    <form method="post" action="{{ url_for('approve_url', url_id=row.id) }}">
+                      <button class="button small primary" type="submit">Approve</button>
+                    </form>
+                    <form method="post" action="{{ url_for('reject_url_route', url_id=row.id) }}">
+                      <button class="button small" type="submit">Reject URL</button>
+                    </form>
+                    <form method="post" action="{{ url_for('reject_domain_route') }}">
+                      <input type="hidden" name="domain" value="{{ row.domain }}">
+                      <button class="button small danger compact-action" type="submit">Reject Domain</button>
+                    </form>
+                  </div>
+                {% else %}
+                  <span class="readonly-note">Read only</span>
+                {% endif %}
               </td>
             </tr>
           {% else %}
@@ -152,16 +156,20 @@
               <td class="cell-status"><span class="badge {{ row.review_status }}">{{ row.review_status|status_label }}</span></td>
               <td class="cell-count">{{ row.url_count }}</td>
               <td class="cell-actions">
-                <div class="row-actions">
-                  <form method="post" action="{{ url_for('approve_domain_route') }}">
-                    <input type="hidden" name="domain" value="{{ row.domain }}">
-                    <button class="button small primary" type="submit">Approve</button>
-                  </form>
-                  <form method="post" action="{{ url_for('reject_domain_route') }}">
-                    <input type="hidden" name="domain" value="{{ row.domain }}">
-                    <button class="button small danger" type="submit">Reject</button>
-                  </form>
-                </div>
+                {% if row.review_status == "pending_review" %}
+                  <div class="row-actions">
+                    <form method="post" action="{{ url_for('approve_domain_route') }}">
+                      <input type="hidden" name="domain" value="{{ row.domain }}">
+                      <button class="button small primary" type="submit">Approve</button>
+                    </form>
+                    <form method="post" action="{{ url_for('reject_domain_route') }}">
+                      <input type="hidden" name="domain" value="{{ row.domain }}">
+                      <button class="button small danger" type="submit">Reject</button>
+                    </form>
+                  </div>
+                {% else %}
+                  <span class="readonly-note">Read only</span>
+                {% endif %}
               </td>
             </tr>
           {% else %}

@@ -760,13 +760,18 @@ def upsert_ioc(conn: Connection, ioc_type: str, value_raw: str, value_norm: str)
     return int(row["id"])
 
 
-def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None = None) -> None:
+def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None = None) -> bool:
     target = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
     if not target:
-        return
-    conn.execute("UPDATE urls SET review_status = 'approved' WHERE id = ?", (url_id,))
+        return False
+    if target["review_status"] != "pending_review":
+        return False
     conn.execute(
-        "UPDATE domains SET review_status = 'approved' WHERE domain = ? AND review_status != 'rejected'",
+        "UPDATE urls SET review_status = 'approved' WHERE id = ? AND review_status = 'pending_review'",
+        (url_id,),
+    )
+    conn.execute(
+        "UPDATE domains SET review_status = 'approved' WHERE domain = ? AND review_status = 'pending_review'",
         (target["domain"],),
     )
     queue_rows = []
@@ -801,23 +806,57 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
                 queue_id=int(item["queue_id"]),
                 initial_status=next_status,
             )
-        return
+        return True
 
     if queue_id:
         enqueue_url_to_queue(conn, queue_id, url_id)
-        return
+        return True
 
     if target["crawl_status"] != "crawled":
         enqueue_job(conn, "crawl_url", {"url_id": url_id}, f"crawl:{url_id}")
+    return True
 
 
-def reject_url(conn: Connection, url_id: int) -> None:
-    conn.execute("UPDATE urls SET review_status = 'rejected' WHERE id = ?", (url_id,))
+def reject_url(conn: Connection, url_id: int) -> bool:
+    return (
+        conn.execute(
+            """
+            UPDATE urls
+            SET review_status = 'rejected'
+            WHERE id = ?
+              AND review_status = 'pending_review'
+            """,
+            (url_id,),
+        ).rowcount
+        > 0
+    )
 
 
-def reject_domain(conn: Connection, domain: str) -> None:
-    conn.execute("UPDATE domains SET review_status = 'rejected' WHERE domain = ?", (domain,))
-    conn.execute("UPDATE urls SET review_status = 'rejected' WHERE domain = ?", (domain,))
+def reject_domain(conn: Connection, domain: str) -> bool:
+    changed = (
+        conn.execute(
+            """
+            UPDATE domains
+            SET review_status = 'rejected'
+            WHERE domain = ?
+              AND review_status = 'pending_review'
+            """,
+            (domain,),
+        ).rowcount
+        > 0
+    )
+    if not changed:
+        return False
+    conn.execute(
+        """
+        UPDATE urls
+        SET review_status = 'rejected'
+        WHERE domain = ?
+          AND review_status = 'pending_review'
+        """,
+        (domain,),
+    )
+    return True
 
 
 def refresh_keyword_status(conn: Connection, keyword_id: int) -> None:
