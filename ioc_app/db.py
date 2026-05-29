@@ -300,7 +300,7 @@ def refresh_builtin_extraction_rules(conn: sqlite3.Connection) -> None:
         ),
         (
             "Domain basic",
-            r"(?<![@\w.-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})(?![\w.-]*@)(?![\w.-])",
+            r"(?<!://)(?<![@\w.-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})(?![\w.-]*@)(?![\w.-])",
             "i",
             1,
             "text",
@@ -367,6 +367,8 @@ def cleanup_invalid_iocs(conn: sqlite3.Connection) -> None:
     for row in rows:
         normalized = normalize_by_rule(row["value_norm"], row["type"], row["type"])
         if row["type"] == "domain" and domain_ioc_is_email_localpart(conn, int(row["id"]), row["value_norm"]):
+            normalized = None
+        if row["type"] == "domain" and domain_ioc_is_full_url_host(conn, int(row["id"]), row["value_norm"]):
             normalized = None
         if normalized == row["value_norm"]:
             continue
@@ -435,6 +437,21 @@ def domain_ioc_is_email_localpart(conn: sqlite3.Connection, ioc_id: int, domain:
 
     localpart_pattern = re.compile(rf"(?<![\w.-]){re.escape(domain)}@", re.IGNORECASE)
     return all(localpart_pattern.search(source["evidence_text"] or "") for source in sources)
+
+
+def domain_ioc_is_full_url_host(conn: sqlite3.Connection, ioc_id: int, domain: str) -> bool:
+    sources = conn.execute(
+        "SELECT evidence_text FROM ioc_sources WHERE ioc_id = ?",
+        (ioc_id,),
+    ).fetchall()
+    if not sources:
+        return False
+
+    url_host_pattern = re.compile(
+        rf"https?://{re.escape(domain)}(?=[:/?#\"'\s]|$)",
+        re.IGNORECASE,
+    )
+    return all(url_host_pattern.search(source["evidence_text"] or "") for source in sources)
 
 
 SCHEMA = """

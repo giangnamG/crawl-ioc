@@ -123,18 +123,8 @@ def normalize_url(value: str) -> str | None:
     ):
         netloc = f"{host}:{port}"
 
-    query_items = []
-    for item in parts.query.split("&"):
-        if not item:
-            continue
-        key = item.split("=", 1)[0]
-        key_l = key.lower()
-        if key_l.startswith("utm_") or key_l in TRACKING_PARAMS:
-            continue
-        query_items.append(item)
-
-    query = "&".join(query_items)
-    path = parts.path or "/"
+    query = parts.query
+    path = parts.path
     return urlunsplit((parts.scheme.lower(), netloc, path, query, ""))
 
 
