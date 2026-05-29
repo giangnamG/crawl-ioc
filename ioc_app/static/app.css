@@ -552,7 +552,44 @@ tbody tr:hover .review-url-actions-cell {
 }
 
 .ioc-col-action {
-  width: 116px;
+  width: 142px;
+}
+
+.selected-ioc-panel {
+  border-color: #93c5fd;
+  box-shadow: 0 14px 32px rgba(37, 99, 235, 0.12);
+  scroll-margin-top: 18px;
+}
+
+.selected-ioc-value {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.selected-ioc-value span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.selected-ioc-value code {
+  display: block;
+  max-width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.selected-row td {
+  background: #eff6ff;
+}
+
+.selected-row:hover td {
+  background: #dbeafe;
 }
 
 .source-inline-list {

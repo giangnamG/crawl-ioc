@@ -24,6 +24,46 @@
     </form>
   </section>
 
+  {% if selected %}
+    <section class="panel selected-ioc-panel" id="ioc-evidence">
+      <div class="panel-head">
+        <div>
+          <h2>Evidence For IOC #{{ selected.id }}</h2>
+          <span class="muted">Selected IOC source evidence</span>
+        </div>
+        <span class="tag">{{ selected.type }}</span>
+      </div>
+      <div class="selected-ioc-value">
+        <span>Normalized Value</span>
+        <code>{{ selected.value_norm }}</code>
+      </div>
+      <div class="table-wrap compact">
+        <table>
+          <thead>
+            <tr>
+              <th>Source URL</th>
+              <th>Domain</th>
+              <th>Rule</th>
+              <th>Evidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in sources %}
+              <tr>
+                <td><a class="source-url-full" href="{{ row.url_norm }}" target="_blank" rel="noreferrer">{{ row.url_norm }}</a></td>
+                <td>{{ row.domain }}</td>
+                <td>{{ row.rule_name or "" }}</td>
+                <td>{{ row.evidence_text }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="4" class="empty">No source rows found for this IOC.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endif %}
+
   <section class="panel">
     <div class="panel-head">
       <h2>IOC Table</h2>
@@ -53,7 +93,7 @@
         </thead>
         <tbody>
           {% for row in rows %}
-            <tr>
+            <tr class="{{ 'selected-row' if selected and selected.id == row.id else '' }}">
               <td>#{{ row.id }}</td>
               <td><span class="tag">{{ row.type }}</span></td>
               <td><code>{{ row.value_norm|truncate_middle(96) }}</code></td>
@@ -71,46 +111,13 @@
               </td>
               <td>{{ row.source_count }}</td>
               <td>{{ row.rule_names or "" }}</td>
-              <td><a class="button small" href="{{ url_for('iocs', ioc_id=row.id, type=ioc_type) }}">Sources</a></td>
+              <td><a class="button small" href="{{ url_for('iocs', ioc_id=row.id, type=ioc_type) }}#ioc-evidence">View Evidence</a></td>
             </tr>
           {% else %}
-            <tr><td colspan="6" class="empty">No IOCs extracted yet.</td></tr>
+            <tr><td colspan="7" class="empty">No IOCs extracted yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
   </section>
-
-  {% if selected %}
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Sources For #{{ selected.id }}</h2>
-        <code>{{ selected.value_norm|truncate_middle(100) }}</code>
-      </div>
-      <div class="table-wrap compact">
-        <table>
-          <thead>
-            <tr>
-              <th>Source URL</th>
-              <th>Domain</th>
-              <th>Rule</th>
-              <th>Evidence</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for row in sources %}
-              <tr>
-                <td><a class="source-url-full" href="{{ row.url_norm }}" target="_blank" rel="noreferrer">{{ row.url_norm }}</a></td>
-                <td>{{ row.domain }}</td>
-                <td>{{ row.rule_name or "" }}</td>
-                <td>{{ row.evidence_text }}</td>
-              </tr>
-            {% else %}
-              <tr><td colspan="4" class="empty">No source rows found.</td></tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  {% endif %}
 {% endblock %}
