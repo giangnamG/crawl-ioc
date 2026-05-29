@@ -30,11 +30,31 @@ def init_db() -> None:
 
 
 def migrate_db(conn: sqlite3.Connection) -> None:
+    ensure_column(conn, "search_queries", "queue_id", "INTEGER REFERENCES queues(id)")
     ensure_column(conn, "search_queries", "result_count", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "search_queries", "page_count", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "search_queries", "last_error", "TEXT")
     ensure_column(conn, "search_queries", "started_at", "TEXT")
     ensure_column(conn, "search_queries", "finished_at", "TEXT")
+    ensure_column(conn, "jobs", "queue_id", "INTEGER REFERENCES queues(id)")
+    ensure_column(conn, "search_queue_items", "output_url_queue_id", "INTEGER REFERENCES queues(id)")
+    ensure_column(conn, "url_sources", "queue_id", "INTEGER REFERENCES queues(id)")
+    ensure_column(conn, "domain_sources", "queue_id", "INTEGER REFERENCES queues(id)")
+    ensure_column(conn, "url_queue_items", "source_queue_id", "INTEGER REFERENCES queues(id)")
+    ensure_column(conn, "url_queue_items", "source_search_query_id", "INTEGER REFERENCES search_queries(id)")
+    ensure_column(conn, "url_queue_items", "source_search_queue_item_id", "INTEGER REFERENCES search_queue_items(id)")
+    ensure_column(conn, "url_queue_items", "source_url_queue_item_id", "INTEGER REFERENCES url_queue_items(id)")
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(queue_id, status, id);
+        CREATE INDEX IF NOT EXISTS idx_search_queries_queue ON search_queries(queue_id, status);
+        CREATE INDEX IF NOT EXISTS idx_search_queue_items_queue ON search_queue_items(queue_id, status);
+        CREATE INDEX IF NOT EXISTS idx_search_queue_items_output ON search_queue_items(output_url_queue_id);
+        CREATE INDEX IF NOT EXISTS idx_url_queue_items_queue ON url_queue_items(queue_id, status);
+        CREATE INDEX IF NOT EXISTS idx_queue_routes_keyword ON queue_routes(keyword_queue_id);
+        CREATE INDEX IF NOT EXISTS idx_queue_routes_url ON queue_routes(url_queue_id);
+        """
+    )
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -64,6 +84,43 @@ def recover_interrupted_jobs(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "UPDATE urls SET crawl_status = 'not_crawled' WHERE crawl_status = 'crawling'"
+    )
+    conn.execute(
+        """
+        UPDATE url_queue_items
+        SET status = 'pending',
+            error = COALESCE(error, 'Recovered after interrupted process.'),
+            started_at = NULL
+        WHERE status = 'running'
+          AND EXISTS (
+            SELECT 1 FROM urls u
+            WHERE u.id = url_queue_items.url_id
+              AND u.review_status = 'approved'
+          )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE url_queue_items
+        SET status = 'pending_review',
+            error = COALESCE(error, 'Recovered after interrupted process.'),
+            started_at = NULL
+        WHERE status = 'running'
+          AND EXISTS (
+            SELECT 1 FROM urls u
+            WHERE u.id = url_queue_items.url_id
+              AND u.review_status != 'approved'
+          )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE search_queue_items
+        SET status = 'pending',
+            error = COALESCE(error, 'Recovered after interrupted process.'),
+            started_at = NULL
+        WHERE status = 'running'
+        """
     )
 
 
@@ -238,6 +295,28 @@ CREATE TABLE IF NOT EXISTS keywords (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS queues (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  queue_type TEXT NOT NULL CHECK(queue_type IN ('keyword_search', 'url_crawl')),
+  status TEXT NOT NULL DEFAULT 'draft',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at TEXT,
+  stopped_at TEXT,
+  UNIQUE (name, queue_type)
+);
+
+CREATE TABLE IF NOT EXISTS queue_routes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  keyword_queue_id INTEGER NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
+  url_queue_id INTEGER NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (keyword_queue_id),
+  UNIQUE (url_queue_id)
+);
+
 CREATE TABLE IF NOT EXISTS search_dorks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -251,6 +330,7 @@ CREATE TABLE IF NOT EXISTS search_dorks (
 
 CREATE TABLE IF NOT EXISTS search_queries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  queue_id INTEGER REFERENCES queues(id),
   keyword_id INTEGER NOT NULL REFERENCES keywords(id),
   dork_id INTEGER NOT NULL REFERENCES search_dorks(id),
   query_text TEXT NOT NULL,
@@ -261,11 +341,12 @@ CREATE TABLE IF NOT EXISTS search_queries (
   started_at TEXT,
   finished_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (keyword_id, dork_id, query_text)
+  UNIQUE (queue_id, keyword_id, dork_id, query_text)
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  queue_id INTEGER REFERENCES queues(id),
   type TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   payload TEXT NOT NULL,
@@ -275,6 +356,22 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   started_at TEXT,
   finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS search_queue_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  queue_id INTEGER NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
+  search_query_id INTEGER NOT NULL REFERENCES search_queries(id),
+  keyword_id INTEGER NOT NULL REFERENCES keywords(id),
+  output_url_queue_id INTEGER REFERENCES queues(id),
+  status TEXT NOT NULL DEFAULT 'paused',
+  result_count INTEGER NOT NULL DEFAULT 0,
+  page_count INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at TEXT,
+  finished_at TEXT,
+  UNIQUE (queue_id, search_query_id)
 );
 
 CREATE TABLE IF NOT EXISTS urls (
@@ -292,6 +389,22 @@ CREATE TABLE IF NOT EXISTS urls (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS url_queue_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  queue_id INTEGER NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
+  url_id INTEGER NOT NULL REFERENCES urls(id),
+  source_queue_id INTEGER REFERENCES queues(id),
+  source_search_query_id INTEGER REFERENCES search_queries(id),
+  source_search_queue_item_id INTEGER REFERENCES search_queue_items(id),
+  source_url_queue_item_id INTEGER REFERENCES url_queue_items(id),
+  status TEXT NOT NULL DEFAULT 'paused',
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at TEXT,
+  finished_at TEXT,
+  UNIQUE (queue_id, url_id)
+);
+
 CREATE TABLE IF NOT EXISTS domains (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   domain TEXT NOT NULL UNIQUE,
@@ -305,6 +418,7 @@ CREATE TABLE IF NOT EXISTS domain_sources (
   domain_id INTEGER NOT NULL REFERENCES domains(id),
   source_type TEXT NOT NULL,
   dedupe_key TEXT NOT NULL UNIQUE,
+  queue_id INTEGER REFERENCES queues(id),
   keyword_id INTEGER REFERENCES keywords(id),
   search_query_id INTEGER REFERENCES search_queries(id),
   source_url_id INTEGER REFERENCES urls(id),
@@ -319,6 +433,7 @@ CREATE TABLE IF NOT EXISTS url_sources (
   url_id INTEGER NOT NULL REFERENCES urls(id),
   source_type TEXT NOT NULL,
   dedupe_key TEXT NOT NULL UNIQUE,
+  queue_id INTEGER REFERENCES queues(id),
   keyword_id INTEGER REFERENCES keywords(id),
   search_query_id INTEGER REFERENCES search_queries(id),
   source_url_id INTEGER REFERENCES urls(id),

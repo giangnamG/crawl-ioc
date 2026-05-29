@@ -17,6 +17,17 @@
       </label>
 
       <div class="field-block">
+        <span class="field-label">Keyword Search Queue (required)</span>
+        <select name="queue_id" required>
+          <option value="" disabled {% if not selected_keyword_queue_id %}selected{% endif %}>Select queue_keyword</option>
+          {% for queue in keyword_queues %}
+            <option value="{{ queue.id }}" {% if selected_keyword_queue_id == queue.id %}selected{% endif %}>#{{ queue.id }} · {{ queue.name }}</option>
+          {% endfor %}
+        </select>
+        <small>Create a Keyword Search Queue on the Queues page before adding keyword work.</small>
+      </div>
+
+      <div class="field-block">
         <span class="field-label">Search Mode</span>
         <div class="mode-grid">
           <label class="mode-card">
@@ -52,7 +63,8 @@
       </div>
 
       <div class="form-actions">
-        <button class="button primary" type="submit">Import And Queue</button>
+        <button class="button primary" type="submit">Add To Keyword Queue</button>
+        <a class="button" href="{{ url_for('queues') }}">Create Or Manage Queues</a>
         <a class="button" href="{{ url_for('dorks') }}">Manage Dorks</a>
       </div>
     </form>
@@ -69,6 +81,7 @@
           <col class="keyword-col-id">
           <col class="keyword-col-text">
           <col class="keyword-col-status">
+          <col class="keyword-col-queue">
           <col class="keyword-col-number">
           <col class="keyword-col-number">
           <col class="keyword-col-number">
@@ -82,6 +95,7 @@
             <th>ID</th>
             <th>Keyword</th>
             <th>Status</th>
+            <th>Queues</th>
             <th>Queries</th>
             <th>Done</th>
             <th>Failed</th>
@@ -97,6 +111,7 @@
               <td>#{{ row.id }}</td>
               <td class="cell-keyword"><strong title="{{ row.text }}">{{ row.text }}</strong></td>
               <td><span class="badge {{ row.status }}">{{ row.status|status_label }}</span></td>
+              <td><span class="truncate-line" title="{{ row.queue_names or '' }}">{{ row.queue_names or "-" }}</span></td>
               <td>{{ row.query_count }}</td>
               <td>{{ row.done_count }}</td>
               <td>{{ row.failed_count }}</td>
@@ -121,7 +136,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="10" class="empty">No keywords imported yet.</td></tr>
+            <tr><td colspan="11" class="empty">No keywords imported yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>

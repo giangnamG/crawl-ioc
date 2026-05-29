@@ -8,6 +8,7 @@ Stack hiện tại:
 Backend/UI: Python Flask server-side rendering
 Database: SQLite3
 Queue MVP: bảng jobs trong SQLite
+Queue nghiệp vụ: bảng queues, search_queue_items, url_queue_items
 Frontend: Jinja templates + CSS thuần
 ```
 
@@ -89,13 +90,15 @@ CloakBrowser giúp browser fingerprint giống trình duyệt thật hơn, nhưn
 Các màn chính:
 
 - `Dashboard`: tổng quan số keyword, query, URL, domain, IOC, job.
-- `Keywords`: import keyword và chọn Google dork template.
-- `Keywords`: có thể chọn `Full Google Query` để queue nguyên dòng như `site:88i.*`, không kết hợp thêm dork.
+- `Queues`: tạo queue nghiệp vụ, quản lý Start/Stop/Resume cho từng queue riêng.
+- `Queues`: thêm domain/URL vào URL Crawl Queue; item được giữ paused cho tới khi queue được start.
+- `Keywords`: thêm keyword vào Keyword Search Queue và chọn Google dork template.
+- `Keywords`: có thể chọn `Full Google Query` để đưa nguyên dòng như `site:88i.*` vào queue, không kết hợp thêm dork.
 - `Search Dorks`: tạo/preview Google dork template.
 - `Review`: approve/reject URL/domain.
 - `Rules`: tạo/test regex rule extract IOC.
 - `Crawl`: theo dõi URL approved/crawled.
-- `Jobs`: chạy job thủ công cho MVP.
+- `Jobs`: xem job kỹ thuật sinh ra từ từng queue; chạy thủ công cho MVP.
 - `Jobs`: khi chạy bằng `python app.py`, background worker tự xử lý job pending; nút thủ công vẫn giữ để kiểm soát.
 - `IOCs`: xem IOC duy nhất và nguồn IOC.
 
@@ -119,6 +122,11 @@ Nguyên tắc quan trọng:
 - IOC không được trùng.
 - Một IOC có thể có nhiều nguồn phát hiện.
 - Domain phải biết được nguồn phát hiện: từ Google Search hay từ domain/URL khác.
+- Keyword Search Queue phải được bind vào đúng một URL Crawl Queue qua bảng `queue_routes`.
+- Khi queue keyword được start, từng `search_queue_items` và job `search_query` được đóng băng `output_url_queue_id`; worker chỉ đẩy URL/domain search được vào đúng queue_url này.
+- `queue_routes` có unique constraint 2 chiều: một queue_keyword chỉ có một output queue_url, và một queue_url không thể làm output cho hai queue_keyword khác nhau.
+- Worker claim job bằng transaction `BEGIN IMMEDIATE`, validate `job.queue_id + search_queue_item_id/url_queue_item_id + output_url_queue_id` trước khi xử lý, để tránh 2 worker lấy cùng job hoặc ghi nhầm queue.
+- Bảng `urls`, `domains`, `iocs` vẫn là bảng chung duy nhất; bảng `url_queue_items`, `url_sources`, `domain_sources`, `ioc_sources` lưu quan hệ nguồn/queue để truy vết.
 
 ## Flow cụ thể theo yêu cầu
 

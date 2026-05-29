@@ -1,0 +1,307 @@
+{% extends "base.html" %}
+
+{% block title %}Queues · IOC Investigator{% endblock %}
+{% block heading %}Queues{% endblock %}
+{% block eyebrow %}Workflow control{% endblock %}
+
+{% block actions %}
+  <a class="button primary" href="{{ url_for('keywords') }}">Add Keywords To Queue</a>
+{% endblock %}
+
+{% block content %}
+  <section class="queue-control-grid">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Create Queue</h2>
+        <span class="muted">Create a workflow container first, then add work items.</span>
+      </div>
+      <form method="post" class="grid-form queue-create-form">
+        <input type="hidden" name="action" value="create">
+        <label class="wide">
+          <span>Name</span>
+          <input name="name" placeholder="88i keyword search batch">
+        </label>
+        <label>
+          <span>Type</span>
+          <select name="queue_type">
+            <option value="keyword_search">Keyword Search</option>
+            <option value="url_crawl">URL Crawl</option>
+          </select>
+        </label>
+        <div class="form-actions">
+          <button class="button primary" type="submit">Create Queue</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Bind Keyword To URL Queue</h2>
+        <span class="muted">Search results from queue_keyword go only to its bound queue_url.</span>
+      </div>
+      <form method="post" class="stacked-form">
+        <input type="hidden" name="action" value="link_queues">
+        <label>
+          <span>Keyword Search Queue (required)</span>
+          <select name="keyword_queue_id" required>
+            <option value="" disabled selected>Select queue_keyword</option>
+            {% for queue in keyword_queues %}
+              <option value="{{ queue.id }}" {% if selected_queue and selected_queue.queue_type == "keyword_search" and selected_queue.id == queue.id %}selected{% endif %}>#{{ queue.id }} · {{ queue.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          <span>Output URL Crawl Queue (required)</span>
+          <select name="url_queue_id" required>
+            <option value="" disabled selected>Select queue_url</option>
+            {% for queue in url_queues %}
+              <option value="{{ queue.id }}">{{ queue.name }} · #{{ queue.id }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div class="form-actions">
+          <button class="button primary" type="submit">Bind Queues</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel" id="add-url-queue">
+      <div class="panel-head">
+        <h2>Add URL/Domain To Queue</h2>
+        <span class="muted">Select the exact queue_url before adding work items.</span>
+      </div>
+      <form method="post" class="stacked-form">
+        <input type="hidden" name="action" value="add_urls">
+        <label>
+          <span>URL Crawl Queue (required)</span>
+          <select name="queue_id" required>
+            <option value="" disabled {% if not selected_queue or selected_queue.queue_type != "url_crawl" %}selected{% endif %}>Select queue_url</option>
+            {% for queue in url_queues %}
+              <option value="{{ queue.id }}" {% if selected_queue and selected_queue.queue_type == "url_crawl" and selected_queue.id == queue.id %}selected{% endif %}>#{{ queue.id }} · {{ queue.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          <span>Domains Or URLs</span>
+          <textarea name="targets" rows="5" placeholder="https://88i.example/&#10;88i.example"></textarea>
+        </label>
+        <div class="form-actions">
+          <button class="button primary" type="submit">Add To Selected URL Queue</button>
+        </div>
+      </form>
+    </section>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Queue Management</h2>
+      <span class="muted">Start, stop, and resume each queue independently.</span>
+    </div>
+    <div class="table-wrap">
+      <table class="queue-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Output URL Queue</th>
+            <th>Status</th>
+            <th>Items</th>
+            <th>Jobs</th>
+            <th>Pending</th>
+            <th>Running</th>
+            <th>Done</th>
+            <th>Failed</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td class="cell-id">#{{ row.id }}</td>
+              <td class="cell-keyword">
+                <a href="{{ url_for('queues', queue_id=row.id) }}"><strong title="{{ row.name }}">{{ row.name }}</strong></a>
+              </td>
+              <td><span class="tag">{{ row.queue_type|queue_type_label }}</span></td>
+              <td>
+                {% if row.queue_type == "keyword_search" %}
+                  {% if row.output_url_queue_id %}
+                    <a class="truncate-line" href="{{ url_for('queues', queue_id=row.output_url_queue_id) }}" title="{{ row.output_url_queue_name }}">#{{ row.output_url_queue_id }} · {{ row.output_url_queue_name }}</a>
+                  {% else %}
+                    <span class="badge failed">Not Bound</span>
+                  {% endif %}
+                {% else %}
+                  <span class="muted">Input queue</span>
+                {% endif %}
+              </td>
+              <td><span class="badge {{ row.status }}">{{ row.status|status_label }}</span></td>
+              <td>{{ row.search_query_count if row.queue_type == "keyword_search" else row.url_item_count }}</td>
+              <td>{{ row.job_count }}</td>
+              <td>{{ row.pending_jobs }}</td>
+              <td>{{ row.running_jobs }}</td>
+              <td>{{ row.done_jobs }}</td>
+              <td>{{ row.failed_jobs }}</td>
+              <td class="cell-actions">
+                <div class="row-actions">
+                  {% if row.status == "running" %}
+                    <form method="post" action="{{ url_for('stop_queue', queue_id=row.id) }}">
+                      <button class="button small" type="submit">Stop</button>
+                    </form>
+                  {% elif row.status == "paused" %}
+                    <form method="post" action="{{ url_for('resume_queue', queue_id=row.id) }}">
+                      <button class="button small primary" type="submit">Resume</button>
+                    </form>
+                  {% elif row.queue_type != "keyword_search" or row.output_url_queue_id %}
+                    <form method="post" action="{{ url_for('start_queue', queue_id=row.id) }}">
+                      <button class="button small primary" type="submit">Start</button>
+                    </form>
+                  {% else %}
+                    <button class="button small" type="button" disabled>Bind First</button>
+                  {% endif %}
+                  <a class="button small" href="{{ url_for('queues', queue_id=row.id) }}">View</a>
+                  {% if row.queue_type == "keyword_search" %}
+                    <a class="button small" href="{{ url_for('keywords', queue_id=row.id) }}">Add Keywords</a>
+                  {% else %}
+                    <a class="button small" href="{{ url_for('queues', queue_id=row.id) }}#add-url-queue">Add URLs</a>
+                  {% endif %}
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="12" class="empty">No queues yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  {% if selected_queue %}
+    <section class="panel">
+      <div class="panel-head">
+        <h2>#{{ selected_queue.id }} · {{ selected_queue.name }}</h2>
+        <span class="badge {{ selected_queue.status }}">{{ selected_queue.status|status_label }}</span>
+      </div>
+      {% if selected_queue.queue_type == "keyword_search" %}
+        <div class="route-note">
+          {% set bound = rows|selectattr("id", "equalto", selected_queue.id)|list|first %}
+          {% if bound and bound.output_url_queue_id %}
+            Output queue_url: <a href="{{ url_for('queues', queue_id=bound.output_url_queue_id) }}">#{{ bound.output_url_queue_id }} · {{ bound.output_url_queue_name }}</a>
+          {% else %}
+            <span class="badge failed">No output queue_url bound. This keyword queue cannot start yet.</span>
+          {% endif %}
+        </div>
+      {% endif %}
+
+      {% if selected_queue.queue_type == "keyword_search" %}
+        <div class="table-wrap queue-detail-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Keyword</th>
+                <th>Query</th>
+                <th>Output URL Queue</th>
+                <th>Status</th>
+                <th>Results</th>
+                <th>Pages</th>
+                <th>Error</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in selected_queries %}
+                <tr>
+                  <td>#{{ item.id }}</td>
+                  <td><strong>{{ item.keyword_text }}</strong></td>
+                  <td><code class="truncate-line" title="{{ item.query_text }}">{{ item.query_text }}</code></td>
+                  <td>
+                    {% if item.output_url_queue_id %}
+                      #{{ item.output_url_queue_id }} · {{ item.output_url_queue_name or "queue_url" }}
+                    {% else %}
+                      <span class="badge failed">Not Bound</span>
+                    {% endif %}
+                  </td>
+                  <td><span class="badge {{ item.status }}">{{ item.status|status_label }}</span></td>
+                  <td>{{ item.result_count }}</td>
+                  <td>{{ item.page_count }}</td>
+                  <td><code class="truncate-line" title="{{ item.error or '' }}">{{ item.error or "" }}</code></td>
+                </tr>
+              {% else %}
+                <tr><td colspan="8" class="empty">No keyword search items in this queue.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="table-wrap queue-detail-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Domain</th>
+                <th>URL</th>
+                <th>Queue Status</th>
+                <th>Source Queue</th>
+                <th>Crawl Status</th>
+                <th>Error</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in selected_url_items %}
+                <tr>
+                  <td>#{{ item.id }}</td>
+                  <td><strong>{{ item.domain }}</strong></td>
+                  <td><code class="truncate-line" title="{{ item.url_norm }}">{{ item.url_norm }}</code></td>
+                  <td><span class="badge {{ item.status }}">{{ item.status|status_label }}</span></td>
+                  <td>
+                    {% if item.source_queue_id %}
+                      #{{ item.source_queue_id }}{% if item.source_queue_name %} · {{ item.source_queue_name }}{% endif %}
+                    {% else %}
+                      -
+                    {% endif %}
+                  </td>
+                  <td><span class="badge {{ item.crawl_status }}">{{ item.crawl_status|status_label }}</span></td>
+                  <td><code class="truncate-line" title="{{ item.error or '' }}">{{ item.error or "" }}</code></td>
+                </tr>
+              {% else %}
+                <tr><td colspan="7" class="empty">No URL/domain items in this queue.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% endif %}
+
+      <div class="subsection-head">
+        <h2>Queue Jobs</h2>
+        <span class="muted">Technical jobs generated from this queue.</span>
+      </div>
+      <div class="table-wrap queue-detail-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Type</th>
+              <th>Status</th>
+              <th>Attempts</th>
+              <th>Payload</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for job in selected_jobs %}
+              <tr>
+                <td>#{{ job.id }}</td>
+                <td><code>{{ job.type }}</code></td>
+                <td><span class="badge {{ job.status }}">{{ job.status|status_label }}</span></td>
+                <td>{{ job.attempts }}</td>
+                <td><code class="truncate-line" title="{{ job.payload }}">{{ job.payload }}</code></td>
+                <td><code class="truncate-line" title="{{ job.error or '' }}">{{ job.error or "" }}</code></td>
+              </tr>
+            {% else %}
+              <tr><td colspan="6" class="empty">No jobs generated for this queue.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endif %}
+{% endblock %}

@@ -4,12 +4,13 @@
 {% block heading %}Dashboard{% endblock %}
 {% block eyebrow %}Overview{% endblock %}
 {% block actions %}
-  <a class="button primary" href="{{ url_for('keywords') }}">Import Keywords</a>
+  <a class="button primary" href="{{ url_for('queues') }}">Manage Queues</a>
 {% endblock %}
 
 {% block content %}
   <section class="metric-grid">
     {% for label, key in [
+      ("Queues", "queues"),
       ("Keywords", "keywords"),
       ("Search Queries", "search_queries"),
       ("Pending Jobs", "pending_jobs"),
