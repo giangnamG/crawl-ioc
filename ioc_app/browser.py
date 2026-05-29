@@ -87,6 +87,7 @@ class BrowserClient:
     def __init__(self) -> None:
         self.provider = os.environ.get("BROWSER_PROVIDER", "cloak").strip().lower()
         self.max_pages = int(os.environ.get("SEARCH_MAX_PAGES", "0"))
+        self.search_hard_page_limit = int(os.environ.get("SEARCH_HARD_PAGE_LIMIT", "100"))
         self.timeout_ms = int(float(os.environ.get("BROWSER_TIMEOUT", "45")) * 1000)
         self.fast_mode = env_bool("SEARCH_FAST_MODE", True)
         self.headless = env_bool("CLOAK_HEADLESS", False)
@@ -129,6 +130,7 @@ class BrowserClient:
         seen: set[str] = set()
         rank = 1
         page_no = 1
+        page_limit = self.max_pages if self.max_pages > 0 else self.search_hard_page_limit
 
         ctx = self._launch_context("google")
         try:
@@ -136,21 +138,24 @@ class BrowserClient:
             page.set_default_timeout(self.timeout_ms)
             self._open_google_search(page, query_text)
 
-            while self.max_pages <= 0 or page_no <= self.max_pages:
+            while page_no <= page_limit:
                 page_items = self._collect_google_results_page(page, page_no, rank, seen)
-                if not page_items:
+                has_result_candidates = self._count_google_result_candidates(page) > 0
+                if not page_items and not has_result_candidates:
                     break
 
-                results.extend(page_items)
-                rank += len(page_items)
+                if page_items:
+                    results.extend(page_items)
+                    rank += len(page_items)
 
-                page_no += 1
-                if self.max_pages > 0 and page_no > self.max_pages:
+                next_page_no = page_no + 1
+                if next_page_no > page_limit:
                     break
 
                 self._sleep_between_pages()
-                if not self._go_google_next_page_by_start(page, query_text, page_no):
+                if not self._go_google_next_page_prefer_link(page, query_text, next_page_no):
                     break
+                page_no = next_page_no
 
             return results
         finally:
@@ -411,6 +416,23 @@ class BrowserClient:
             rank += 1
         return output
 
+    def _count_google_result_candidates(self, page) -> int:
+        try:
+            return int(
+                page.evaluate(
+                    """
+                    () => Array.from(document.querySelectorAll('#search a[href], #rso a[href]'))
+                      .filter(a => {
+                        const href = a.href || a.getAttribute('href') || '';
+                        if (!href || href.startsWith('#') || href.startsWith('javascript:')) return false;
+                        return Boolean(a.querySelector('h3')) || Boolean((a.innerText || '').trim());
+                      }).length
+                    """
+                )
+            )
+        except Exception:
+            return 0
+
     def _go_google_next_page(self, page) -> bool:
         try:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -438,6 +460,54 @@ class BrowserClient:
             return True
         except Exception:
             return False
+
+    def _go_google_next_page_prefer_link(self, page, query_text: str, page_no: int) -> bool:
+        next_href = self._get_google_next_href(page)
+        if next_href:
+            try:
+                page.goto(next_href, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                self._dismiss_google_consent(page)
+                self._wait_for_google_results(page)
+                self._raise_if_google_blocked(page)
+                return True
+            except RuntimeError as exc:
+                if "anti-bot/CAPTCHA" in str(exc):
+                    raise
+            except Exception:
+                pass
+
+        if self._go_google_next_page(page):
+            return True
+
+        if self.next_fallback_direct:
+            return self._go_google_next_page_by_start(page, query_text, page_no)
+        return False
+
+    def _get_google_next_href(self, page) -> str | None:
+        try:
+            href = page.evaluate(
+                """
+                () => {
+                  const anchors = Array.from(document.querySelectorAll('a[href]'));
+                  const next = anchors.find(a => {
+                    const id = (a.id || '').toLowerCase();
+                    const aria = (a.getAttribute('aria-label') || '').toLowerCase();
+                    const text = (a.innerText || a.textContent || '').trim().toLowerCase();
+                    return id === 'pnnext'
+                      || aria === 'next'
+                      || aria === 'next page'
+                      || text === 'next'
+                      || text === 'tiếp';
+                  });
+                  return next ? next.href : '';
+                }
+                """
+            )
+            if href:
+                return str(href)
+        except Exception:
+            pass
+        return None
 
     def _go_google_next_page_by_start(self, page, query_text: str, page_no: int) -> bool:
         if page_no <= 1:

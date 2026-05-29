@@ -60,7 +60,8 @@ $env:CLOAK_TIMEZONE="Asia/Saigon"
 $env:CLOAK_PROXY="http://user:pass@host:port"  # optional
 $env:CLOAK_GEOIP="true"                       # bật khi dùng proxy để match timezone/locale
 $env:CLOAK_FINGERPRINT_SEED="12345"           # optional, giữ fingerprint ổn định
-$env:SEARCH_MAX_PAGES="0"        # 0 = chạy đến khi Google không còn result mới
+$env:SEARCH_MAX_PAGES="0"        # 0 = chạy tới khi Google không còn Next/result
+$env:SEARCH_HARD_PAGE_LIMIT="100" # giới hạn an toàn khi SEARCH_MAX_PAGES=0
 ```
 
 Binary CloakBrowser:

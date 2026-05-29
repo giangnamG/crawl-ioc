@@ -264,6 +264,7 @@ def create_app(start_worker: bool = False) -> Flask:
                 output_url_queue_id = int(output_url_queue["id"]) if output_url_queue else None
                 keywords_imported = 0
                 queries_created = 0
+                queries_requeued = 0
 
                 for text in keyword_lines:
                     keyword_id = upsert_keyword(conn, text)
@@ -285,9 +286,18 @@ def create_app(start_worker: bool = False) -> Flask:
                             """,
                             (queue_id, search_query_id),
                         )
+                        existing_item = get_search_queue_item(conn, queue_id, search_query_id)
                         queue_item_id = upsert_search_queue_item(
                             conn, queue_id, search_query_id, keyword_id, output_url_queue_id
                         )
+                        if existing_item:
+                            if reactivate_search_queue_item(
+                                conn,
+                                queue_item_id,
+                                search_query_id,
+                                output_url_queue_id,
+                            ):
+                                queries_requeued += 1
                         queue_search_job(
                             conn,
                             queue_id=queue_id,
@@ -296,9 +306,12 @@ def create_app(start_worker: bool = False) -> Flask:
                             output_url_queue_id=output_url_queue_id,
                             initial_status="paused",
                         )
+                    refresh_keyword_status(conn, keyword_id)
+
+                refresh_queue_status(conn, queue_id)
 
                 flash(
-                    f"Added {keywords_imported} keyword lines and {queries_created} search queries to queue. Start the queue when ready.",
+                    f"Added {keywords_imported} keyword lines, created {queries_created} search queries, and requeued {queries_requeued} existing queries. Start the queue when ready.",
                     "success",
                 )
                 return redirect(url_for("queues", queue_id=queue_id))
@@ -891,6 +904,18 @@ def delete_keyword_from_queue(conn, keyword_id: int) -> tuple[bool, int, int, st
     if running_queries:
         return False, 0, 0, "Cannot delete keyword while a search query is running. Stop it and wait for the current browser session to finish."
 
+    running_items = conn.execute(
+        """
+        SELECT id
+        FROM search_queue_items
+        WHERE keyword_id = ?
+          AND status = 'running'
+        """,
+        (keyword_id,),
+    ).fetchall()
+    if running_items:
+        return False, 0, 0, "Cannot delete keyword while a queue item is running. Stop it and wait for the current browser session to finish."
+
     running_jobs = []
     for query_id in query_ids:
         row = conn.execute(
@@ -910,10 +935,31 @@ def delete_keyword_from_queue(conn, keyword_id: int) -> tuple[bool, int, int, st
 
     conn.execute("UPDATE keywords SET status = 'paused' WHERE id = ?", (keyword_id,))
     job_count = 0
+    affected_queue_ids = {
+        int(row["queue_id"])
+        for row in conn.execute(
+            """
+            SELECT DISTINCT queue_id
+            FROM search_queue_items
+            WHERE keyword_id = ?
+            """,
+            (keyword_id,),
+        ).fetchall()
+        if row["queue_id"] is not None
+    }
 
     if query_ids:
         query_placeholders = ",".join("?" for _ in query_ids)
         source_params = [keyword_id, *query_ids]
+        queue_item_rows = conn.execute(
+            f"""
+            SELECT id
+            FROM search_queue_items
+            WHERE keyword_id = ? OR search_query_id IN ({query_placeholders})
+            """,
+            source_params,
+        ).fetchall()
+        queue_item_ids = [int(row["id"]) for row in queue_item_rows]
         conn.execute(
             f"""
             UPDATE url_sources
@@ -932,6 +978,24 @@ def delete_keyword_from_queue(conn, keyword_id: int) -> tuple[bool, int, int, st
             """,
             source_params,
         )
+        conn.execute(
+            f"""
+            UPDATE url_queue_items
+            SET source_search_query_id = NULL
+            WHERE source_search_query_id IN ({query_placeholders})
+            """,
+            query_ids,
+        )
+        if queue_item_ids:
+            item_placeholders = ",".join("?" for _ in queue_item_ids)
+            conn.execute(
+                f"""
+                UPDATE url_queue_items
+                SET source_search_queue_item_id = NULL
+                WHERE source_search_queue_item_id IN ({item_placeholders})
+                """,
+                queue_item_ids,
+            )
 
         for query_id in query_ids:
             job_cursor = conn.execute(
@@ -943,12 +1007,37 @@ def delete_keyword_from_queue(conn, keyword_id: int) -> tuple[bool, int, int, st
                 (f"search:{query_id}", f"queue:%:search:{query_id}"),
             )
             job_count += max(job_cursor.rowcount, 0)
+        conn.execute(
+            f"""
+            DELETE FROM search_queue_items
+            WHERE keyword_id = ? OR search_query_id IN ({query_placeholders})
+            """,
+            source_params,
+        )
         conn.execute(f"DELETE FROM search_queries WHERE id IN ({query_placeholders})", query_ids)
     else:
         conn.execute("UPDATE url_sources SET keyword_id = NULL WHERE keyword_id = ?", (keyword_id,))
         conn.execute("UPDATE domain_sources SET keyword_id = NULL WHERE keyword_id = ?", (keyword_id,))
+        queue_item_rows = conn.execute(
+            "SELECT id FROM search_queue_items WHERE keyword_id = ?",
+            (keyword_id,),
+        ).fetchall()
+        queue_item_ids = [int(row["id"]) for row in queue_item_rows]
+        if queue_item_ids:
+            item_placeholders = ",".join("?" for _ in queue_item_ids)
+            conn.execute(
+                f"""
+                UPDATE url_queue_items
+                SET source_search_queue_item_id = NULL
+                WHERE source_search_queue_item_id IN ({item_placeholders})
+                """,
+                queue_item_ids,
+            )
+        conn.execute("DELETE FROM search_queue_items WHERE keyword_id = ?", (keyword_id,))
 
     conn.execute("DELETE FROM keywords WHERE id = ?", (keyword_id,))
+    for queue_id in affected_queue_ids:
+        refresh_queue_status(conn, queue_id)
     return True, len(query_ids), job_count, ""
 
 
@@ -1428,6 +1517,61 @@ def upsert_search_queue_item(
         (queue_id, search_query_id),
     ).fetchone()
     return int(row["id"])
+
+
+def get_search_queue_item(conn, queue_id: int, search_query_id: int):
+    return conn.execute(
+        """
+        SELECT *
+        FROM search_queue_items
+        WHERE queue_id = ? AND search_query_id = ?
+        """,
+        (queue_id, search_query_id),
+    ).fetchone()
+
+
+def reactivate_search_queue_item(
+    conn,
+    queue_item_id: int,
+    search_query_id: int,
+    output_url_queue_id: int | None,
+) -> bool:
+    row = conn.execute(
+        "SELECT status FROM search_queue_items WHERE id = ?",
+        (queue_item_id,),
+    ).fetchone()
+    if not row or row["status"] == "running":
+        return False
+
+    conn.execute(
+        """
+        UPDATE search_queue_items
+        SET status = 'paused',
+            output_url_queue_id = COALESCE(?, output_url_queue_id),
+            result_count = 0,
+            page_count = 0,
+            error = NULL,
+            started_at = NULL,
+            finished_at = NULL
+        WHERE id = ?
+        """,
+        (output_url_queue_id, queue_item_id),
+    )
+    conn.execute(
+        """
+        UPDATE search_queries
+        SET status = 'pending',
+            result_count = 0,
+            page_count = 0,
+            last_error = NULL,
+            started_at = NULL,
+            finished_at = NULL
+        WHERE id = ?
+          AND status != 'running'
+        """,
+        (search_query_id,),
+    )
+    return True
 
 
 def build_search_job_payload(
