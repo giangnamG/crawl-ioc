@@ -506,6 +506,42 @@ def classify_crawl_strategy(url: str) -> str:
     return "cloak_browser"
 
 
+def enqueue_discovered_url_if_new(
+    conn: Connection,
+    url_queue_id: int | None,
+    url_id: int,
+    source_url_queue_item_id: int | None = None,
+) -> int | None:
+    if not url_queue_id:
+        return None
+
+    target = conn.execute(
+        "SELECT crawl_status FROM urls WHERE id = ?",
+        (url_id,),
+    ).fetchone()
+    if not target or target["crawl_status"] in TERMINAL_CRAWL_STATUSES:
+        return None
+
+    existing_item = conn.execute(
+        """
+        SELECT id
+        FROM url_queue_items
+        WHERE queue_id = ? AND url_id = ?
+        """,
+        (url_queue_id, url_id),
+    ).fetchone()
+    if existing_item:
+        return None
+
+    return enqueue_url_to_queue(
+        conn,
+        url_queue_id=url_queue_id,
+        url_id=url_id,
+        source_queue_id=url_queue_id,
+        source_url_queue_item_id=source_url_queue_item_id,
+    )
+
+
 def env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -634,7 +670,7 @@ def process_crawl_url(
                 discovered_domain = get_domain(discovered_url)
                 if discovered_domain:
                     discovered_url_id = upsert_url(
-                        conn, ioc.raw, discovered_url, discovered_domain, "extracted_from_crawl"
+                        conn, discovered_url, discovered_url, discovered_domain, "extracted_from_crawl"
                     )
                     upsert_domain(conn, discovered_domain, "extracted_from_crawl")
                     upsert_url_source(
@@ -654,14 +690,12 @@ def process_crawl_url(
                         source_url_id=url_id,
                         discovered_url_id=discovered_url_id,
                     )
-                    if queue_id:
-                        enqueue_url_to_queue(
-                            conn,
-                            url_queue_id=queue_id,
-                            url_id=discovered_url_id,
-                            source_queue_id=queue_id,
-                            source_url_queue_item_id=url_queue_item_id,
-                        )
+                    enqueue_discovered_url_if_new(
+                        conn,
+                        url_queue_id=queue_id,
+                        url_id=discovered_url_id,
+                        source_url_queue_item_id=url_queue_item_id,
+                    )
 
         if ioc.type == "domain":
             discovered_domain = normalize_domain(ioc.norm)
@@ -690,12 +724,11 @@ def process_crawl_url(
                     source_url_id=url_id,
                     discovered_url_id=discovered_url_id,
                 )
-                if queue_id and discovered_url_id:
-                    enqueue_url_to_queue(
+                if discovered_url_id:
+                    enqueue_discovered_url_if_new(
                         conn,
                         url_queue_id=queue_id,
                         url_id=discovered_url_id,
-                        source_queue_id=queue_id,
                         source_url_queue_item_id=url_queue_item_id,
                     )
 

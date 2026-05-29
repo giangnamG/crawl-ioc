@@ -30,13 +30,23 @@
       <span class="muted">{{ rows|length }} rows</span>
     </div>
     <div class="table-wrap">
-      <table>
+      <table class="ioc-table">
+        <colgroup>
+          <col class="ioc-col-id">
+          <col class="ioc-col-type">
+          <col class="ioc-col-value">
+          <col class="ioc-col-sources">
+          <col class="ioc-col-count">
+          <col class="ioc-col-rules">
+          <col class="ioc-col-action">
+        </colgroup>
         <thead>
           <tr>
             <th>ID</th>
             <th>Type</th>
             <th>Normalized Value</th>
-            <th>Sources</th>
+            <th>Source Domain / URL</th>
+            <th>Count</th>
             <th>Rules</th>
             <th class="actions-col">Action</th>
           </tr>
@@ -47,6 +57,18 @@
               <td>#{{ row.id }}</td>
               <td><span class="tag">{{ row.type }}</span></td>
               <td><code>{{ row.value_norm|truncate_middle(96) }}</code></td>
+              <td>
+                <div class="source-inline-list">
+                  {% for source_domain in (row.source_domains.split(",") if row.source_domains else []) %}
+                    <span class="source-domain">{{ source_domain }}</span>
+                  {% endfor %}
+                  {% for source_url in (row.source_urls.split(",") if row.source_urls else []) %}
+                    <a href="{{ source_url }}" target="_blank" rel="noreferrer">{{ source_url }}</a>
+                  {% else %}
+                    <span class="muted">No source URL</span>
+                  {% endfor %}
+                </div>
+              </td>
               <td>{{ row.source_count }}</td>
               <td>{{ row.rule_names or "" }}</td>
               <td><a class="button small" href="{{ url_for('iocs', ioc_id=row.id, type=ioc_type) }}">Sources</a></td>
@@ -78,7 +100,7 @@
           <tbody>
             {% for row in sources %}
               <tr>
-                <td><a href="{{ row.url_norm }}" target="_blank" rel="noreferrer">{{ row.url_norm|truncate_middle(86) }}</a></td>
+                <td><a class="source-url-full" href="{{ row.url_norm }}" target="_blank" rel="noreferrer">{{ row.url_norm }}</a></td>
                 <td>{{ row.domain }}</td>
                 <td>{{ row.rule_name or "" }}</td>
                 <td>{{ row.evidence_text }}</td>

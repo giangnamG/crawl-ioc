@@ -1,6 +1,9 @@
 import os
+import re
 import sqlite3
 from pathlib import Path
+
+from .normalizers import normalize_by_rule
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -269,26 +272,169 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
             ],
         )
 
-    conn.execute(
+    refresh_builtin_extraction_rules(conn)
+    cleanup_invalid_iocs(conn)
+
+
+def refresh_builtin_extraction_rules(conn: sqlite3.Connection) -> None:
+    updates = [
+        (
+            "Email basic",
+            r"(?<![A-Z0-9._%+-])([A-Z0-9](?:[A-Z0-9._%+-]{0,62}[A-Z0-9])?@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+)(?![A-Z0-9._%+-])",
+            "i",
+            1,
+            "text",
+            r"@(example|test|invalid|localhost)\.",
+            "email",
+            "Strict email extraction with validated domain/TLD.",
+        ),
+        (
+            "HTTP URL",
+            r"https?://[^\s\"'<>]+",
+            "i",
+            0,
+            "all",
+            None,
+            "url",
+            "Absolute HTTP/HTTPS URL extraction with URL/domain validation.",
+        ),
+        (
+            "Domain basic",
+            r"(?<![@\w.-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})(?![\w.-]*@)(?![\w.-])",
+            "i",
+            1,
+            "text",
+            r"^(example\.com|localhost|.*\.(?:php|html?|aspx?|jsp|css|js|mjs|map|png|jpe?g|gif|svg|webp|json|xml|txt|pdf|woff2?|ttf|eot))$",
+            "domain",
+            "Strict domain extraction with TLD validation to avoid JavaScript property false positives.",
+        ),
+        (
+            "Vietnam mobile phone",
+            r"(?<![\d+])(?:\+84|84|0)[\s.\-]?(?:3|5|7|8|9)(?:[\s.\-]?\d){8}(?!\d)",
+            "",
+            0,
+            "text",
+            None,
+            "phone_vn",
+            "Vietnam mobile phone extraction for 0xxx, +84xxx, and spaced/dotted forms.",
+        ),
+        (
+            "Address context",
+            r"(?:địa\s*chỉ|dia\s*chi|address|office\s+address)\s*[:：-]\s*([^\n\r<>{}();=]{8,180}?)(?=\s+(?:email|e-mail|mail|sdt|sđt|phone|tel|telephone|hotline|website|web|social)\b\s*:?|[\n\r<]|$)",
+            "i",
+            1,
+            "text",
+            None,
+            "address",
+            "Address extraction only from explicit address labels.",
+        ),
+    ]
+    for name, pattern, flags, value_group, input_scope, exclude_pattern, normalizer, description in updates:
+        conn.execute(
+            """
+            UPDATE extraction_rules
+            SET pattern = ?,
+                flags = ?,
+                value_group = ?,
+                input_scope = ?,
+                exclude_pattern = ?,
+                normalizer = ?,
+                description = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE builtin = 1 AND name = ?
+            """,
+            (
+                pattern,
+                flags,
+                value_group,
+                input_scope,
+                exclude_pattern,
+                normalizer,
+                description,
+                name,
+            ),
+        )
+
+
+def cleanup_invalid_iocs(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
         """
-        UPDATE extraction_rules
-        SET pattern = ?,
-            normalizer = 'phone_vn',
-            input_scope = 'text',
-            updated_at = CURRENT_TIMESTAMP
-        WHERE builtin = 1 AND name = 'Vietnam mobile phone'
-        """,
-        (r"(?<!\d)(?:\+?84|0)[\s.\-]?(?:3|5|7|8|9)(?:[\s.\-]?\d){8}(?!\d)",),
-    )
-    conn.execute(
+        SELECT id, type, value_norm
+        FROM iocs
+        WHERE type IN ('domain', 'email', 'phone', 'url', 'address')
         """
-        UPDATE extraction_rules
-        SET exclude_pattern = ?,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE builtin = 1 AND name = 'Domain basic'
+    ).fetchall()
+    for row in rows:
+        normalized = normalize_by_rule(row["value_norm"], row["type"], row["type"])
+        if row["type"] == "domain" and domain_ioc_is_email_localpart(conn, int(row["id"]), row["value_norm"]):
+            normalized = None
+        if normalized == row["value_norm"]:
+            continue
+        if normalized:
+            merge_or_update_ioc(conn, int(row["id"]), row["type"], normalized)
+        else:
+            conn.execute("DELETE FROM ioc_sources WHERE ioc_id = ?", (row["id"],))
+            conn.execute("DELETE FROM iocs WHERE id = ?", (row["id"],))
+
+
+def merge_or_update_ioc(conn: sqlite3.Connection, ioc_id: int, ioc_type: str, normalized: str) -> None:
+    existing = conn.execute(
+        "SELECT id FROM iocs WHERE type = ? AND value_norm = ?",
+        (ioc_type, normalized),
+    ).fetchone()
+    if not existing:
+        conn.execute(
+            """
+            UPDATE iocs
+            SET value_raw = ?,
+                value_norm = ?
+            WHERE id = ?
+            """,
+            (normalized, normalized, ioc_id),
+        )
+        return
+
+    existing_id = int(existing["id"])
+    if existing_id == ioc_id:
+        return
+
+    sources = conn.execute(
+        """
+        SELECT source_url_id, extraction_rule_id, evidence_text
+        FROM ioc_sources
+        WHERE ioc_id = ?
         """,
-        (r"^(example\.com|localhost|.*\.(?:php|html?|aspx?|jsp|css|js|png|jpe?g|gif|svg|webp|json|xml|txt|pdf))$",),
-    )
+        (ioc_id,),
+    ).fetchall()
+    for source in sources:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO ioc_sources(
+              ioc_id, source_url_id, extraction_rule_id, evidence_text
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                existing_id,
+                source["source_url_id"],
+                source["extraction_rule_id"],
+                source["evidence_text"],
+            ),
+        )
+    conn.execute("DELETE FROM ioc_sources WHERE ioc_id = ?", (ioc_id,))
+    conn.execute("DELETE FROM iocs WHERE id = ?", (ioc_id,))
+
+
+def domain_ioc_is_email_localpart(conn: sqlite3.Connection, ioc_id: int, domain: str) -> bool:
+    sources = conn.execute(
+        "SELECT evidence_text FROM ioc_sources WHERE ioc_id = ?",
+        (ioc_id,),
+    ).fetchall()
+    if not sources:
+        return False
+
+    localpart_pattern = re.compile(rf"(?<![\w.-]){re.escape(domain)}@", re.IGNORECASE)
+    return all(localpart_pattern.search(source["evidence_text"] or "") for source in sources)
 
 
 SCHEMA = """

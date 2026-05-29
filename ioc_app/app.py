@@ -666,9 +666,12 @@ def create_app(start_worker: bool = False) -> Flask:
                 f"""
                 SELECT i.*,
                        COUNT(DISTINCT s.id) AS source_count,
+                       GROUP_CONCAT(DISTINCT u.domain) AS source_domains,
+                       GROUP_CONCAT(DISTINCT u.url_norm) AS source_urls,
                        GROUP_CONCAT(DISTINCT r.name) AS rule_names
                 FROM iocs i
                 LEFT JOIN ioc_sources s ON s.ioc_id = i.id
+                LEFT JOIN urls u ON u.id = s.source_url_id
                 LEFT JOIN extraction_rules r ON r.id = s.extraction_rule_id
                 {where}
                 GROUP BY i.id

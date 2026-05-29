@@ -522,6 +522,65 @@ tbody tr:hover .review-url-actions-cell {
   width: 170px;
 }
 
+.ioc-table {
+  min-width: 1380px;
+  table-layout: fixed;
+}
+
+.ioc-col-id {
+  width: 74px;
+}
+
+.ioc-col-type {
+  width: 130px;
+}
+
+.ioc-col-value {
+  width: 300px;
+}
+
+.ioc-col-sources {
+  width: 440px;
+}
+
+.ioc-col-count {
+  width: 80px;
+}
+
+.ioc-col-rules {
+  width: 170px;
+}
+
+.ioc-col-action {
+  width: 116px;
+}
+
+.source-inline-list {
+  display: grid;
+  gap: 4px;
+  max-height: 116px;
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.source-inline-list a,
+.source-inline-list .source-domain {
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.source-inline-list .source-domain {
+  color: #334155;
+  font-weight: 700;
+}
+
+.source-url-full {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .keyword-table {
   min-width: 1120px;
   table-layout: fixed;
