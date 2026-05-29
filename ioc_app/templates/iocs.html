@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+
+{% block title %}IOCs · IOC Investigator{% endblock %}
+{% block heading %}IOCs{% endblock %}
+{% block eyebrow %}Extracted indicators and sources{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Filters</h2>
+      <span class="muted">Each IOC is unique by type and normalized value.</span>
+    </div>
+    <form method="get" class="filter-bar">
+      <label>
+        <span>Type</span>
+        <select name="type">
+          <option value="" {% if not ioc_type %}selected{% endif %}>Any</option>
+          {% for item in ["email", "phone", "url", "domain", "hash_md5", "hash_sha1", "hash_sha256", "hash_sha512", "address"] %}
+            <option value="{{ item }}" {% if ioc_type == item %}selected{% endif %}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button class="button primary" type="submit">Apply</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>IOC Table</h2>
+      <span class="muted">{{ rows|length }} rows</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Type</th>
+            <th>Normalized Value</th>
+            <th>Sources</th>
+            <th>Rules</th>
+            <th class="actions-col">Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td>#{{ row.id }}</td>
+              <td><span class="tag">{{ row.type }}</span></td>
+              <td><code>{{ row.value_norm|truncate_middle(96) }}</code></td>
+              <td>{{ row.source_count }}</td>
+              <td>{{ row.rule_names or "" }}</td>
+              <td><a class="button small" href="{{ url_for('iocs', ioc_id=row.id, type=ioc_type) }}">Sources</a></td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6" class="empty">No IOCs extracted yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  {% if selected %}
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Sources For #{{ selected.id }}</h2>
+        <code>{{ selected.value_norm|truncate_middle(100) }}</code>
+      </div>
+      <div class="table-wrap compact">
+        <table>
+          <thead>
+            <tr>
+              <th>Source URL</th>
+              <th>Domain</th>
+              <th>Rule</th>
+              <th>Evidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in sources %}
+              <tr>
+                <td><a href="{{ row.url_norm }}" target="_blank" rel="noreferrer">{{ row.url_norm|truncate_middle(86) }}</a></td>
+                <td>{{ row.domain }}</td>
+                <td>{{ row.rule_name or "" }}</td>
+                <td>{{ row.evidence_text }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="4" class="empty">No source rows found.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endif %}
+{% endblock %}

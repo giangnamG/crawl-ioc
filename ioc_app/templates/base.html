@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}IOC Investigator{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">IO</span>
+          <div>
+            <strong>IOC Investigator</strong>
+            <small>SQLite SSR Console</small>
+          </div>
+        </div>
+        <nav class="nav-list" aria-label="Primary">
+          {% for label, endpoint in nav %}
+            <a href="{{ url_for(endpoint) }}" class="{% if request.endpoint == endpoint %}active{% endif %}">
+              {{ label }}
+            </a>
+          {% endfor %}
+        </nav>
+        <div class="sidebar-foot">
+          <span>DB</span>
+          <code title="{{ db_path }}">{{ db_path|truncate_middle(36) }}</code>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">{% block eyebrow %}Investigation Console{% endblock %}</p>
+            <h1>{% block heading %}Dashboard{% endblock %}</h1>
+          </div>
+          <div class="topbar-actions">
+            {% block actions %}{% endblock %}
+          </div>
+        </header>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            <div class="flash-stack">
+              {% for category, message in messages %}
+                <div class="flash {{ category }}">{{ message }}</div>
+              {% endfor %}
+            </div>
+          {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </body>
+</html>

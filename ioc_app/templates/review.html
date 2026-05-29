@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+
+{% block title %}Review · IOC Investigator{% endblock %}
+{% block heading %}Review URLs And Domains{% endblock %}
+{% block eyebrow %}Human validation gate{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Filters</h2>
+      <span class="muted">Rejected rows are hidden unless selected.</span>
+    </div>
+    <form method="get" class="filter-bar">
+      <label>
+        <span>Status</span>
+        <select name="status">
+          {% for item in ["pending_review", "approved", "rejected"] %}
+            <option value="{{ item }}" {% if status == item %}selected{% endif %}>{{ item|status_label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Domain Source</span>
+        <select name="source">
+          <option value="" {% if not source %}selected{% endif %}>Any</option>
+          <option value="google_search" {% if source == "google_search" %}selected{% endif %}>Google Search</option>
+          <option value="extracted_from_crawl" {% if source == "extracted_from_crawl" %}selected{% endif %}>From Domain</option>
+          <option value="both" {% if source == "both" %}selected{% endif %}>Both</option>
+        </select>
+      </label>
+      <label class="grow">
+        <span>Search</span>
+        <input name="q" value="{{ q }}" placeholder="domain or URL">
+      </label>
+      <button class="button primary" type="submit">Apply</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>URL Review Queue</h2>
+      <span class="muted">{{ urls|length }} rows</span>
+    </div>
+    <div class="table-wrap scroll-y review-url-wrap">
+      <table class="review-table url-review-table">
+        <colgroup>
+          <col class="col-id">
+          <col class="col-domain">
+          <col class="col-source">
+          <col class="col-url">
+          <col class="col-query">
+          <col class="col-status">
+          <col class="col-status">
+          <col class="col-actions">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Domain</th>
+            <th>Source</th>
+            <th>URL</th>
+            <th>Query</th>
+            <th>Review</th>
+            <th>Crawl</th>
+            <th class="actions-col">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in urls %}
+            <tr>
+              <td class="cell-id">#{{ row.id }}</td>
+              <td class="cell-domain"><strong title="{{ row.domain }}">{{ row.domain }}</strong></td>
+              <td class="cell-tags">
+                {% for item in (row.domain_sources or "").split(",") if item %}
+                  <span class="tag">{{ "Google" if item == "google_search" else "From Domain" }}</span>
+                {% endfor %}
+              </td>
+              <td class="cell-url">
+                <a class="truncate-line" href="{{ row.url_norm }}" target="_blank" rel="noreferrer" title="{{ row.url_norm }}">{{ row.url_norm }}</a>
+                {% if row.title %}<small class="truncate-line" title="{{ row.title }}">{{ row.title }}</small>{% endif %}
+              </td>
+              <td class="cell-query"><code class="truncate-line" title="{{ row.queries or '' }}">{{ row.queries or "" }}</code></td>
+              <td class="cell-status"><span class="badge {{ row.review_status }}">{{ row.review_status|status_label }}</span></td>
+              <td class="cell-status"><span class="badge {{ row.crawl_status }}">{{ row.crawl_status|status_label }}</span></td>
+              <td class="cell-actions">
+                <div class="row-actions">
+                  <form method="post" action="{{ url_for('approve_url', url_id=row.id) }}">
+                    <button class="button small primary" type="submit">Approve</button>
+                  </form>
+                  <form method="post" action="{{ url_for('reject_url_route', url_id=row.id) }}">
+                    <button class="button small" type="submit">Reject URL</button>
+                  </form>
+                  <form method="post" action="{{ url_for('reject_domain_route') }}">
+                    <input type="hidden" name="domain" value="{{ row.domain }}">
+                    <button class="button small danger compact-action" type="submit">Reject Domain</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="8" class="empty">No URLs match this filter.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Domain Review</h2>
+      <span class="muted">Approve/reject all URLs under a domain.</span>
+    </div>
+    <div class="table-wrap compact scroll-y review-domain-wrap">
+      <table class="review-table domain-review-table">
+        <colgroup>
+          <col class="col-domain-wide">
+          <col class="col-source-wide">
+          <col class="col-status">
+          <col class="col-count">
+          <col class="col-actions">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Domain</th>
+            <th>Sources</th>
+            <th>Status</th>
+            <th>URLs</th>
+            <th class="actions-col">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in domains %}
+            <tr>
+              <td class="cell-domain"><strong title="{{ row.domain }}">{{ row.domain }}</strong></td>
+              <td class="cell-tags">
+                {% for item in (row.sources or "").split(",") if item %}
+                  <span class="tag">{{ "Google" if item == "google_search" else "From Domain" }}</span>
+                {% endfor %}
+              </td>
+              <td class="cell-status"><span class="badge {{ row.review_status }}">{{ row.review_status|status_label }}</span></td>
+              <td class="cell-count">{{ row.url_count }}</td>
+              <td class="cell-actions">
+                <div class="row-actions">
+                  <form method="post" action="{{ url_for('approve_domain_route') }}">
+                    <input type="hidden" name="domain" value="{{ row.domain }}">
+                    <button class="button small primary" type="submit">Approve</button>
+                  </form>
+                  <form method="post" action="{{ url_for('reject_domain_route') }}">
+                    <input type="hidden" name="domain" value="{{ row.domain }}">
+                    <button class="button small danger" type="submit">Reject</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="5" class="empty">No domains found.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

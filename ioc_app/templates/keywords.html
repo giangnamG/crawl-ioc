@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+
+{% block title %}Keywords · IOC Investigator{% endblock %}
+{% block heading %}Keywords{% endblock %}
+{% block eyebrow %}Search intake{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Import Keywords</h2>
+      <span class="muted">Use dork templates or submit each line as a complete Google query.</span>
+    </div>
+    <form method="post" class="stacked-form">
+      <label>
+        <span>Keywords Or Full Queries</span>
+        <textarea name="keywords" rows="7" placeholder="88i&#10;88i casino&#10;site:88i.*"></textarea>
+      </label>
+
+      <div class="field-block">
+        <span class="field-label">Search Mode</span>
+        <div class="mode-grid">
+          <label class="mode-card">
+            <input type="radio" name="query_mode" value="dork" checked>
+            <span>
+              <strong>Combine With Dorks</strong>
+              <small>Each line is treated as a keyword and rendered through selected templates.</small>
+            </span>
+          </label>
+          <label class="mode-card">
+            <input type="radio" name="query_mode" value="direct">
+            <span>
+              <strong>Full Google Query</strong>
+              <small>Each line is queued exactly as typed, e.g. <code>site:88i.*</code>.</small>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <div class="field-block">
+        <span class="field-label">Search Dorks</span>
+        <div class="check-grid">
+          {% for dork in dorks %}
+            <label class="check-row {% if not dork.enabled %}muted-row{% endif %}">
+              <input type="checkbox" name="dork_ids" value="{{ dork.id }}" {% if dork.enabled %}checked{% endif %} {% if not dork.enabled %}disabled{% endif %}>
+              <span>
+                <strong>{{ dork.name }}</strong>
+                <code>{{ dork.template }}</code>
+              </span>
+            </label>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="form-actions">
+        <button class="button primary" type="submit">Import And Queue</button>
+        <a class="button" href="{{ url_for('dorks') }}">Manage Dorks</a>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Imported Keywords</h2>
+      <span class="muted">Latest 200</span>
+    </div>
+    <div class="table-wrap">
+      <table class="keyword-table">
+        <colgroup>
+          <col class="keyword-col-id">
+          <col class="keyword-col-text">
+          <col class="keyword-col-status">
+          <col class="keyword-col-number">
+          <col class="keyword-col-number">
+          <col class="keyword-col-number">
+          <col class="keyword-col-number">
+          <col class="keyword-col-number">
+          <col class="keyword-col-created">
+          <col class="keyword-col-actions">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Keyword</th>
+            <th>Status</th>
+            <th>Queries</th>
+            <th>Done</th>
+            <th>Failed</th>
+            <th>Results</th>
+            <th>Pages</th>
+            <th>Created</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td>#{{ row.id }}</td>
+              <td class="cell-keyword"><strong title="{{ row.text }}">{{ row.text }}</strong></td>
+              <td><span class="badge {{ row.status }}">{{ row.status|status_label }}</span></td>
+              <td>{{ row.query_count }}</td>
+              <td>{{ row.done_count }}</td>
+              <td>{{ row.failed_count }}</td>
+              <td>{{ row.result_count }}</td>
+              <td>{{ row.page_count }}</td>
+              <td>{{ row.created_at }}</td>
+              <td class="cell-actions">
+                <div class="row-actions">
+                  {% if row.status == "paused" %}
+                    <form method="post" action="{{ url_for('resume_keyword', keyword_id=row.id) }}">
+                      <button class="button small primary" type="submit">Resume</button>
+                    </form>
+                  {% else %}
+                    <form method="post" action="{{ url_for('stop_keyword', keyword_id=row.id) }}">
+                      <button class="button small" type="submit">Stop</button>
+                    </form>
+                  {% endif %}
+                  <form method="post" action="{{ url_for('delete_keyword', keyword_id=row.id) }}" onsubmit="return confirm('Delete this keyword from queue? Collected URLs, domains, and IOCs will be kept.');">
+                    <button class="button small danger" type="submit">Delete</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="10" class="empty">No keywords imported yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

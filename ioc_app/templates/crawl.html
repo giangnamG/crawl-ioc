@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block title %}Crawl · IOC Investigator{% endblock %}
+{% block heading %}Crawl Status{% endblock %}
+{% block eyebrow %}Approved URL processing{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-head">
+      <h2>URL Crawl State</h2>
+      <a href="{{ url_for('jobs') }}">Run jobs</a>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Domain</th>
+            <th>URL</th>
+            <th>Review</th>
+            <th>Crawl</th>
+            <th>Status Code</th>
+            <th>Crawled At</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td>#{{ row.id }}</td>
+              <td><strong>{{ row.domain }}</strong></td>
+              <td>
+                <a href="{{ row.url_norm }}" target="_blank" rel="noreferrer">{{ row.url_norm|truncate_middle(86) }}</a>
+                {% if row.final_url and row.final_url != row.url_norm %}
+                  <small>Final: {{ row.final_url|truncate_middle(86) }}</small>
+                {% endif %}
+              </td>
+              <td><span class="badge {{ row.review_status }}">{{ row.review_status|status_label }}</span></td>
+              <td><span class="badge {{ row.crawl_status }}">{{ row.crawl_status|status_label }}</span></td>
+              <td>{{ row.status_code or "" }}</td>
+              <td>{{ row.crawled_at or "" }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="7" class="empty">No approved or crawled URLs yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

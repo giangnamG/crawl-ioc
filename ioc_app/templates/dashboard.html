@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard · IOC Investigator{% endblock %}
+{% block heading %}Dashboard{% endblock %}
+{% block eyebrow %}Overview{% endblock %}
+{% block actions %}
+  <a class="button primary" href="{{ url_for('keywords') }}">Import Keywords</a>
+{% endblock %}
+
+{% block content %}
+  <section class="metric-grid">
+    {% for label, key in [
+      ("Keywords", "keywords"),
+      ("Search Queries", "search_queries"),
+      ("Pending Jobs", "pending_jobs"),
+      ("Pending Review", "pending_review"),
+      ("Approved URLs", "approved_urls"),
+      ("Crawled URLs", "crawled_urls"),
+      ("Domains", "domains"),
+      ("IOCs", "iocs")
+    ] %}
+      <div class="metric">
+        <span>{{ label }}</span>
+        <strong>{{ counts[key] }}</strong>
+      </div>
+    {% endfor %}
+  </section>
+
+  <div class="two-col">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Recent Jobs</h2>
+        <a href="{{ url_for('jobs') }}">View all</a>
+      </div>
+      <div class="table-wrap dashboard-table-wrap">
+        <table class="dashboard-table">
+          <colgroup>
+            <col class="dash-col-id">
+            <col class="dash-col-type">
+            <col class="dash-col-status">
+            <col class="dash-col-attempts">
+          </colgroup>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Type</th>
+              <th>Status</th>
+              <th>Attempts</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for job in recent_jobs %}
+              <tr>
+                <td class="cell-id">#{{ job.id }}</td>
+                <td><code class="truncate-line" title="{{ job.type }}">{{ job.type }}</code></td>
+                <td><span class="badge {{ job.status }}">{{ job.status|status_label }}</span></td>
+                <td class="cell-count">{{ job.attempts }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="4" class="empty">No jobs yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Recent IOCs</h2>
+        <a href="{{ url_for('iocs') }}">View all</a>
+      </div>
+      <div class="table-wrap dashboard-table-wrap">
+        <table class="dashboard-table">
+          <colgroup>
+            <col class="dash-col-ioc-type">
+            <col class="dash-col-ioc-value">
+          </colgroup>
+          <thead>
+            <tr>
+              <th>Type</th>
+              <th>Value</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for ioc in recent_iocs %}
+              <tr>
+                <td><span class="tag">{{ ioc.type }}</span></td>
+                <td><code class="truncate-line" title="{{ ioc.value_norm }}">{{ ioc.value_norm }}</code></td>
+              </tr>
+            {% else %}
+              <tr><td colspan="2" class="empty">No IOCs yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+{% endblock %}

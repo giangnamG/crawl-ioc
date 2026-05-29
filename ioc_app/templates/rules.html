@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+
+{% block title %}Rules · IOC Investigator{% endblock %}
+{% block heading %}Extraction Rules{% endblock %}
+{% block eyebrow %}Regex IOC extraction{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Create Or Test Rule</h2>
+      <span class="muted">Rules run only when enabled. Keep input scope narrow.</span>
+    </div>
+    <form method="post" class="grid-form">
+      <label>
+        <span>Name</span>
+        <input name="name" placeholder="Vietnam phone">
+      </label>
+      <label>
+        <span>IOC Type</span>
+        <select name="ioc_type">
+          {% for item in ["email", "phone", "url", "domain", "hash_md5", "hash_sha1", "hash_sha256", "hash_sha512", "address"] %}
+            <option value="{{ item }}">{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Flags</span>
+        <input name="flags" placeholder="i">
+      </label>
+      <label>
+        <span>Value Group</span>
+        <input name="value_group" type="number" value="0" min="0">
+      </label>
+      <label class="wide">
+        <span>Regex Pattern</span>
+        <input name="pattern" placeholder='[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'>
+      </label>
+      <label>
+        <span>Input Scope</span>
+        <select name="input_scope">
+          {% for item in ["text", "html", "links", "final_url", "redirects", "all"] %}
+            <option value="{{ item }}">{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Normalizer</span>
+        <select name="normalizer">
+          {% for item in ["default", "email", "phone_vn", "url", "domain", "hash", "address", "lowercase", "none"] %}
+            <option value="{{ item }}">{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Priority</span>
+        <input name="priority" type="number" value="100">
+      </label>
+      <label>
+        <span>Enabled</span>
+        <select name="enabled">
+          <option value="1">Enabled</option>
+          <option value="0">Disabled</option>
+        </select>
+      </label>
+      <label class="wide">
+        <span>Exclude Pattern</span>
+        <input name="exclude_pattern" placeholder="example\.com|test@">
+      </label>
+      <label class="wide">
+        <span>Description</span>
+        <input name="description" placeholder="What this rule is supposed to catch">
+      </label>
+      <label class="wide">
+        <span>Sample Text</span>
+        <textarea name="sample_text" rows="4" placeholder="Liên hệ 0988123456 hoặc support@example.com"></textarea>
+      </label>
+      <div class="form-actions wide">
+        <button class="button primary" type="submit" name="action" value="create">Create Rule</button>
+        <button class="button" type="submit" name="action" value="test">Test Rule</button>
+      </div>
+    </form>
+
+    {% if test_warnings %}
+      <div class="result-box error">
+        {% for warning in test_warnings %}
+          <span>{{ warning }}</span>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+    {% if test_output is not none %}
+      <div class="result-box">
+        <strong>Test Matches</strong>
+        {% if test_output %}
+          {% for item in test_output %}
+            <div class="match-row">
+              <span class="tag">{{ item.type }}</span>
+              <code>{{ item.norm }}</code>
+              <small>{{ item.evidence }}</small>
+            </div>
+          {% endfor %}
+        {% else %}
+          <span>No matches.</span>
+        {% endif %}
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Rules</h2>
+      <span class="muted">{{ rows|length }} configured</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Scope</th>
+            <th>Normalizer</th>
+            <th>Priority</th>
+            <th>Status</th>
+            <th>Pattern</th>
+            <th class="actions-col">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td>#{{ row.id }}</td>
+              <td>
+                <strong>{{ row.name }}</strong>
+                {% if row.builtin %}<span class="tag">built-in</span>{% endif %}
+              </td>
+              <td><span class="tag">{{ row.ioc_type }}</span></td>
+              <td>{{ row.input_scope }}</td>
+              <td>{{ row.normalizer }}</td>
+              <td>{{ row.priority }}</td>
+              <td><span class="badge {{ 'done' if row.enabled else 'skipped' }}">{{ "Enabled" if row.enabled else "Disabled" }}</span></td>
+              <td><code>{{ row.pattern|truncate_middle(90) }}</code></td>
+              <td>
+                <div class="row-actions">
+                  <form method="post" action="{{ url_for('toggle_rule', rule_id=row.id) }}">
+                    <button class="button small" type="submit">{{ "Disable" if row.enabled else "Enable" }}</button>
+                  </form>
+                  <form method="post" action="{{ url_for('delete_rule', rule_id=row.id) }}">
+                    <button class="button small danger" type="submit">Delete</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="9" class="empty">No extraction rules configured.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

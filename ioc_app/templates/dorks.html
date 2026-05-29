@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+
+{% block title %}Search Dorks · IOC Investigator{% endblock %}
+{% block heading %}Search Dorks{% endblock %}
+{% block eyebrow %}Google query templates{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Create Or Preview Template</h2>
+      <span class="muted">Use <code>{keyword}</code> as the placeholder.</span>
+    </div>
+    <form method="post" class="grid-form">
+      <label>
+        <span>Name</span>
+        <input name="name" placeholder="Contact page">
+      </label>
+      <label>
+        <span>Template</span>
+        <input name="template" placeholder='"{keyword}" "contact"'>
+      </label>
+      <label>
+        <span>Sample Keyword</span>
+        <input name="sample_keyword" value="88i">
+      </label>
+      <label class="wide">
+        <span>Description</span>
+        <input name="description" placeholder="Find pages with contact context">
+      </label>
+      <div class="form-actions wide">
+        <button class="button primary" type="submit" name="action" value="create">Create Dork</button>
+        <button class="button" type="submit" name="action" value="preview">Preview</button>
+      </div>
+    </form>
+
+    {% if preview %}
+      <div class="result-box {% if not preview.ok %}error{% endif %}">
+        <strong>{{ "Preview" if preview.ok else "Invalid template" }}</strong>
+        <code>{{ preview.query_text or preview.message }}</code>
+        {% for warning in preview.warnings %}
+          <span>{{ warning }}</span>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Templates</h2>
+      <span class="muted">{{ rows|length }} configured</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Template</th>
+            <th>Status</th>
+            <th>Description</th>
+            <th class="actions-col">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td>#{{ row.id }}</td>
+              <td><strong>{{ row.name }}</strong></td>
+              <td><code>{{ row.template }}</code></td>
+              <td><span class="badge {{ 'done' if row.enabled else 'skipped' }}">{{ "Enabled" if row.enabled else "Disabled" }}</span></td>
+              <td>{{ row.description or "" }}</td>
+              <td>
+                <div class="row-actions">
+                  <form method="post" action="{{ url_for('toggle_dork', dork_id=row.id) }}">
+                    <button class="button small" type="submit">{{ "Disable" if row.enabled else "Enable" }}</button>
+                  </form>
+                  <form method="post" action="{{ url_for('delete_dork', dork_id=row.id) }}">
+                    <button class="button small danger" type="submit">Delete</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6" class="empty">No dorks configured.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

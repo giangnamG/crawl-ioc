@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+
+{% block title %}Jobs · IOC Investigator{% endblock %}
+{% block heading %}Jobs{% endblock %}
+{% block eyebrow %}Queue control{% endblock %}
+{% block actions %}
+  <form method="post" class="inline-form">
+    <button class="button" type="submit" name="action" value="run_one">Run One</button>
+    <button class="button primary" type="submit" name="action" value="run_all">Run Batch</button>
+    <button class="button" type="submit" name="action" value="pause_all">Stop Queue</button>
+    <button class="button" type="submit" name="action" value="resume_all">Resume Queue</button>
+  </form>
+{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Job Queue</h2>
+      <span class="muted">
+        {% if auto_worker_enabled %}
+          Auto runner is active. Manual controls are still available.
+        {% else %}
+          Manual runner for local MVP.
+        {% endif %}
+      </span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Type</th>
+            <th>Status</th>
+            <th>Attempts</th>
+            <th>Payload</th>
+            <th>Error</th>
+            <th>Created</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td>#{{ row.id }}</td>
+              <td><code>{{ row.type }}</code></td>
+              <td><span class="badge {{ row.status }}">{{ row.status|status_label }}</span></td>
+              <td>{{ row.attempts }}</td>
+              <td><code>{{ row.payload|truncate_middle(60) }}</code></td>
+              <td>
+                {% if row.error %}
+                  <details>
+                    <summary>View</summary>
+                    <pre>{{ row.error }}</pre>
+                  </details>
+                {% endif %}
+              </td>
+              <td>{{ row.created_at }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="7" class="empty">No jobs queued.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}
