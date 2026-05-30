@@ -105,6 +105,20 @@
     </section>
   </section>
 
+  <section class="metric-grid queue-url-overview">
+    {% for label, key in [
+      ("Total URLs", "total_urls"),
+      ("Crawling URLs", "crawling_urls"),
+      ("Pending URLs", "pending_urls"),
+      ("Rejected URLs", "rejected_urls")
+    ] %}
+      <div class="metric">
+        <span>{{ label }}</span>
+        <strong>{{ url_overview[key] or 0 }}</strong>
+      </div>
+    {% endfor %}
+  </section>
+
   <section class="panel">
     <div class="panel-head">
       <h2>Queue Management</h2>
@@ -124,6 +138,10 @@
           <col class="queue-col-number">
           <col class="queue-col-number">
           <col class="queue-col-number">
+          <col class="queue-col-number">
+          <col class="queue-col-number">
+          <col class="queue-col-number">
+          <col class="queue-col-number">
           <col class="queue-col-actions">
         </colgroup>
         <thead>
@@ -134,6 +152,10 @@
             <th>Output URL Queue</th>
             <th>Status</th>
             <th class="queue-cell-number">Items</th>
+            <th class="queue-cell-number">URL Total</th>
+            <th class="queue-cell-number">URL Crawling</th>
+            <th class="queue-cell-number">URL Pending</th>
+            <th class="queue-cell-number">URL Rejected</th>
             <th class="queue-cell-number">Jobs</th>
             <th class="queue-cell-number">Pending</th>
             <th class="queue-cell-number">Running</th>
@@ -163,6 +185,10 @@
               </td>
               <td><span class="badge {{ row.status }}">{{ row.status|status_label }}</span></td>
               <td class="queue-cell-number">{{ row.search_query_count if row.queue_type == "keyword_search" else row.url_item_count }}</td>
+              <td class="queue-cell-number">{{ row.queue_url_total if row.queue_type == "url_crawl" else "-" }}</td>
+              <td class="queue-cell-number">{{ row.queue_url_crawling if row.queue_type == "url_crawl" else "-" }}</td>
+              <td class="queue-cell-number">{{ row.queue_url_pending if row.queue_type == "url_crawl" else "-" }}</td>
+              <td class="queue-cell-number">{{ row.queue_url_rejected if row.queue_type == "url_crawl" else "-" }}</td>
               <td class="queue-cell-number">{{ row.job_count }}</td>
               <td class="queue-cell-number">{{ row.pending_jobs }}</td>
               <td class="queue-cell-number">{{ row.running_jobs }}</td>
@@ -195,7 +221,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="12" class="empty">No queues yet.</td></tr>
+            <tr><td colspan="16" class="empty">No queues yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -259,6 +285,49 @@
           </table>
         </div>
       {% else %}
+        <div
+          class="subsection-head"
+          data-crawling-url-panel
+          data-endpoint="{{ url_for('queue_crawling_urls_api', queue_id=selected_queue.id) }}"
+        >
+          <h2>Currently Crawling URLs</h2>
+          <span class="muted"><span data-crawling-url-count>{{ selected_crawling_urls|length }}</span> rows · updates every 1.5s</span>
+        </div>
+        <div class="table-wrap queue-detail-wrap">
+          <table class="crawling-url-table">
+            <thead>
+              <tr>
+                <th>Queue Item</th>
+                <th>Domain</th>
+                <th>URL</th>
+                <th>Queue</th>
+                <th>Crawl</th>
+                <th>Status Code</th>
+                <th>Fetch Method</th>
+                <th>Started</th>
+                <th>Error</th>
+              </tr>
+            </thead>
+            <tbody data-crawling-url-body>
+              {% for item in selected_crawling_urls %}
+                <tr>
+                  <td>#{{ item.queue_item_id }}</td>
+                  <td><strong>{{ item.domain }}</strong></td>
+                  <td><a class="truncate-line" href="{{ item.url_norm }}" target="_blank" rel="noreferrer" title="{{ item.url_norm }}">{{ item.url_norm }}</a></td>
+                  <td><span class="badge {{ item.queue_status }}">{{ item.queue_status|status_label }}</span></td>
+                  <td><span class="badge {{ item.crawl_status }}">{{ item.crawl_status|status_label }}</span></td>
+                  <td>{{ item.status_code or "" }}</td>
+                  <td><code>{{ item.fetch_method or "" }}</code></td>
+                  <td>{{ item.queue_started_at or item.job_started_at or "" }}</td>
+                  <td><code class="truncate-line" title="{{ item.queue_error or item.crawl_error or '' }}">{{ item.queue_error or item.crawl_error or "" }}</code></td>
+                </tr>
+              {% else %}
+                <tr><td colspan="9" class="empty">No URLs are currently crawling.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
         <div class="table-wrap queue-detail-wrap">
           <table>
             <thead>

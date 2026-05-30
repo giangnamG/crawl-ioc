@@ -674,7 +674,7 @@ tbody tr:hover .review-url-actions-cell {
 }
 
 .queue-table {
-  min-width: 1360px;
+  min-width: 1720px;
   table-layout: fixed;
 }
 
@@ -760,6 +760,11 @@ tbody tr:hover .queue-actions-cell {
   max-height: 430px;
   overflow: auto;
   margin-bottom: 14px;
+}
+
+.crawling-url-table {
+  min-width: 1280px;
+  table-layout: fixed;
 }
 
 .col-id {

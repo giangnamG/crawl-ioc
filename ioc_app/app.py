@@ -5,7 +5,7 @@ import os
 import threading
 import time
 
-from flask import Flask, flash, redirect, render_template, request, url_for
+from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
 
 from .db import connect, db_path, init_db, is_url_whitelisted
 from .extractor import test_rule, validate_rule
@@ -210,6 +210,7 @@ def create_app(start_worker: bool = False) -> Flask:
                     return redirect(url_for("queues", queue_id=keyword_queue_id or url_queue_id))
 
             rows = query_queues(conn)
+            url_overview = query_url_overview(conn)
             keyword_queues = conn.execute(
                 "SELECT * FROM queues WHERE queue_type = 'keyword_search' ORDER BY id DESC"
             ).fetchall()
@@ -221,6 +222,7 @@ def create_app(start_worker: bool = False) -> Flask:
             selected_jobs = []
             selected_url_items = []
             selected_queries = []
+            selected_crawling_urls = []
             if selected_queue_id:
                 selected_queue = conn.execute(
                     "SELECT * FROM queues WHERE id = ?", (selected_queue_id,)
@@ -267,15 +269,41 @@ def create_app(start_worker: bool = False) -> Flask:
                     """,
                     (selected_queue_id,),
                 ).fetchall()
+                selected_crawling_urls = query_crawling_urls(conn, selected_queue_id)
         return render_template(
             "queues.html",
             rows=rows,
+            url_overview=url_overview,
             keyword_queues=keyword_queues,
             url_queues=url_queues,
             selected_queue=selected_queue,
             selected_jobs=selected_jobs,
             selected_url_items=selected_url_items,
             selected_queries=selected_queries,
+            selected_crawling_urls=selected_crawling_urls,
+        )
+
+    @app.get("/api/queues/<int:queue_id>/crawling-urls")
+    def queue_crawling_urls_api(queue_id: int):
+        with connect() as conn:
+            queue = conn.execute(
+                "SELECT id, name, queue_type FROM queues WHERE id = ?",
+                (queue_id,),
+            ).fetchone()
+            if not queue:
+                return jsonify({"ok": False, "error": "Queue not found."}), 404
+            rows = query_crawling_urls(conn, queue_id)
+        return jsonify(
+            {
+                "ok": True,
+                "queue": {
+                    "id": queue["id"],
+                    "name": queue["name"],
+                    "queue_type": queue["queue_type"],
+                },
+                "count": len(rows),
+                "items": [dict(row) for row in rows],
+            }
         )
 
     @app.post("/queues/<int:queue_id>/start")
@@ -1328,18 +1356,95 @@ def query_queues(conn):
                COUNT(DISTINCT CASE WHEN j.status = 'failed' THEN j.id END) AS failed_jobs,
                COUNT(DISTINCT sqi.id) AS search_query_count,
                COUNT(DISTINCT uqi.id) AS url_item_count,
+               COUNT(DISTINCT CASE WHEN q.queue_type = 'url_crawl' THEN queue_url.id END) AS queue_url_total,
+               COUNT(DISTINCT CASE
+                 WHEN q.queue_type = 'url_crawl'
+                  AND (queue_url.crawl_status = 'crawling' OR uqi.status = 'running')
+                 THEN queue_url.id
+               END) AS queue_url_crawling,
+               COUNT(DISTINCT CASE
+                 WHEN q.queue_type = 'url_crawl'
+                  AND uqi.status IN ('pending_review', 'pending', 'paused')
+                  AND queue_url.review_status != 'rejected'
+                  AND queue_url.crawl_status NOT IN ('crawled', 'metadata_only')
+                 THEN queue_url.id
+               END) AS queue_url_pending,
+               COUNT(DISTINCT CASE
+                 WHEN q.queue_type = 'url_crawl'
+                  AND queue_url.review_status = 'rejected'
+                 THEN queue_url.id
+               END) AS queue_url_rejected,
                qr.url_queue_id AS output_url_queue_id,
                uq.name AS output_url_queue_name
         FROM queues q
         LEFT JOIN jobs j ON j.queue_id = q.id
         LEFT JOIN search_queue_items sqi ON sqi.queue_id = q.id
         LEFT JOIN url_queue_items uqi ON uqi.queue_id = q.id
+        LEFT JOIN urls queue_url ON queue_url.id = uqi.url_id
         LEFT JOIN queue_routes qr ON qr.keyword_queue_id = q.id
         LEFT JOIN queues uq ON uq.id = qr.url_queue_id
         GROUP BY q.id
         ORDER BY q.id DESC
         LIMIT 200
         """
+    ).fetchall()
+
+
+def query_url_overview(conn):
+    return conn.execute(
+        """
+        SELECT
+          COUNT(*) AS total_urls,
+          SUM(CASE WHEN crawl_status = 'crawling' THEN 1 ELSE 0 END) AS crawling_urls,
+          SUM(
+            CASE
+              WHEN review_status = 'pending_review'
+               AND crawl_status NOT IN ('crawled', 'metadata_only')
+              THEN 1 ELSE 0
+            END
+          ) AS pending_urls,
+          SUM(CASE WHEN review_status = 'rejected' THEN 1 ELSE 0 END) AS rejected_urls
+        FROM urls
+        """
+    ).fetchone()
+
+
+def query_crawling_urls(conn, queue_id: int):
+    return conn.execute(
+        """
+        SELECT qi.id AS queue_item_id,
+               qi.status AS queue_status,
+               qi.started_at AS queue_started_at,
+               qi.error AS queue_error,
+               u.id AS url_id,
+               u.domain,
+               u.url_norm,
+               u.review_status,
+               u.crawl_status,
+               u.status_code,
+               u.fetch_method,
+               u.crawl_error,
+               j.id AS job_id,
+               j.attempts,
+               j.started_at AS job_started_at,
+               source_q.name AS source_queue_name
+        FROM url_queue_items qi
+        JOIN urls u ON u.id = qi.url_id
+        LEFT JOIN jobs j ON j.type = 'crawl_url'
+          AND j.queue_id = qi.queue_id
+          AND j.dedupe_key = 'queue:' || qi.queue_id || ':crawl:' || qi.url_id
+          AND j.status = 'running'
+        LEFT JOIN queues source_q ON source_q.id = qi.source_queue_id
+        WHERE qi.queue_id = ?
+          AND (
+            qi.status = 'running'
+            OR u.crawl_status = 'crawling'
+            OR j.id IS NOT NULL
+          )
+        ORDER BY COALESCE(qi.started_at, j.started_at, qi.created_at) DESC, qi.id DESC
+        LIMIT 200
+        """,
+        (queue_id,),
     ).fetchall()
 
 

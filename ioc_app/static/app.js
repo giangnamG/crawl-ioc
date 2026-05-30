@@ -199,6 +199,98 @@
     setPatternFeedback(bar, `Ticked ${matched} rows.`);
   });
 
+  function escapeHtml(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function statusClass(value) {
+    return String(value || "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  }
+
+  function statusLabel(value) {
+    return String(value || "")
+      .split("_")
+      .filter(Boolean)
+      .map(function (part) {
+        return part.charAt(0).toUpperCase() + part.slice(1);
+      })
+      .join(" ");
+  }
+
+  function renderCrawlingUrlRows(body, rows) {
+    if (!rows || rows.length === 0) {
+      body.innerHTML = '<tr><td colspan="9" class="empty">No URLs are currently crawling.</td></tr>';
+      return;
+    }
+
+    body.innerHTML = rows
+      .map(function (item) {
+        const queueStatus = item.queue_status || "";
+        const crawlStatus = item.crawl_status || "";
+        const error = item.queue_error || item.crawl_error || "";
+        const started = item.queue_started_at || item.job_started_at || "";
+        const url = item.url_norm || "";
+        return `
+          <tr>
+            <td>#${escapeHtml(item.queue_item_id || "")}</td>
+            <td><strong>${escapeHtml(item.domain || "")}</strong></td>
+            <td><a class="truncate-line" href="${escapeHtml(url)}" target="_blank" rel="noreferrer" title="${escapeHtml(url)}">${escapeHtml(url)}</a></td>
+            <td><span class="badge ${statusClass(queueStatus)}">${escapeHtml(statusLabel(queueStatus))}</span></td>
+            <td><span class="badge ${statusClass(crawlStatus)}">${escapeHtml(statusLabel(crawlStatus))}</span></td>
+            <td>${escapeHtml(item.status_code || "")}</td>
+            <td><code>${escapeHtml(item.fetch_method || "")}</code></td>
+            <td>${escapeHtml(started)}</td>
+            <td><code class="truncate-line" title="${escapeHtml(error)}">${escapeHtml(error)}</code></td>
+          </tr>
+        `;
+      })
+      .join("");
+  }
+
+  function startCrawlingUrlPolling() {
+    const panel = document.querySelector("[data-crawling-url-panel]");
+    const body = document.querySelector("[data-crawling-url-body]");
+    if (!panel || !body) {
+      return;
+    }
+    const endpoint = panel.getAttribute("data-endpoint");
+    if (!endpoint) {
+      return;
+    }
+    const count = document.querySelector("[data-crawling-url-count]");
+
+    async function refresh() {
+      if (document.hidden) {
+        return;
+      }
+      try {
+        const response = await fetch(endpoint, {
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          return;
+        }
+        const payload = await response.json();
+        const rows = Array.isArray(payload.items) ? payload.items : [];
+        renderCrawlingUrlRows(body, rows);
+        if (count) {
+          count.textContent = String(rows.length);
+        }
+      } catch (_error) {
+        // Keep the last rendered state if polling temporarily fails.
+      }
+    }
+
+    refresh();
+    window.setInterval(refresh, 1500);
+  }
+
   function restoreScroll() {
     let payload;
     const key = keyForPath(window.location.pathname);
@@ -236,8 +328,10 @@
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", restoreScroll, { once: true });
+    document.addEventListener("DOMContentLoaded", startCrawlingUrlPolling, { once: true });
   } else {
     restoreScroll();
+    startCrawlingUrlPolling();
   }
   window.addEventListener("pageshow", restoreScroll);
 })();
