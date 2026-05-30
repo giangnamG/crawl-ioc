@@ -112,12 +112,14 @@
       return "";
     }
     if (field === "all") {
-      return [
-        row.dataset.patternDomain || "",
-        row.dataset.patternUrl || "",
-        row.dataset.patternSource || "",
-        row.dataset.patternQuery || "",
-      ].join("\n");
+      return Object.keys(row.dataset)
+        .filter(function (key) {
+          return key.indexOf("pattern") === 0;
+        })
+        .map(function (key) {
+          return row.dataset[key] || "";
+        })
+        .join("\n");
     }
     return row.dataset[`pattern${field.charAt(0).toUpperCase()}${field.slice(1)}`] || "";
   }
@@ -162,7 +164,7 @@
       return;
     }
     const panel = bar.closest(".panel");
-    const table = panel ? panel.querySelector("table.review-table") : null;
+    const table = panel ? panel.querySelector("table[data-pattern-table], table.review-table") : null;
     if (!table) {
       return;
     }

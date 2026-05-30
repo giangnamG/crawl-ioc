@@ -57,13 +57,13 @@
             <th>Output URL Queue</th>
             <th>Status</th>
             <th class="queue-cell-number">Items</th>
-            <th class="queue-cell-number">URL Total</th>
-            <th class="queue-cell-number">URL Crawling</th>
-            <th class="queue-cell-number">URL Pending</th>
-            <th class="queue-cell-number">URL Rejected</th>
+            <th class="queue-cell-number" title="Total URLs">URLs</th>
+            <th class="queue-cell-number" title="Crawling URLs">Crawl</th>
+            <th class="queue-cell-number" title="Pending URLs">U-P</th>
+            <th class="queue-cell-number" title="Rejected URLs">Reject</th>
             <th class="queue-cell-number">Jobs</th>
-            <th class="queue-cell-number">Pending</th>
-            <th class="queue-cell-number">Running</th>
+            <th class="queue-cell-number" title="Pending jobs">J-P</th>
+            <th class="queue-cell-number" title="Running jobs">Run</th>
             <th class="queue-cell-number">Done</th>
             <th class="queue-cell-number">Failed</th>
             <th class="queue-actions-head">Actions</th>
@@ -114,13 +114,13 @@
                       <button class="button small primary" type="submit">Start</button>
                     </form>
                   {% else %}
-                    <button class="button small" type="button" disabled>Bind First</button>
+                    <button class="button small" type="button" title="Bind output URL queue first" disabled>Bind</button>
                   {% endif %}
                   <a class="button small" href="{{ url_for('queue_detail', queue_id=row.id) }}">View</a>
                   {% if row.queue_type == "keyword_search" %}
-                    <a class="button small" href="{{ url_for('keywords', queue_id=row.id) }}">Add Keywords</a>
+                    <a class="button small" href="{{ url_for('keywords', queue_id=row.id) }}" title="Add Keywords">Add</a>
                   {% else %}
-                    <a class="button small" href="{{ url_for('queue_detail', queue_id=row.id) }}#add-url-queue">Add URLs</a>
+                    <a class="button small" href="{{ url_for('queue_detail', queue_id=row.id) }}#add-url-queue" title="Add URLs">Add</a>
                   {% endif %}
                 </div>
               </td>

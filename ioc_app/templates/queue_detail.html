@@ -62,13 +62,13 @@
         <table class="keyword-search-status-table">
           <thead>
             <tr>
-              <th>Queue Item</th>
+              <th title="Queue Item">Item</th>
               <th>Keyword</th>
               <th>Query</th>
-              <th>Output URL Queue</th>
+              <th title="Output URL Queue">Output</th>
               <th>Search</th>
               <th>Job</th>
-              <th>Attempts</th>
+              <th title="Attempts">Try</th>
               <th>Started</th>
               <th>Error</th>
             </tr>
@@ -104,15 +104,15 @@
         <span class="muted">All keyword queries generated for this queue.</span>
       </div>
       <div class="table-wrap queue-detail-wrap">
-        <table>
+        <table class="queue-keyword-items-table">
           <thead>
             <tr>
               <th>ID</th>
               <th>Keyword</th>
               <th>Query</th>
-              <th>Output URL Queue</th>
+              <th title="Output URL Queue">Output</th>
               <th>Status</th>
-              <th>Results</th>
+              <th title="Results">Res</th>
               <th>Pages</th>
               <th>Error</th>
             </tr>
@@ -147,17 +147,17 @@
         <span class="muted">{{ selected_keyword_search_results|length }} URL results from this queue.</span>
       </div>
       <div class="table-wrap queue-detail-wrap">
-        <table>
+        <table class="queue-search-results-table">
           <thead>
             <tr>
               <th>Rank</th>
-              <th>Keyword</th>
+              <th>Key</th>
               <th>Query</th>
               <th>URL</th>
-              <th>Title / Snippet</th>
+              <th>Title</th>
               <th>Review</th>
               <th>Crawl</th>
-              <th>Output Queue</th>
+              <th>Output</th>
               <th>Found</th>
             </tr>
           </thead>
@@ -230,13 +230,13 @@
         <table class="crawling-url-table">
           <thead>
             <tr>
-              <th>Queue Item</th>
+              <th title="Queue Item">Item</th>
               <th>Domain</th>
               <th>URL</th>
               <th>Queue</th>
               <th>Crawl</th>
-              <th>Status Code</th>
-              <th>Fetch Method</th>
+              <th title="Status Code">Code</th>
+              <th title="Fetch Method">Method</th>
               <th>Started</th>
               <th>Error</th>
             </tr>
@@ -262,15 +262,15 @@
       </div>
 
       <div class="table-wrap queue-detail-wrap">
-        <table>
+        <table class="queue-url-items-table">
           <thead>
             <tr>
               <th>ID</th>
               <th>Domain</th>
               <th>URL</th>
-              <th>Queue Status</th>
-              <th>Source Queue</th>
-              <th>Crawl Status</th>
+              <th title="Queue Status">Queue</th>
+              <th>Source</th>
+              <th>Crawl</th>
               <th>Error</th>
               <th>Actions</th>
             </tr>
@@ -314,13 +314,13 @@
       <span class="muted">Technical jobs generated from this queue.</span>
     </div>
     <div class="table-wrap queue-detail-wrap">
-      <table>
+      <table class="queue-jobs-table">
         <thead>
           <tr>
             <th>ID</th>
             <th>Type</th>
             <th>Status</th>
-            <th>Attempts</th>
+            <th title="Attempts">Try</th>
             <th>Payload</th>
             <th>Error</th>
           </tr>

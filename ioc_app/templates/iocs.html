@@ -5,13 +5,16 @@
 {% block eyebrow %}Extracted indicators and sources{% endblock %}
 
 {% block content %}
-  <section class="panel">
+  <section class="panel ioc-filter-panel">
     <div class="panel-head">
-      <h2>Filters</h2>
-      <span class="muted">Each IOC is unique by type and normalized value.</span>
+      <div>
+        <h2>Search IOCs</h2>
+        <span class="muted">Filter by type, IOC value, source, rule, or evidence.</span>
+      </div>
+      <span class="ioc-filter-count">{{ rows|length }} matches</span>
     </div>
-    <form method="get" class="filter-bar">
-      <label>
+    <form method="get" class="ioc-filter-form" role="search">
+      <label class="ioc-filter-type">
         <span>Type</span>
         <select name="type">
           <option value="" {% if not ioc_type %}selected{% endif %}>Any</option>
@@ -20,7 +23,27 @@
           {% endfor %}
         </select>
       </label>
-      <button class="button primary" type="submit">Apply</button>
+      <label class="ioc-filter-search">
+        <span>Search</span>
+        <span class="ioc-search-control">
+          <svg class="ioc-search-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M10.8 5.5a5.3 5.3 0 1 0 0 10.6 5.3 5.3 0 0 0 0-10.6Zm-7.1 5.3a7.1 7.1 0 1 1 12.6 4.5l3.5 3.5-1.3 1.3-3.5-3.5a7.1 7.1 0 0 1-11.3-5.8Z" fill="currentColor"/>
+          </svg>
+          <input
+            type="search"
+            name="q"
+            value="{{ q }}"
+            autocomplete="off"
+            placeholder="Value, source URL/domain, rule, evidence"
+          >
+        </span>
+      </label>
+      <div class="ioc-filter-actions">
+        <button class="button primary" type="submit">Apply</button>
+        {% if ioc_type or q %}
+          <a class="button" href="{{ url_for('iocs') }}">Clear</a>
+        {% endif %}
+      </div>
     </form>
   </section>
 
@@ -38,7 +61,7 @@
         <code>{{ selected.value_norm }}</code>
       </div>
       <div class="table-wrap compact">
-        <table>
+        <table class="ioc-evidence-table">
           <thead>
             <tr>
               <th>Source URL</th>
@@ -69,9 +92,42 @@
       <h2>IOC Table</h2>
       <span class="muted">{{ rows|length }} rows</span>
     </div>
+    <form
+      id="bulk-ioc-delete-form"
+      method="post"
+      action="{{ url_for('bulk_delete_iocs') }}"
+      class="bulk-action-bar"
+      onsubmit="return confirm('Delete selected IOCs and their evidence rows? Source URLs will be kept.');"
+    >
+      <input type="hidden" name="type" value="{{ ioc_type }}">
+      <input type="hidden" name="q" value="{{ q }}">
+      <span class="muted">Select IOC rows, then delete them in one action.</span>
+      <button class="button small danger" type="submit">Delete Selected</button>
+    </form>
+    <div class="bulk-pattern-bar" data-pattern-scope="ioc">
+      <label>
+        <span>Auto tick field</span>
+        <select data-pattern-field>
+          <option value="all">All visible text</option>
+          <option value="type">Type</option>
+          <option value="value">Value</option>
+          <option value="domain">Source domain</option>
+          <option value="url">Source URL</option>
+          <option value="rule">Rule</option>
+        </select>
+      </label>
+      <label class="grow">
+        <span>Pattern</span>
+        <input data-pattern-input placeholder="domain.com or ^hash_">
+      </label>
+      <button class="button small" type="button" data-pattern-apply>Auto Tick</button>
+      <button class="button small" type="button" data-pattern-clear>Clear Ticks</button>
+      <span class="muted" data-pattern-feedback></span>
+    </div>
     <div class="table-wrap">
-      <table class="ioc-table">
+      <table class="ioc-table" data-pattern-table>
         <colgroup>
+          <col class="ioc-col-select">
           <col class="ioc-col-id">
           <col class="ioc-col-type">
           <col class="ioc-col-value">
@@ -82,6 +138,9 @@
         </colgroup>
         <thead>
           <tr>
+            <th class="select-col">
+              <input class="bulk-toggle" type="checkbox" data-bulk-target="ioc_ids" aria-label="Select all visible IOC rows">
+            </th>
             <th>ID</th>
             <th>Type</th>
             <th>Normalized Value</th>
@@ -93,7 +152,17 @@
         </thead>
         <tbody>
           {% for row in rows %}
-            <tr class="{{ 'selected-row' if selected and selected.id == row.id else '' }}">
+            <tr
+              class="{{ 'selected-row' if selected and selected.id == row.id else '' }}"
+              data-pattern-type="{{ row.type }}"
+              data-pattern-value="{{ row.value_norm }}"
+              data-pattern-domain="{{ row.source_domains or '' }}"
+              data-pattern-url="{{ row.source_urls or '' }}"
+              data-pattern-rule="{{ row.rule_names or '' }}"
+            >
+              <td class="cell-select">
+                <input type="checkbox" name="ioc_ids" value="{{ row.id }}" form="bulk-ioc-delete-form" aria-label="Select IOC #{{ row.id }}">
+              </td>
               <td>#{{ row.id }}</td>
               <td><span class="tag">{{ row.type }}</span></td>
               <td><code>{{ row.value_norm|truncate_middle(96) }}</code></td>
@@ -111,10 +180,17 @@
               </td>
               <td>{{ row.source_count }}</td>
               <td>{{ row.rule_names or "" }}</td>
-              <td><a class="button small" href="{{ url_for('iocs', ioc_id=row.id, type=ioc_type) }}#ioc-evidence">View Evidence</a></td>
+              <td class="cell-actions">
+                <a class="button small" href="{{ url_for('iocs', ioc_id=row.id, type=ioc_type, q=q) }}#ioc-evidence" title="View Evidence">View</a>
+                <form method="post" action="{{ url_for('delete_ioc', ioc_id=row.id) }}" onsubmit="return confirm('Delete this IOC and its evidence rows? Source URLs will be kept.');">
+                  <input type="hidden" name="type" value="{{ ioc_type }}">
+                  <input type="hidden" name="q" value="{{ q }}">
+                  <button class="button small danger" type="submit">Delete</button>
+                </form>
+              </td>
             </tr>
           {% else %}
-            <tr><td colspan="7" class="empty">No IOCs extracted yet.</td></tr>
+            <tr><td colspan="8" class="empty">No IOCs extracted yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>

@@ -873,30 +873,9 @@ def create_app(start_worker: bool = False) -> Flask:
     def iocs():
         selected_id = request.args.get("ioc_id", type=int)
         ioc_type = request.args.get("type", "")
+        q = request.args.get("q", "").strip()
         with connect() as conn:
-            params: list[object] = []
-            where = ""
-            if ioc_type:
-                where = "WHERE i.type = ?"
-                params.append(ioc_type)
-            rows = conn.execute(
-                f"""
-                SELECT i.*,
-                       COUNT(DISTINCT s.id) AS source_count,
-                       GROUP_CONCAT(DISTINCT u.domain) AS source_domains,
-                       GROUP_CONCAT(DISTINCT u.url_norm) AS source_urls,
-                       GROUP_CONCAT(DISTINCT r.name) AS rule_names
-                FROM iocs i
-                LEFT JOIN ioc_sources s ON s.ioc_id = i.id
-                LEFT JOIN urls u ON u.id = s.source_url_id
-                LEFT JOIN extraction_rules r ON r.id = s.extraction_rule_id
-                {where}
-                GROUP BY i.id
-                ORDER BY i.id DESC
-                LIMIT 500
-                """,
-                params,
-            ).fetchall()
+            rows = query_iocs(conn, ioc_type, q)
             sources = []
             selected = None
             if selected_id:
@@ -912,7 +891,58 @@ def create_app(start_worker: bool = False) -> Flask:
                     """,
                     (selected_id,),
                 ).fetchall()
-        return render_template("iocs.html", rows=rows, selected=selected, sources=sources, ioc_type=ioc_type)
+        return render_template(
+            "iocs.html",
+            rows=rows,
+            selected=selected,
+            sources=sources,
+            ioc_type=ioc_type,
+            q=q,
+        )
+
+    @app.post("/iocs/<int:ioc_id>/delete")
+    def delete_ioc(ioc_id: int):
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM iocs WHERE id = ?", (ioc_id,)).fetchone()
+            if not row:
+                flash("IOC not found.", "error")
+                return redirect(url_for("iocs", type=request.form.get("type", ""), q=request.form.get("q", "")))
+            source_count = scalar(conn, "SELECT COUNT(*) FROM ioc_sources WHERE ioc_id = ?", (ioc_id,))
+            conn.execute("DELETE FROM ioc_sources WHERE ioc_id = ?", (ioc_id,))
+            conn.execute("DELETE FROM iocs WHERE id = ?", (ioc_id,))
+        flash(
+            f"Deleted IOC #{ioc_id} and {source_count} evidence rows. Source URLs were kept.",
+            "success",
+        )
+        return redirect(url_for("iocs", type=request.form.get("type", ""), q=request.form.get("q", "")))
+
+    @app.post("/iocs/bulk-delete")
+    def bulk_delete_iocs():
+        ioc_ids = unique_ints(request.form.getlist("ioc_ids"))
+        if not ioc_ids:
+            flash("Select at least one IOC row.", "error")
+            return redirect(url_for("iocs", type=request.form.get("type", ""), q=request.form.get("q", "")))
+
+        placeholders = ",".join("?" for _ in ioc_ids)
+        with connect() as conn:
+            existing_count = scalar(
+                conn,
+                f"SELECT COUNT(*) FROM iocs WHERE id IN ({placeholders})",
+                tuple(ioc_ids),
+            )
+            source_count = scalar(
+                conn,
+                f"SELECT COUNT(*) FROM ioc_sources WHERE ioc_id IN ({placeholders})",
+                tuple(ioc_ids),
+            )
+            conn.execute(f"DELETE FROM ioc_sources WHERE ioc_id IN ({placeholders})", tuple(ioc_ids))
+            conn.execute(f"DELETE FROM iocs WHERE id IN ({placeholders})", tuple(ioc_ids))
+
+        flash(
+            f"Deleted {existing_count} selected IOCs and {source_count} evidence rows. Source URLs were kept.",
+            "success",
+        )
+        return redirect(url_for("iocs", type=request.form.get("type", ""), q=request.form.get("q", "")))
 
     if start_worker:
         start_background_worker(app)
@@ -1679,6 +1709,57 @@ def query_keyword_search_results(conn, queue_id: int):
         LIMIT 500
         """,
         (queue_id,),
+    ).fetchall()
+
+
+def query_iocs(conn, ioc_type: str, q: str):
+    params: list[object] = []
+    where = []
+    if ioc_type:
+        where.append("i.type = ?")
+        params.append(ioc_type)
+    if q:
+        like = f"%{q}%"
+        where.append(
+            """
+            (
+              i.value_norm LIKE ?
+              OR i.value_raw LIKE ?
+              OR EXISTS (
+                SELECT 1
+                FROM ioc_sources s2
+                JOIN urls u2 ON u2.id = s2.source_url_id
+                LEFT JOIN extraction_rules r2 ON r2.id = s2.extraction_rule_id
+                WHERE s2.ioc_id = i.id
+                  AND (
+                    u2.domain LIKE ?
+                    OR u2.url_norm LIKE ?
+                    OR r2.name LIKE ?
+                    OR s2.evidence_text LIKE ?
+                  )
+              )
+            )
+            """
+        )
+        params.extend([like, like, like, like, like, like])
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+    return conn.execute(
+        f"""
+        SELECT i.*,
+               COUNT(DISTINCT s.id) AS source_count,
+               GROUP_CONCAT(DISTINCT u.domain) AS source_domains,
+               GROUP_CONCAT(DISTINCT u.url_norm) AS source_urls,
+               GROUP_CONCAT(DISTINCT r.name) AS rule_names
+        FROM iocs i
+        LEFT JOIN ioc_sources s ON s.ioc_id = i.id
+        LEFT JOIN urls u ON u.id = s.source_url_id
+        LEFT JOIN extraction_rules r ON r.id = s.extraction_rule_id
+        {where_sql}
+        GROUP BY i.id
+        ORDER BY i.id DESC
+        LIMIT 500
+        """,
+        params,
     ).fetchall()
 
 
