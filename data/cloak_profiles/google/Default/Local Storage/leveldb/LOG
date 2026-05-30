@@ -1,0 +1,13 @@
+2026/05/30-01:53:10.024 601c Reusing MANIFEST E:\88i\data\cloak_profiles\google\Default\Local Storage\leveldb/MANIFEST-000001
+2026/05/30-01:53:10.029 601c Recovering log #9
+2026/05/30-01:53:10.030 601c Level-0 table #11: started
+2026/05/30-01:53:10.035 601c Level-0 table #11: 62890 bytes OK
+2026/05/30-01:53:10.039 601c Delete type=0 #9
+2026/05/30-01:53:10.040 75bc Compacting 4@0 + 0@1 files
+2026/05/30-01:53:10.046 75bc Generated table #13@0: 12 keys, 16271 bytes
+2026/05/30-01:53:10.046 75bc Compacted 4@0 + 0@1 files => 16271 bytes
+2026/05/30-01:53:10.047 75bc compacted to: files[ 0 1 0 0 0 0 0 ]
+2026/05/30-01:53:10.048 75bc Delete type=2 #3
+2026/05/30-01:53:10.048 75bc Delete type=2 #6
+2026/05/30-01:53:10.048 75bc Delete type=2 #9
+2026/05/30-01:53:10.048 75bc Delete type=2 #11
