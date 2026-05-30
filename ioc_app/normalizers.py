@@ -32,6 +32,11 @@ MEDIA_ASSET_EXTENSIONS = {
     ".webm",
     ".webp",
     ".wmv",
+    # Static frontend assets should not become review/crawl targets.
+    ".css",
+    ".js",
+    ".map",
+    ".mjs",
 }
 
 TRACKING_PARAMS = {

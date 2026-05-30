@@ -7,7 +7,7 @@ import urllib.parse
 from sqlite3 import Connection
 
 from .browser import BrowserClient, is_retryable_proxy_error
-from .db import connect, is_url_whitelisted
+from .db import connect, is_url_whitelisted, is_url_whitelisted_latest
 from .extractor import extract_iocs_by_rules
 from .normalizers import get_domain, is_media_asset_url, normalize_domain, normalize_url
 
@@ -753,7 +753,9 @@ def enqueue_url_to_queue(
     target = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
     if not queue or not target:
         return None
-    if is_media_asset_url(target["url_norm"]) or is_url_whitelisted(conn, target["url_norm"]):
+    if is_media_asset_url(target["url_norm"]):
+        return None
+    if url_matches_current_or_latest_whitelist(conn, int(target["id"]), target["url_norm"]):
         return None
     if target["crawl_status"] in TERMINAL_CRAWL_STATUSES:
         remove_url_from_queue_items(conn, url_id)
@@ -763,6 +765,9 @@ def enqueue_url_to_queue(
 
     initial_status = "pending_review"
     job_status = "paused"
+
+    if url_matches_current_or_latest_whitelist(conn, int(target["id"]), target["url_norm"]):
+        return None
 
     conn.execute(
         """
@@ -792,6 +797,9 @@ def enqueue_url_to_queue(
     ).fetchone()
     if not row:
         return None
+    if url_matches_current_or_latest_whitelist(conn, int(target["id"]), target["url_norm"]):
+        remove_url_from_queue_items(conn, url_id)
+        return None
 
     conn.execute(
         """
@@ -819,6 +827,21 @@ def enqueue_url_to_queue(
         initial_status=job_status,
     )
     return int(row["id"])
+
+
+def url_matches_current_or_latest_whitelist(conn: Connection, url_id: int, url_norm: str) -> bool:
+    whitelisted = is_url_whitelisted(conn, url_norm) or is_url_whitelisted_latest(url_norm)
+    if whitelisted:
+        conn.execute(
+            """
+            UPDATE urls
+            SET review_status = 'ignored_whitelist'
+            WHERE id = ?
+              AND review_status = 'pending_review'
+            """,
+            (url_id,),
+        )
+    return whitelisted
 
 
 def upsert_url_source(conn: Connection, **kwargs: object) -> None:

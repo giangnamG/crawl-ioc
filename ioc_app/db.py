@@ -3,7 +3,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from .normalizers import get_domain, normalize_by_rule, normalize_url
+from .normalizers import get_domain, is_media_asset_url, normalize_by_rule, normalize_url
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -64,6 +64,11 @@ def is_url_whitelisted(conn: sqlite3.Connection, url_norm: str) -> bool:
     )
 
 
+def is_url_whitelisted_latest(url_norm: str) -> bool:
+    with connect() as conn:
+        return is_url_whitelisted(conn, url_norm)
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
@@ -117,6 +122,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     )
     migrate_domain_tables_into_urls(conn)
     remove_crawled_urls_from_queue_items(conn)
+    remove_ignored_asset_urls_from_queue_items(conn)
     conn.executescript(
         """
         CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(queue_id, status, id);
@@ -263,6 +269,65 @@ def remove_crawled_urls_from_queue_items(conn: sqlite3.Connection) -> None:
         item_ids,
     )
     conn.execute(f"DELETE FROM url_queue_items WHERE id IN ({placeholders})", item_ids)
+
+
+def remove_ignored_asset_urls_from_queue_items(conn: sqlite3.Connection) -> None:
+    if not table_exists(conn, "url_queue_items") or not table_exists(conn, "urls"):
+        return
+
+    asset_rows = [
+        row
+        for row in conn.execute("SELECT id, url_norm FROM urls").fetchall()
+        if is_media_asset_url(row["url_norm"])
+    ]
+    if not asset_rows:
+        return
+
+    asset_ids = [int(row["id"]) for row in asset_rows]
+    placeholders = ",".join("?" for _ in asset_ids)
+    item_rows = conn.execute(
+        f"""
+        SELECT id, queue_id, url_id
+        FROM url_queue_items
+        WHERE url_id IN ({placeholders})
+          AND status != 'running'
+        """,
+        asset_ids,
+    ).fetchall()
+
+    for row in item_rows:
+        conn.execute(
+            """
+            DELETE FROM jobs
+            WHERE type = 'crawl_url'
+              AND dedupe_key = ?
+              AND status != 'running'
+            """,
+            (f"queue:{row['queue_id']}:crawl:{row['url_id']}",),
+        )
+
+    item_ids = [int(row["id"]) for row in item_rows]
+    if item_ids:
+        item_placeholders = ",".join("?" for _ in item_ids)
+        conn.execute(
+            f"""
+            UPDATE url_queue_items
+            SET source_url_queue_item_id = NULL
+            WHERE source_url_queue_item_id IN ({item_placeholders})
+            """,
+            item_ids,
+        )
+        conn.execute(f"DELETE FROM url_queue_items WHERE id IN ({item_placeholders})", item_ids)
+
+    conn.execute(
+        f"""
+        UPDATE urls
+        SET review_status = 'ignored_asset'
+        WHERE id IN ({placeholders})
+          AND review_status = 'pending_review'
+        """,
+        asset_ids,
+    )
 
 
 def recover_interrupted_jobs(conn: sqlite3.Connection) -> None:
