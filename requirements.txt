@@ -1,2 +1,3 @@
 Flask>=3.0,<4.0
 cloakbrowser>=0.3.31,<0.4
+gunicorn>=20.1.0
