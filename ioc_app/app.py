@@ -329,6 +329,7 @@ def create_app(start_worker: bool = False) -> Flask:
             ).fetchall()
             selected_crawling_urls = query_crawling_urls(conn, queue_id)
             selected_keyword_search_status = query_keyword_search_status(conn, queue_id)
+            selected_keyword_search_results = query_keyword_search_results(conn, queue_id)
         return render_template(
             "queue_detail.html",
             selected_queue=selected_queue,
@@ -337,6 +338,7 @@ def create_app(start_worker: bool = False) -> Flask:
             selected_queries=selected_queries,
             selected_crawling_urls=selected_crawling_urls,
             selected_keyword_search_status=selected_keyword_search_status,
+            selected_keyword_search_results=selected_keyword_search_results,
         )
 
     @app.get("/api/queues/<int:queue_id>/crawling-urls")
@@ -1632,6 +1634,49 @@ def query_keyword_search_status(conn, queue_id: int):
           )
         ORDER BY COALESCE(sqi.started_at, sq.started_at, j.started_at, sqi.created_at) DESC, sqi.id DESC
         LIMIT 200
+        """,
+        (queue_id,),
+    ).fetchall()
+
+
+def query_keyword_search_results(conn, queue_id: int):
+    return conn.execute(
+        """
+        SELECT us.id AS source_id,
+               us.created_at,
+               us.title,
+               us.snippet,
+               us.rank,
+               us.page_no,
+               u.id AS url_id,
+               u.url_norm,
+               u.domain,
+               u.review_status,
+               u.crawl_status,
+               u.status_code,
+               u.fetch_method,
+               k.text AS keyword_text,
+               sq.query_text,
+               output_q.id AS output_url_queue_id,
+               output_q.name AS output_url_queue_name,
+               uqi.id AS output_queue_item_id,
+               uqi.status AS output_queue_item_status
+        FROM url_sources us
+        JOIN urls u ON u.id = us.url_id
+        LEFT JOIN keywords k ON k.id = us.keyword_id
+        LEFT JOIN search_queries sq ON sq.id = us.search_query_id
+        LEFT JOIN search_queue_items sqi ON sqi.queue_id = us.queue_id
+          AND sqi.search_query_id = us.search_query_id
+        LEFT JOIN queues output_q ON output_q.id = sqi.output_url_queue_id
+        LEFT JOIN url_queue_items uqi ON uqi.url_id = us.url_id
+          AND uqi.queue_id = sqi.output_url_queue_id
+        WHERE us.queue_id = ?
+          AND us.source_type = 'google_search'
+        ORDER BY us.created_at DESC,
+                 COALESCE(us.page_no, 0),
+                 COALESCE(us.rank, 0),
+                 us.id DESC
+        LIMIT 500
         """,
         (queue_id,),
     ).fetchall()

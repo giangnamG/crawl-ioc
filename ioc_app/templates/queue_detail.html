@@ -141,6 +141,66 @@
           </tbody>
         </table>
       </div>
+
+      <div class="subsection-head">
+        <h2>Keyword Search Results</h2>
+        <span class="muted">{{ selected_keyword_search_results|length }} URL results from this queue.</span>
+      </div>
+      <div class="table-wrap queue-detail-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Keyword</th>
+              <th>Query</th>
+              <th>URL</th>
+              <th>Title / Snippet</th>
+              <th>Review</th>
+              <th>Crawl</th>
+              <th>Output Queue</th>
+              <th>Found</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in selected_keyword_search_results %}
+              <tr>
+                <td>
+                  {% if item.rank %}
+                    #{{ item.rank }}{% if item.page_no %}<br><span class="muted">p{{ item.page_no }}</span>{% endif %}
+                  {% else %}
+                    -
+                  {% endif %}
+                </td>
+                <td><strong>{{ item.keyword_text or "-" }}</strong></td>
+                <td><code class="truncate-line" title="{{ item.query_text or '' }}">{{ item.query_text or "" }}</code></td>
+                <td>
+                  <div><strong>{{ item.domain }}</strong></div>
+                  <a class="truncate-line" href="{{ item.url_norm }}" target="_blank" rel="noreferrer" title="{{ item.url_norm }}">{{ item.url_norm }}</a>
+                </td>
+                <td>
+                  <div class="truncate-line" title="{{ item.title or '' }}">{{ item.title or "-" }}</div>
+                  <small class="muted truncate-line" title="{{ item.snippet or '' }}">{{ item.snippet or "" }}</small>
+                </td>
+                <td><span class="badge {{ item.review_status }}">{{ item.review_status|status_label }}</span></td>
+                <td><span class="badge {{ item.crawl_status }}">{{ item.crawl_status|status_label }}</span></td>
+                <td>
+                  {% if item.output_url_queue_id %}
+                    <a href="{{ url_for('queue_detail', queue_id=item.output_url_queue_id) }}">#{{ item.output_url_queue_id }} · {{ item.output_url_queue_name or "queue_url" }}</a>
+                    {% if item.output_queue_item_status %}
+                      <br><span class="badge {{ item.output_queue_item_status }}">{{ item.output_queue_item_status|status_label }}</span>
+                    {% endif %}
+                  {% else %}
+                    <span class="badge failed">Not Bound</span>
+                  {% endif %}
+                </td>
+                <td>{{ item.created_at }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="9" class="empty">No keyword search results in this queue.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
     {% else %}
       <div class="subsection-head" id="add-url-queue">
         <h2>Add URL/Domain To Queue</h2>
