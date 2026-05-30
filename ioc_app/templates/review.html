@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}Review · IOC Investigator{% endblock %}
-{% block heading %}Review URLs And Domains{% endblock %}
+{% block heading %}Review URLs{% endblock %}
 {% block eyebrow %}Human validation gate{% endblock %}
 
 {% block content %}
@@ -12,13 +12,12 @@
     </div>
     <form method="get" class="filter-bar review-filter-bar">
       <input type="hidden" name="url_status" value="{{ url_status }}">
-      <input type="hidden" name="domain_status" value="{{ domain_status }}">
       <label>
-        <span>Domain Source</span>
+        <span>Source</span>
         <select name="source">
           <option value="" {% if not source %}selected{% endif %}>Any</option>
           <option value="google_search" {% if source == "google_search" %}selected{% endif %}>Google Search</option>
-          <option value="extracted_from_crawl" {% if source == "extracted_from_crawl" %}selected{% endif %}>From Domain</option>
+          <option value="extracted_from_crawl" {% if source == "extracted_from_crawl" %}selected{% endif %}>From Crawl</option>
           <option value="both" {% if source == "both" %}selected{% endif %}>Both</option>
         </select>
       </label>
@@ -42,7 +41,7 @@
             aria-describedby="url-review-queue-help"
           >?</button>
           <span class="helper-popover helper-popover-wide" id="url-review-queue-help" role="tooltip">
-            Bảng này duyệt từng URL cụ thể trước khi crawl. Approve chỉ áp dụng cho URL trong dòng đó và đưa URL vào tiến trình crawl; Reject URL chỉ loại URL đó. Reject Domain trong dòng URL sẽ loại tất cả URL còn Need Action thuộc cùng domain. Các URL đã Approved hoặc Rejected chỉ còn read-only.
+            Bảng này duyệt từng URL cụ thể trước khi crawl. Domain được phát hiện cũng được chuẩn hóa thành URL root như https://example.com/ và đi qua cùng cơ chế review, queue, approve, reject như mọi URL khác. Các URL đã Approved hoặc Rejected chỉ còn read-only.
           </span>
         </span>
       </div>
@@ -52,7 +51,7 @@
       {% for tab in review_tabs %}
         <a
           class="tab-pill {% if url_status == tab.value %}active{% endif %}"
-          href="{{ url_for('review', url_status=tab.value, domain_status=domain_status, source=source, q=q) }}"
+          href="{{ url_for('review', url_status=tab.value, source=source, q=q) }}"
           aria-current="{{ 'page' if url_status == tab.value else 'false' }}"
         >{{ tab.label }}</a>
       {% endfor %}
@@ -120,7 +119,7 @@
             <tr
               data-pattern-domain="{{ row.domain }}"
               data-pattern-url="{{ row.url_norm }}"
-              data-pattern-source="{{ row.domain_sources or '' }}"
+              data-pattern-source="{{ row.sources or '' }}"
               data-pattern-query="{{ row.queries or '' }}"
             >
               <td class="cell-select">
@@ -133,8 +132,8 @@
               <td class="cell-id">#{{ row.id }}</td>
               <td class="cell-domain"><strong title="{{ row.domain }}">{{ row.domain }}</strong></td>
               <td class="cell-tags">
-                {% for item in (row.domain_sources or "").split(",") if item %}
-                  <span class="tag">{{ "Google" if item == "google_search" else "From Domain" }}</span>
+                {% for item in (row.sources or "").split(",") if item %}
+                  <span class="tag">{{ "Google" if item == "google_search" else "From Crawl" }}</span>
                 {% endfor %}
               </td>
               <td class="cell-url">
@@ -153,10 +152,6 @@
                     <form method="post" action="{{ url_for('reject_url_route', url_id=row.id) }}">
                       <button class="button small" type="submit">Reject URL</button>
                     </form>
-                    <form method="post" action="{{ url_for('reject_domain_route') }}">
-                      <input type="hidden" name="domain" value="{{ row.domain }}">
-                      <button class="button small danger compact-action" type="submit">Reject Domain</button>
-                    </form>
                   </div>
                 {% else %}
                   <span class="readonly-note">Read only</span>
@@ -165,144 +160,6 @@
             </tr>
           {% else %}
             <tr><td colspan="9" class="empty">No URLs in this tab.</td></tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </section>
-
-  <section class="panel">
-    <div class="panel-head">
-      <div class="helper-title">
-        <h2>Domain Review</h2>
-        <span class="helper-tip">
-          <button
-            class="helper-icon"
-            type="button"
-            aria-label="Giải thích bảng Domain Review"
-            aria-describedby="domain-review-help"
-          >?</button>
-          <span class="helper-popover helper-popover-wide" id="domain-review-help" role="tooltip">
-            Bảng này gom các URL theo domain để thao tác hàng loạt. Approve domain sẽ approve tất cả URL còn Need Action thuộc domain đó và queue crawl cho các URL này. Reject domain sẽ reject tất cả URL còn Need Action thuộc domain đó. Các URL/domain đã duyệt trước đó không bị đổi lại.
-          </span>
-        </span>
-      </div>
-      <span class="muted">Approve/reject all URLs under a domain.</span>
-    </div>
-    <nav class="table-tabs" aria-label="Domain review status tabs">
-      {% for tab in review_tabs %}
-        <a
-          class="tab-pill {% if domain_status == tab.value %}active{% endif %}"
-          href="{{ url_for('review', url_status=url_status, domain_status=tab.value, source=source, q=q) }}"
-          aria-current="{{ 'page' if domain_status == tab.value else 'false' }}"
-        >{{ tab.label }}</a>
-      {% endfor %}
-    </nav>
-    {% if domain_status == "pending_review" %}
-      <form id="bulk-domain-review-form" method="post" action="{{ url_for('bulk_review_domains') }}" class="bulk-action-bar">
-        <span class="muted">Select domain rows, then apply one action to matching Need Action URLs.</span>
-        <button class="button small primary" type="submit" name="bulk_action" value="approve">Approve Selected</button>
-        <button class="button small danger" type="submit" name="bulk_action" value="reject">Reject Selected</button>
-      </form>
-      <div class="bulk-pattern-bar" data-pattern-scope="domain">
-        <label>
-          <span>Auto tick field</span>
-          <select data-pattern-field>
-            <option value="all">All visible text</option>
-            <option value="domain">Domain</option>
-            <option value="source">Source</option>
-          </select>
-        </label>
-        <label class="grow">
-          <span>Pattern</span>
-          <input data-pattern-input placeholder="88i.co.uk or \\.co\\.uk$">
-        </label>
-        <button class="button small" type="button" data-pattern-apply>Auto Tick</button>
-        <button class="button small" type="button" data-pattern-clear>Clear Ticks</button>
-        <span class="muted" data-pattern-feedback></span>
-      </div>
-    {% else %}
-      <div class="bulk-action-bar">
-        <span class="muted">This tab is read-only. Bulk actions are available only in Need Action.</span>
-      </div>
-    {% endif %}
-    <div class="table-wrap compact scroll-y review-domain-wrap">
-      <table class="review-table domain-review-table">
-        <colgroup>
-          <col class="review-col-select">
-          <col class="col-domain-wide">
-          <col class="col-source-wide">
-          <col class="col-status">
-          <col class="col-count">
-          <col class="col-actions">
-        </colgroup>
-        <thead>
-          <tr>
-            <th class="select-col">
-              <input class="bulk-toggle" type="checkbox" data-bulk-target="domains" aria-label="Select all visible domain rows" {% if domain_status != "pending_review" %}disabled{% endif %}>
-            </th>
-            <th>Domain</th>
-            <th>Sources</th>
-            <th>Status</th>
-            <th>
-              <span class="helper-title">
-                <span>URLs</span>
-                <span class="helper-tip">
-                  <button
-                    class="helper-icon"
-                    type="button"
-                    aria-label="Explain URLs count"
-                    aria-describedby="domain-url-count-help"
-                  >?</button>
-                  <span class="helper-popover helper-popover-wide" id="domain-url-count-help" role="tooltip">
-                    Đây là số lượng URL duy nhất đang được hệ thống lưu dưới domain này. Khi bấm Approve hoặc Reject ở dòng domain, thao tác sẽ áp dụng cho tất cả URL thuộc domain này vẫn còn ở trạng thái Need Action; các URL đã Approved hoặc Rejected sẽ chỉ được giữ read-only và không bị đổi lại.
-                  </span>
-                </span>
-              </span>
-            </th>
-            <th class="actions-col">Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in domains %}
-            <tr
-              data-pattern-domain="{{ row.domain }}"
-              data-pattern-source="{{ row.sources or '' }}"
-            >
-              <td class="cell-select">
-                {% if row.review_status == "pending_review" %}
-                  <input type="checkbox" name="domains" value="{{ row.domain }}" form="bulk-domain-review-form" aria-label="Select domain {{ row.domain }}">
-                {% else %}
-                  <span class="readonly-note">-</span>
-                {% endif %}
-              </td>
-              <td class="cell-domain"><strong title="{{ row.domain }}">{{ row.domain }}</strong></td>
-              <td class="cell-tags">
-                {% for item in (row.sources or "").split(",") if item %}
-                  <span class="tag">{{ "Google" if item == "google_search" else "From Domain" }}</span>
-                {% endfor %}
-              </td>
-              <td class="cell-status"><span class="badge {{ row.review_status }}">{{ row.review_status|status_label }}</span></td>
-              <td class="cell-count">{{ row.url_count }}</td>
-              <td class="cell-actions">
-                {% if row.review_status == "pending_review" %}
-                  <div class="row-actions">
-                    <form method="post" action="{{ url_for('approve_domain_route') }}">
-                      <input type="hidden" name="domain" value="{{ row.domain }}">
-                      <button class="button small primary" type="submit">Approve</button>
-                    </form>
-                    <form method="post" action="{{ url_for('reject_domain_route') }}">
-                      <input type="hidden" name="domain" value="{{ row.domain }}">
-                      <button class="button small danger" type="submit">Reject</button>
-                    </form>
-                  </div>
-                {% else %}
-                  <span class="readonly-note">Read only</span>
-                {% endif %}
-              </td>
-            </tr>
-          {% else %}
-            <tr><td colspan="6" class="empty">No domains in this tab.</td></tr>
           {% endfor %}
         </tbody>
       </table>

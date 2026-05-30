@@ -3,7 +3,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from .normalizers import normalize_by_rule
+from .normalizers import get_domain, normalize_by_rule, normalize_url
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -57,7 +57,6 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "jobs", "queue_id", "INTEGER REFERENCES queues(id)")
     ensure_column(conn, "search_queue_items", "output_url_queue_id", "INTEGER REFERENCES queues(id)")
     ensure_column(conn, "url_sources", "queue_id", "INTEGER REFERENCES queues(id)")
-    ensure_column(conn, "domain_sources", "queue_id", "INTEGER REFERENCES queues(id)")
     ensure_column(conn, "url_queue_items", "source_queue_id", "INTEGER REFERENCES queues(id)")
     ensure_column(conn, "url_queue_items", "source_search_query_id", "INTEGER REFERENCES search_queries(id)")
     ensure_column(conn, "url_queue_items", "source_search_queue_item_id", "INTEGER REFERENCES search_queue_items(id)")
@@ -66,6 +65,8 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "urls", "content_length", "INTEGER")
     ensure_column(conn, "urls", "fetch_method", "TEXT")
     ensure_column(conn, "urls", "crawl_error", "TEXT")
+    migrate_domain_tables_into_urls(conn)
+    remove_crawled_urls_from_queue_items(conn)
     conn.executescript(
         """
         CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(queue_id, status, id);
@@ -80,10 +81,137 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     )
 
 
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+    )
+
+
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    if not table_exists(conn, table):
+        return
     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def migrate_domain_tables_into_urls(conn: sqlite3.Connection) -> None:
+    if not table_exists(conn, "domains"):
+        return
+
+    for row in conn.execute("SELECT * FROM domains").fetchall():
+        domain = row["domain"]
+        url_norm = normalize_url(f"https://{domain}/")
+        if not url_norm:
+            continue
+        normalized_domain = get_domain(url_norm)
+        if not normalized_domain:
+            continue
+        review_status = row["review_status"] or "pending_review"
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO urls(url_raw, url_norm, domain, first_source, review_status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                url_norm,
+                url_norm,
+                normalized_domain,
+                row["first_source"] or "domain_migration",
+                review_status,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE urls
+            SET review_status = CASE
+                WHEN review_status = 'pending_review' THEN ?
+                ELSE review_status
+            END
+            WHERE url_norm = ?
+            """,
+            (review_status, url_norm),
+        )
+
+    if table_exists(conn, "domain_sources"):
+        rows = conn.execute(
+            """
+            SELECT ds.*, d.domain
+            FROM domain_sources ds
+            JOIN domains d ON d.id = ds.domain_id
+            ORDER BY ds.id
+            """
+        ).fetchall()
+        for row in rows:
+            domain_url = normalize_url(f"https://{row['domain']}/")
+            if not domain_url:
+                continue
+            url = conn.execute("SELECT id FROM urls WHERE url_norm = ?", (domain_url,)).fetchone()
+            if not url:
+                continue
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO url_sources(
+                  url_id, source_type, dedupe_key, queue_id, keyword_id, search_query_id,
+                  source_url_id, title, snippet, rank, page_no
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                """,
+                (
+                    url["id"],
+                    row["source_type"],
+                    f"migrated-domain:{row['dedupe_key']}",
+                    row["queue_id"],
+                    row["keyword_id"],
+                    row["search_query_id"],
+                    row["source_url_id"],
+                    row["rank"],
+                    row["page_no"],
+                ),
+            )
+        conn.execute("DROP TABLE domain_sources")
+
+    conn.execute("DROP TABLE domains")
+
+
+def remove_crawled_urls_from_queue_items(conn: sqlite3.Connection) -> None:
+    if not table_exists(conn, "url_queue_items") or not table_exists(conn, "urls"):
+        return
+    item_rows = conn.execute(
+        """
+        SELECT qi.id, qi.queue_id, qi.url_id
+        FROM url_queue_items qi
+        JOIN urls u ON u.id = qi.url_id
+        WHERE u.crawl_status IN ('crawled', 'metadata_only')
+          AND qi.status != 'running'
+        """
+    ).fetchall()
+    item_ids = [int(row["id"]) for row in item_rows]
+    if not item_ids:
+        return
+    for row in item_rows:
+        conn.execute(
+            """
+            DELETE FROM jobs
+            WHERE type = 'crawl_url'
+              AND dedupe_key = ?
+              AND status != 'running'
+            """,
+            (f"queue:{row['queue_id']}:crawl:{row['url_id']}",),
+        )
+    placeholders = ",".join("?" for _ in item_ids)
+    conn.execute(
+        f"""
+        UPDATE url_queue_items
+        SET source_url_queue_item_id = NULL
+        WHERE source_url_queue_item_id IN ({placeholders})
+        """,
+        item_ids,
+    )
+    conn.execute(f"DELETE FROM url_queue_items WHERE id IN ({placeholders})", item_ids)
 
 
 def recover_interrupted_jobs(conn: sqlite3.Connection) -> None:
@@ -600,29 +728,6 @@ CREATE TABLE IF NOT EXISTS url_queue_items (
   started_at TEXT,
   finished_at TEXT,
   UNIQUE (queue_id, url_id)
-);
-
-CREATE TABLE IF NOT EXISTS domains (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  domain TEXT NOT NULL UNIQUE,
-  first_source TEXT NOT NULL,
-  review_status TEXT NOT NULL DEFAULT 'pending_review',
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS domain_sources (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  domain_id INTEGER NOT NULL REFERENCES domains(id),
-  source_type TEXT NOT NULL,
-  dedupe_key TEXT NOT NULL UNIQUE,
-  queue_id INTEGER REFERENCES queues(id),
-  keyword_id INTEGER REFERENCES keywords(id),
-  search_query_id INTEGER REFERENCES search_queries(id),
-  source_url_id INTEGER REFERENCES urls(id),
-  discovered_url_id INTEGER REFERENCES urls(id),
-  rank INTEGER,
-  page_no INTEGER,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS url_sources (

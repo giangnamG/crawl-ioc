@@ -277,6 +277,7 @@ def run_one() -> str:
                     url_queue_item_id=url_queue_item_id,
                 )
                 mark_url_queue_item(conn, url_queue_item_id, "done")
+                remove_url_from_queue_items(conn, int(payload["url_id"]))
             else:
                 raise ValueError(f"Unsupported job type: {job['type']}")
 
@@ -416,23 +417,10 @@ def process_search_query(
                 continue
 
             if is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm):
-                upsert_domain(conn, domain, "google_search")
-                upsert_domain_source(
-                    conn,
-                    domain=domain,
-                    source_type="google_search",
-                    dedupe_key=f"domain:google:{effective_queue_id or 'global'}:{search_query_id}:{item.page_no}:{item.rank}:{domain}",
-                    queue_id=effective_queue_id,
-                    keyword_id=search_query["keyword_id"],
-                    search_query_id=search_query_id,
-                    rank=item.rank,
-                    page_no=item.page_no,
-                )
                 continue
 
             url_id = upsert_url(conn, item.url, url_norm, domain, "google_search")
             saved_urls += 1
-            upsert_domain(conn, domain, "google_search")
             upsert_url_source(
                 conn,
                 url_id=url_id,
@@ -443,18 +431,6 @@ def process_search_query(
                 search_query_id=search_query_id,
                 title=item.title,
                 snippet=item.snippet,
-                rank=item.rank,
-                page_no=item.page_no,
-            )
-            upsert_domain_source(
-                conn,
-                domain=domain,
-                source_type="google_search",
-                dedupe_key=f"domain:google:{effective_queue_id or 'global'}:{search_query_id}:{item.page_no}:{item.rank}:{domain}",
-                queue_id=effective_queue_id,
-                keyword_id=search_query["keyword_id"],
-                search_query_id=search_query_id,
-                discovered_url_id=url_id,
                 rank=item.rank,
                 page_no=item.page_no,
             )
@@ -689,20 +665,10 @@ def process_crawl_url(
                 discovered_domain = get_domain(discovered_url)
                 if discovered_domain:
                     if is_media_asset_url(discovered_url) or is_url_whitelisted(conn, discovered_url):
-                        upsert_domain(conn, discovered_domain, "extracted_from_crawl")
-                        upsert_domain_source(
-                            conn,
-                            domain=discovered_domain,
-                            source_type="extracted_from_crawl",
-                            dedupe_key=f"domain:crawl-ignored-url:{queue_id or 'global'}:{url_id}:{discovered_domain}:{discovered_url}",
-                            queue_id=queue_id,
-                            source_url_id=url_id,
-                        )
                         continue
                     discovered_url_id = upsert_url(
                         conn, discovered_url, discovered_url, discovered_domain, "extracted_from_crawl"
                     )
-                    upsert_domain(conn, discovered_domain, "extracted_from_crawl")
                     upsert_url_source(
                         conn,
                         url_id=discovered_url_id,
@@ -710,15 +676,6 @@ def process_crawl_url(
                         dedupe_key=f"crawl:{queue_id or 'global'}:{url_id}:{discovered_url}",
                         queue_id=queue_id,
                         source_url_id=url_id,
-                    )
-                    upsert_domain_source(
-                        conn,
-                        domain=discovered_domain,
-                        source_type="extracted_from_crawl",
-                        dedupe_key=f"domain:crawl:{queue_id or 'global'}:{url_id}:{discovered_domain}",
-                        queue_id=queue_id,
-                        source_url_id=url_id,
-                        discovered_url_id=discovered_url_id,
                     )
                     enqueue_discovered_url_if_new(
                         conn,
@@ -730,9 +687,7 @@ def process_crawl_url(
         if ioc.type == "domain":
             discovered_domain = normalize_domain(ioc.norm)
             if discovered_domain:
-                upsert_domain(conn, discovered_domain, "extracted_from_crawl")
                 discovered_url = normalize_url(f"https://{discovered_domain}/")
-                discovered_url_id = None
                 if discovered_url:
                     discovered_url_id = upsert_url(
                         conn, discovered_url, discovered_url, discovered_domain, "extracted_from_crawl"
@@ -745,16 +700,6 @@ def process_crawl_url(
                         queue_id=queue_id,
                         source_url_id=url_id,
                     )
-                upsert_domain_source(
-                    conn,
-                    domain=discovered_domain,
-                    source_type="extracted_from_crawl",
-                    dedupe_key=f"domain:crawl:{queue_id or 'global'}:{url_id}:{discovered_domain}",
-                    queue_id=queue_id,
-                    source_url_id=url_id,
-                    discovered_url_id=discovered_url_id,
-                )
-                if discovered_url_id:
                     enqueue_discovered_url_if_new(
                         conn,
                         url_queue_id=queue_id,
@@ -772,18 +717,6 @@ def upsert_url(conn: Connection, url_raw: str, url_norm: str, domain: str, first
         (url_raw, url_norm, domain, first_source),
     )
     row = conn.execute("SELECT id FROM urls WHERE url_norm = ?", (url_norm,)).fetchone()
-    return int(row["id"])
-
-
-def upsert_domain(conn: Connection, domain: str, first_source: str) -> int:
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO domains(domain, first_source)
-        VALUES (?, ?)
-        """,
-        (domain, first_source),
-    )
-    row = conn.execute("SELECT id FROM domains WHERE domain = ?", (domain,)).fetchone()
     return int(row["id"])
 
 
@@ -816,6 +749,9 @@ def enqueue_url_to_queue(
     if not queue or not target:
         return None
     if is_media_asset_url(target["url_norm"]) or is_url_whitelisted(conn, target["url_norm"]):
+        return None
+    if target["crawl_status"] in TERMINAL_CRAWL_STATUSES:
+        remove_url_from_queue_items(conn, url_id)
         return None
     if target["review_status"] != "pending_review":
         return None
@@ -905,31 +841,6 @@ def upsert_url_source(conn: Connection, **kwargs: object) -> None:
     )
 
 
-def upsert_domain_source(conn: Connection, **kwargs: object) -> None:
-    domain_id = upsert_domain(conn, str(kwargs["domain"]), str(kwargs.get("source_type") or "manual"))
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO domain_sources(
-          domain_id, source_type, dedupe_key, queue_id, keyword_id, search_query_id,
-          source_url_id, discovered_url_id, rank, page_no
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            domain_id,
-            kwargs.get("source_type"),
-            kwargs.get("dedupe_key"),
-            kwargs.get("queue_id"),
-            kwargs.get("keyword_id"),
-            kwargs.get("search_query_id"),
-            kwargs.get("source_url_id"),
-            kwargs.get("discovered_url_id"),
-            kwargs.get("rank"),
-            kwargs.get("page_no"),
-        ),
-    )
-
-
 def upsert_ioc(conn: Connection, ioc_type: str, value_raw: str, value_norm: str) -> int:
     conn.execute(
         """
@@ -991,6 +902,9 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
     target = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
     if not target:
         return False
+    if target["crawl_status"] in TERMINAL_CRAWL_STATUSES:
+        remove_url_from_queue_items(conn, url_id)
+        return False
     whitelisted = is_url_whitelisted(conn, target["url_norm"])
     if is_media_asset_url(target["url_norm"]) or whitelisted:
         conn.execute(
@@ -1011,10 +925,6 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
     conn.execute(
         "UPDATE urls SET review_status = 'approved' WHERE id = ? AND review_status = 'pending_review'",
         (url_id,),
-    )
-    conn.execute(
-        "UPDATE domains SET review_status = 'approved' WHERE domain = ? AND review_status = 'pending_review'",
-        (target["domain"],),
     )
     queue_rows = []
     if queue_id:
@@ -1075,56 +985,6 @@ def reject_url(conn: Connection, url_id: int) -> bool:
     if changed:
         remove_url_from_queue_items(conn, url_id)
     return changed
-
-
-def reject_domain(conn: Connection, domain: str) -> bool:
-    changed = (
-        conn.execute(
-            """
-            UPDATE domains
-            SET review_status = 'rejected'
-            WHERE domain = ?
-              AND review_status = 'pending_review'
-            """,
-            (domain,),
-        ).rowcount
-        > 0
-    )
-    if not changed:
-        return False
-    url_rows = conn.execute(
-        """
-        SELECT id
-        FROM urls
-        WHERE domain = ?
-          AND review_status = 'pending_review'
-          AND NOT EXISTS (
-            SELECT 1
-            FROM whitelist_urls wu
-            WHERE wu.url_norm = urls.url_norm
-              AND wu.enabled = 1
-          )
-        """,
-        (domain,),
-    ).fetchall()
-    conn.execute(
-        """
-        UPDATE urls
-        SET review_status = 'rejected'
-        WHERE domain = ?
-          AND review_status = 'pending_review'
-          AND NOT EXISTS (
-            SELECT 1
-            FROM whitelist_urls wu
-            WHERE wu.url_norm = urls.url_norm
-              AND wu.enabled = 1
-          )
-        """,
-        (domain,),
-    )
-    for row in url_rows:
-        remove_url_from_queue_items(conn, int(row["id"]))
-    return True
 
 
 def refresh_keyword_status(conn: Connection, keyword_id: int) -> None:

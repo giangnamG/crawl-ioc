@@ -11,16 +11,15 @@ from .db import connect, db_path, init_db, is_url_whitelisted
 from .extractor import test_rule, validate_rule
 from .normalizers import get_domain, is_media_asset_url, normalize_url
 from .worker import (
+    TERMINAL_CRAWL_STATUSES,
     approve_url_and_enqueue,
     enqueue_job,
     refresh_keyword_status,
     refresh_queue_status,
     remove_url_from_queue_items,
-    reject_domain,
     reject_url,
     run_all,
     run_one,
-    upsert_domain,
     upsert_url,
 )
 
@@ -79,7 +78,13 @@ def create_app(start_worker: bool = False) -> Flask:
                 "search_queries": scalar(conn, "SELECT COUNT(*) FROM search_queries"),
                 "pending_jobs": scalar(conn, "SELECT COUNT(*) FROM jobs WHERE status = 'pending'"),
                 "pending_review": scalar(
-                    conn, "SELECT COUNT(*) FROM urls WHERE review_status = 'pending_review'"
+                    conn,
+                    """
+                    SELECT COUNT(*)
+                    FROM urls
+                    WHERE review_status = 'pending_review'
+                      AND crawl_status NOT IN ('crawled', 'metadata_only')
+                    """,
                 ),
                 "approved_urls": scalar(conn, "SELECT COUNT(*) FROM urls WHERE review_status = 'approved'"),
                 "crawled_urls": scalar(
@@ -87,7 +92,6 @@ def create_app(start_worker: bool = False) -> Flask:
                     "SELECT COUNT(*) FROM urls WHERE crawl_status IN ('crawled', 'metadata_only')",
                 ),
                 "iocs": scalar(conn, "SELECT COUNT(*) FROM iocs"),
-                "domains": scalar(conn, "SELECT COUNT(*) FROM domains"),
             }
             recent_jobs = conn.execute(
                 "SELECT * FROM jobs ORDER BY id DESC LIMIT 8"
@@ -612,24 +616,16 @@ def create_app(start_worker: bool = False) -> Flask:
         url_status = normalize_review_status(
             request.args.get("url_status") or legacy_status or "pending_review"
         )
-        domain_status = normalize_review_status(
-            request.args.get("domain_status") or legacy_status or "pending_review"
-        )
         source = request.args.get("source", "")
         q = request.args.get("q", "").strip()
         with connect() as conn:
             urls = list(query_review_urls(conn, url_status, q))
             if source:
-                urls = [row for row in urls if source_matches(row["domain_sources"] or "", source)]
-            domains = list(query_review_domains(conn, domain_status, q))
-            if source:
-                domains = [row for row in domains if source_matches(row["sources"] or "", source)]
+                urls = [row for row in urls if source_matches(row["sources"] or "", source)]
         return render_template(
             "review.html",
             urls=urls,
-            domains=domains,
             url_status=url_status,
-            domain_status=domain_status,
             review_tabs=REVIEW_TABS,
             source=source,
             q=q,
@@ -677,65 +673,6 @@ def create_app(start_worker: bool = False) -> Flask:
                 return redirect(request.referrer or url_for("review"))
         label = "approved" if action == "approve" else "rejected"
         flash(f"Bulk URL action completed: {changed} of {len(url_ids)} selected URLs {label}.", "success")
-        return redirect(request.referrer or url_for("review"))
-
-    @app.post("/domains/reject")
-    def reject_domain_route():
-        domain = request.form.get("domain", "")
-        with connect() as conn:
-            changed = reject_domain(conn, domain)
-        flash(
-            f"Domain rejected: {domain}" if changed else f"Domain is already reviewed and is read-only: {domain}",
-            "success" if changed else "error",
-        )
-        return redirect(request.referrer or url_for("review"))
-
-    @app.post("/domains/approve")
-    def approve_domain_route():
-        domain = request.form.get("domain", "")
-        with connect() as conn:
-            changed, url_count = approve_domain_and_enqueue(conn, domain)
-        flash(
-            f"Domain approved and queued {url_count} pending URLs: {domain}"
-            if changed
-            else f"Domain is already reviewed and is read-only: {domain}",
-            "success" if changed else "error",
-        )
-        return redirect(request.referrer or url_for("review"))
-
-    @app.post("/domains/bulk")
-    def bulk_review_domains():
-        action = request.form.get("bulk_action", "")
-        domains = unique_strings(request.form.getlist("domains"))
-        if not domains:
-            flash("Select at least one domain row.", "error")
-            return redirect(request.referrer or url_for("review"))
-        changed = 0
-        affected_urls = 0
-        with connect() as conn:
-            if action == "approve":
-                for domain in domains:
-                    ok, url_count = approve_domain_and_enqueue(conn, domain)
-                    if ok:
-                        changed += 1
-                        affected_urls += url_count
-            elif action == "reject":
-                for domain in domains:
-                    if reject_domain(conn, domain):
-                        changed += 1
-            else:
-                flash("Bulk domain action is invalid.", "error")
-                return redirect(request.referrer or url_for("review"))
-        if action == "approve":
-            flash(
-                f"Bulk domain action completed: {changed} of {len(domains)} domains approved, {affected_urls} pending URLs queued.",
-                "success",
-            )
-        else:
-            flash(
-                f"Bulk domain action completed: {changed} of {len(domains)} domains rejected.",
-                "success",
-            )
         return redirect(request.referrer or url_for("review"))
 
     @app.get("/crawl")
@@ -888,18 +825,6 @@ def unique_ints(values: list[str]) -> list[int]:
         except (TypeError, ValueError):
             continue
         if item in seen:
-            continue
-        seen.add(item)
-        rows.append(item)
-    return rows
-
-
-def unique_strings(values: list[str]) -> list[str]:
-    seen = set()
-    rows = []
-    for value in values:
-        item = (value or "").strip()
-        if not item or item in seen:
             continue
         seen.add(item)
         rows.append(item)
@@ -1121,15 +1046,6 @@ def delete_keyword_from_queue(conn, keyword_id: int) -> tuple[bool, int, int, st
         )
         conn.execute(
             f"""
-            UPDATE domain_sources
-            SET keyword_id = NULL,
-                search_query_id = NULL
-            WHERE keyword_id = ? OR search_query_id IN ({query_placeholders})
-            """,
-            source_params,
-        )
-        conn.execute(
-            f"""
             UPDATE url_queue_items
             SET source_search_query_id = NULL
             WHERE source_search_query_id IN ({query_placeholders})
@@ -1167,7 +1083,6 @@ def delete_keyword_from_queue(conn, keyword_id: int) -> tuple[bool, int, int, st
         conn.execute(f"DELETE FROM search_queries WHERE id IN ({query_placeholders})", query_ids)
     else:
         conn.execute("UPDATE url_sources SET keyword_id = NULL WHERE keyword_id = ?", (keyword_id,))
-        conn.execute("UPDATE domain_sources SET keyword_id = NULL WHERE keyword_id = ?", (keyword_id,))
         queue_item_rows = conn.execute(
             "SELECT id FROM search_queue_items WHERE keyword_id = ?",
             (keyword_id,),
@@ -1608,10 +1523,18 @@ def reset_url_for_manual_rerun(conn, url_id: int) -> None:
 
 def requeue_url_queue_item(conn, queue_id: int, url_id: int, queue_item_id: int) -> bool:
     row = conn.execute(
-        "SELECT status FROM url_queue_items WHERE id = ?",
+        """
+        SELECT qi.status, u.crawl_status
+        FROM url_queue_items qi
+        JOIN urls u ON u.id = qi.url_id
+        WHERE qi.id = ?
+        """,
         (queue_item_id,),
     ).fetchone()
     if not row or row["status"] == "running":
+        return False
+    if row["crawl_status"] in TERMINAL_CRAWL_STATUSES:
+        remove_url_from_queue_items(conn, url_id)
         return False
 
     running_job = conn.execute(
@@ -1665,12 +1588,12 @@ def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int, 
             continue
 
         url_id = upsert_url(conn, item, url_norm, domain, "manual_queue")
-        upsert_domain(conn, domain, "manual_queue")
+        target = conn.execute("SELECT crawl_status FROM urls WHERE id = ?", (url_id,)).fetchone()
+        if target and target["crawl_status"] in TERMINAL_CRAWL_STATUSES:
+            remove_url_from_queue_items(conn, url_id)
+            skipped += 1
+            continue
         conn.execute("UPDATE urls SET review_status = 'approved' WHERE id = ?", (url_id,))
-        conn.execute(
-            "UPDATE domains SET review_status = 'approved' WHERE domain = ? AND review_status != 'rejected'",
-            (domain,),
-        )
         existing_item = conn.execute(
             """
             SELECT id
@@ -1732,43 +1655,6 @@ def apply_url_whitelist(conn, url_norm: str) -> dict[str, int]:
         "removed_items": removed_items,
         "removed_jobs": removed_jobs,
     }
-
-
-def approve_domain_and_enqueue(conn, domain: str) -> tuple[bool, int]:
-    domain_row = conn.execute(
-        "SELECT review_status FROM domains WHERE domain = ?", (domain,)
-    ).fetchone()
-    if not domain_row or domain_row["review_status"] != "pending_review":
-        return False, 0
-    conn.execute(
-        """
-        UPDATE domains
-        SET review_status = 'approved'
-        WHERE domain = ?
-          AND review_status = 'pending_review'
-        """,
-        (domain,),
-    )
-    pending_urls = conn.execute(
-        """
-        SELECT id
-        FROM urls
-        WHERE domain = ?
-          AND review_status = 'pending_review'
-          AND NOT EXISTS (
-            SELECT 1
-            FROM whitelist_urls wu
-            WHERE wu.url_norm = urls.url_norm
-              AND wu.enabled = 1
-          )
-        """,
-        (domain,),
-    ).fetchall()
-    queued_count = 0
-    for row in pending_urls:
-        if approve_url_and_enqueue(conn, int(row["id"])):
-            queued_count += 1
-    return True, queued_count
 
 
 def delete_url_queue_item(conn, item_id: int) -> tuple[bool, int | None, int, str]:
@@ -2101,6 +1987,7 @@ def query_review_urls(conn, status: str, q: str):
     if status:
         where.append("u.review_status = ?")
         params.append(status)
+    where.append("u.crawl_status NOT IN ('crawled', 'metadata_only')")
     where.append("u.review_status != 'ignored_whitelist'")
     where.append(
         """
@@ -2119,13 +2006,11 @@ def query_review_urls(conn, status: str, q: str):
     rows = conn.execute(
         f"""
         SELECT u.*,
-               GROUP_CONCAT(DISTINCT ds.source_type) AS domain_sources,
+               GROUP_CONCAT(DISTINCT us.source_type) AS sources,
                GROUP_CONCAT(DISTINCT sq.query_text) AS queries,
                MIN(us.title) AS title,
                MIN(us.snippet) AS snippet
         FROM urls u
-        LEFT JOIN domains d ON d.domain = u.domain
-        LEFT JOIN domain_sources ds ON ds.domain_id = d.id
         LEFT JOIN url_sources us ON us.url_id = u.id
         LEFT JOIN search_queries sq ON sq.id = us.search_query_id
         {where_sql}
@@ -2136,44 +2021,6 @@ def query_review_urls(conn, status: str, q: str):
         params,
     ).fetchall()
     return [row for row in rows if not is_media_asset_url(row["url_norm"])][:500]
-
-
-def query_review_domains(conn, status: str, q: str):
-    params: list[object] = []
-    where = []
-    if status:
-        where.append("d.review_status = ?")
-        params.append(status)
-    if q:
-        where.append("d.domain LIKE ?")
-        params.append(f"%{q}%")
-    where_sql = "WHERE " + " AND ".join(where) if where else ""
-    return conn.execute(
-        f"""
-        SELECT d.*,
-               GROUP_CONCAT(DISTINCT ds.source_type) AS sources,
-               COUNT(
-                 DISTINCT CASE
-                   WHEN u.review_status != 'ignored_whitelist'
-                    AND NOT EXISTS (
-                      SELECT 1
-                      FROM whitelist_urls wu
-                      WHERE wu.url_norm = u.url_norm
-                        AND wu.enabled = 1
-                    )
-                   THEN u.id
-                 END
-               ) AS url_count
-        FROM domains d
-        LEFT JOIN domain_sources ds ON ds.domain_id = d.id
-        LEFT JOIN urls u ON u.domain = d.domain
-        {where_sql}
-        GROUP BY d.id
-        ORDER BY d.created_at DESC
-        LIMIT 500
-        """,
-        params,
-    ).fetchall()
 
 
 def source_matches(sources: str, wanted: str) -> bool:

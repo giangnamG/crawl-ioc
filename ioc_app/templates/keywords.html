@@ -129,7 +129,7 @@
                       <button class="button small" type="submit">Stop</button>
                     </form>
                   {% endif %}
-                  <form method="post" action="{{ url_for('delete_keyword', keyword_id=row.id) }}" onsubmit="return confirm('Delete this keyword from queue? Collected URLs, domains, and IOCs will be kept.');">
+                  <form method="post" action="{{ url_for('delete_keyword', keyword_id=row.id) }}" onsubmit="return confirm('Delete this keyword from queue? Collected URLs and IOCs will be kept.');">
                     <button class="button small danger" type="submit">Delete</button>
                   </form>
                 </div>
