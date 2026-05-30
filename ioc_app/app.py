@@ -19,9 +19,12 @@ from .worker import (
     refresh_queue_status,
     remove_url_from_queue_items,
     reject_url,
+    recover_stale_worker_slots,
     run_all,
     run_one,
     upsert_url,
+    url_crawl_concurrency,
+    url_crawl_worker_threads,
 )
 
 
@@ -867,7 +870,20 @@ def create_app(start_worker: bool = False) -> Flask:
                 LIMIT 200
                 """
             ).fetchall()
-        return render_template("jobs.html", rows=rows)
+            worker_slots = conn.execute(
+                """
+                SELECT ws.*, q.name AS queue_name, q.queue_type
+                FROM worker_slots ws
+                LEFT JOIN queues q ON q.id = ws.queue_id
+                ORDER BY ws.worker_type, ws.slot_key
+                """
+            ).fetchall()
+        return render_template(
+            "jobs.html",
+            rows=rows,
+            worker_slots=worker_slots,
+            url_crawl_concurrency=url_crawl_concurrency(),
+        )
 
     @app.get("/iocs")
     def iocs():
@@ -2513,19 +2529,64 @@ def source_matches(sources: str, wanted: str) -> bool:
 
 
 def start_background_worker(app: Flask) -> None:
-    if app.config.get("AUTO_WORKER_THREAD"):
+    if app.config.get("AUTO_WORKER_THREADS"):
         return
 
     poll_seconds = float(os.environ.get("WORKER_POLL_SECONDS", "3"))
+    maintenance_seconds = float(os.environ.get("WORKER_MAINTAINER_SECONDS", str(max(10.0, poll_seconds * 2))))
+    threads: list[threading.Thread] = []
 
-    def worker_loop() -> None:
+    def worker_loop(
+        job_types: tuple[str, ...],
+        worker_slot_key: str,
+        worker_type: str,
+        idle_delay: float = 0.3,
+    ) -> None:
         while True:
             try:
-                message = run_one()
-                time.sleep(poll_seconds if message == "No pending job." else 0.3)
+                message = run_one(
+                    job_types=job_types,
+                    worker_slot_key=worker_slot_key,
+                    worker_type=worker_type,
+                )
+                time.sleep(poll_seconds if message == "No pending job." else idle_delay)
             except Exception:
                 time.sleep(poll_seconds)
 
-    thread = threading.Thread(target=worker_loop, name="ioc-background-worker", daemon=True)
-    thread.start()
-    app.config["AUTO_WORKER_THREAD"] = thread
+    def maintainer_loop() -> None:
+        while True:
+            try:
+                recover_stale_worker_slots()
+            except Exception:
+                pass
+            time.sleep(maintenance_seconds)
+
+    search_thread = threading.Thread(
+        target=worker_loop,
+        args=(("search_query",), "search_query:1", "search_query"),
+        name="ioc-search-worker-1",
+        daemon=True,
+    )
+    search_thread.start()
+    threads.append(search_thread)
+
+    for index in range(1, url_crawl_worker_threads() + 1):
+        thread = threading.Thread(
+            target=worker_loop,
+            args=(("crawl_url",), f"crawl_url:{index}", "crawl_url"),
+            name=f"ioc-crawl-worker-{index}",
+            daemon=True,
+        )
+        thread.start()
+        threads.append(thread)
+
+    maintainer_thread = threading.Thread(
+        target=maintainer_loop,
+        name="ioc-worker-maintainer",
+        daemon=True,
+    )
+    maintainer_thread.start()
+    threads.append(maintainer_thread)
+
+    app.config["AUTO_WORKER_THREADS"] = threads
+    app.config["AUTO_WORKER_THREAD"] = threads[0] if threads else True

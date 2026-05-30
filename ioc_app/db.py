@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sqlite3
@@ -17,10 +18,11 @@ def db_path() -> Path:
 def connect() -> sqlite3.Connection:
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=float(os.environ.get("SQLITE_BUSY_TIMEOUT", "30")))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -85,6 +87,11 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "search_queries", "started_at", "TEXT")
     ensure_column(conn, "search_queries", "finished_at", "TEXT")
     ensure_column(conn, "jobs", "queue_id", "INTEGER REFERENCES queues(id)")
+    ensure_column(conn, "jobs", "target_url_id", "INTEGER")
+    ensure_column(conn, "jobs", "target_queue_item_id", "INTEGER")
+    ensure_column(conn, "jobs", "worker_slot_key", "TEXT")
+    ensure_column(conn, "jobs", "run_token", "TEXT")
+    ensure_column(conn, "jobs", "heartbeat_at", "TEXT")
     ensure_column(conn, "search_queue_items", "output_url_queue_id", "INTEGER REFERENCES queues(id)")
     ensure_column(conn, "url_sources", "queue_id", "INTEGER REFERENCES queues(id)")
     ensure_column(conn, "url_queue_items", "source_queue_id", "INTEGER REFERENCES queues(id)")
@@ -123,9 +130,32 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     migrate_domain_tables_into_urls(conn)
     remove_crawled_urls_from_queue_items(conn)
     remove_ignored_asset_urls_from_queue_items(conn)
+    migrate_job_targets(conn)
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS worker_slots (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          slot_key TEXT NOT NULL UNIQUE,
+          worker_type TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          status TEXT NOT NULL DEFAULT 'idle',
+          job_id INTEGER,
+          queue_id INTEGER,
+          target_url_id INTEGER,
+          target_queue_item_id INTEGER,
+          run_token TEXT,
+          thread_name TEXT,
+          pid INTEGER,
+          started_at TEXT,
+          heartbeat_at TEXT,
+          finished_at TEXT,
+          error TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(queue_id, status, id);
+        CREATE INDEX IF NOT EXISTS idx_jobs_crawl_target ON jobs(type, status, target_url_id);
+        CREATE INDEX IF NOT EXISTS idx_jobs_worker_slot ON jobs(worker_slot_key, status);
         CREATE INDEX IF NOT EXISTS idx_search_queries_queue ON search_queries(queue_id, status);
         CREATE INDEX IF NOT EXISTS idx_search_queue_items_queue ON search_queue_items(queue_id, status);
         CREATE INDEX IF NOT EXISTS idx_search_queue_items_output ON search_queue_items(output_url_queue_id);
@@ -134,6 +164,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_queue_routes_url ON queue_routes(url_queue_id);
         CREATE INDEX IF NOT EXISTS idx_whitelist_urls_enabled ON whitelist_urls(enabled, url_norm);
         CREATE INDEX IF NOT EXISTS idx_whitelist_urls_match ON whitelist_urls(enabled, match_type, match_value);
+        CREATE INDEX IF NOT EXISTS idx_worker_slots_type ON worker_slots(worker_type, enabled, status);
         """
     )
 
@@ -153,6 +184,38 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition:
     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def migrate_job_targets(conn: sqlite3.Connection) -> None:
+    if not table_exists(conn, "jobs"):
+        return
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if {"target_url_id", "target_queue_item_id", "payload", "type"} - columns:
+        return
+    rows = conn.execute(
+        """
+        SELECT id, payload
+        FROM jobs
+        WHERE type = 'crawl_url'
+          AND (target_url_id IS NULL OR target_queue_item_id IS NULL)
+        """
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except Exception:
+            continue
+        target_url_id = payload.get("url_id")
+        target_queue_item_id = payload.get("url_queue_item_id")
+        conn.execute(
+            """
+            UPDATE jobs
+            SET target_url_id = COALESCE(target_url_id, ?),
+                target_queue_item_id = COALESCE(target_queue_item_id, ?)
+            WHERE id = ?
+            """,
+            (target_url_id, target_queue_item_id, row["id"]),
+        )
 
 
 def migrate_domain_tables_into_urls(conn: sqlite3.Connection) -> None:
@@ -336,10 +399,30 @@ def recover_interrupted_jobs(conn: sqlite3.Connection) -> None:
         UPDATE jobs
         SET status = 'pending',
             started_at = NULL,
+            worker_slot_key = NULL,
+            run_token = NULL,
+            heartbeat_at = NULL,
             error = COALESCE(error, 'Recovered after interrupted process.')
         WHERE status = 'running'
         """
     )
+    if table_exists(conn, "worker_slots"):
+        conn.execute(
+            """
+            UPDATE worker_slots
+            SET status = 'idle',
+                job_id = NULL,
+                queue_id = NULL,
+                target_url_id = NULL,
+                target_queue_item_id = NULL,
+                run_token = NULL,
+                heartbeat_at = NULL,
+                finished_at = CURRENT_TIMESTAMP,
+                error = COALESCE(error, 'Recovered after interrupted process.'),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'running'
+            """
+        )
     conn.execute(
         """
         UPDATE search_queries

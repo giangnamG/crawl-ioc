@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 import traceback
 import urllib.parse
+import uuid
 from sqlite3 import Connection
 
 from .browser import BrowserClient, is_retryable_proxy_error
@@ -14,6 +17,10 @@ from .normalizers import get_domain, is_media_asset_url, normalize_domain, norma
 
 class PausedJob(Exception):
     """Raised when a queued job has been paused before execution."""
+
+
+class LeaseLostJob(Exception):
+    """Raised when a stale worker lease has been reclaimed by the maintainer."""
 
 
 TERMINAL_CRAWL_STATUSES = {"crawled", "metadata_only"}
@@ -58,6 +65,56 @@ HTTP_BINARY_EXTENSIONS = {
 }
 
 
+def env_int(name: str, default: int, minimum: int = 0, maximum: int | None = None) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        value = default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = float(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+def url_crawl_concurrency() -> int:
+    return env_int("URL_CRAWL_CONCURRENCY", 1, minimum=1, maximum=32)
+
+
+def url_crawl_worker_threads() -> int:
+    concurrency = url_crawl_concurrency()
+    return env_int("URL_CRAWL_WORKER_THREADS", concurrency + 1, minimum=concurrency, maximum=64)
+
+
+def worker_slot_stale_seconds() -> int:
+    return env_int("WORKER_SLOT_STALE_SECONDS", 900, minimum=60)
+
+
+def worker_slot_max_seconds() -> int:
+    return env_int("WORKER_SLOT_MAX_SECONDS", 1800, minimum=120)
+
+
+def worker_heartbeat_seconds() -> float:
+    return env_float("WORKER_HEARTBEAT_SECONDS", 5.0, minimum=1.0)
+
+
+def payload_int(payload: dict[str, object], key: str) -> int | None:
+    value = payload.get(key)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def enqueue_job(
     conn: Connection,
     job_type: str,
@@ -67,6 +124,10 @@ def enqueue_job(
     initial_status: str = "pending",
 ) -> None:
     payload_json = json.dumps(payload)
+    target_url_id = payload_int(payload, "url_id") if job_type == "crawl_url" else None
+    target_queue_item_id = (
+        payload_int(payload, "url_queue_item_id") if job_type == "crawl_url" else None
+    )
     existing = conn.execute(
         "SELECT id, status FROM jobs WHERE dedupe_key = ?", (dedupe_key,)
     ).fetchone()
@@ -84,56 +145,173 @@ def enqueue_job(
             SET queue_id = ?,
                 status = ?,
                 payload = ?,
+                target_url_id = ?,
+                target_queue_item_id = ?,
                 attempts = CASE WHEN status IN ('failed', 'done') THEN 0 ELSE attempts END,
                 error = NULL,
                 started_at = NULL,
-                finished_at = NULL
+                finished_at = NULL,
+                worker_slot_key = NULL,
+                run_token = NULL,
+                heartbeat_at = NULL
             WHERE id = ?
             """,
-            (queue_id, next_status, payload_json, existing["id"]),
+            (
+                queue_id,
+                next_status,
+                payload_json,
+                target_url_id,
+                target_queue_item_id,
+                existing["id"],
+            ),
         )
         return
 
     conn.execute(
         """
-        INSERT OR IGNORE INTO jobs(queue_id, type, status, payload, dedupe_key)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO jobs(
+          queue_id, type, status, payload, dedupe_key, target_url_id, target_queue_item_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (queue_id, job_type, initial_status, payload_json, dedupe_key),
+        (
+            queue_id,
+            job_type,
+            initial_status,
+            payload_json,
+            dedupe_key,
+            target_url_id,
+            target_queue_item_id,
+        ),
     )
 
 
-def claim_next_job() -> dict[str, object] | None:
+def claim_next_job(
+    job_types: tuple[str, ...] | None = None,
+    worker_slot_key: str | None = None,
+    worker_type: str | None = None,
+) -> dict[str, object] | None:
+    run_token = uuid.uuid4().hex
+    type_filter = ""
+    params: list[object] = []
+    if job_types:
+        placeholders = ",".join("?" for _ in job_types)
+        type_filter = f"AND j.type IN ({placeholders})"
+        params.extend(job_types)
+
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        if worker_slot_key:
+            conn.execute(
+                """
+                INSERT INTO worker_slots(slot_key, worker_type, enabled, status)
+                VALUES (?, ?, 1, 'idle')
+                ON CONFLICT(slot_key) DO UPDATE SET
+                    worker_type = excluded.worker_type,
+                    enabled = 1,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (worker_slot_key, worker_type or "worker"),
+            )
+
         row = conn.execute(
-            """
+            f"""
             SELECT j.*
             FROM jobs j
             LEFT JOIN queues q ON q.id = j.queue_id
             WHERE j.status = 'pending'
               AND (j.queue_id IS NULL OR q.status = 'running')
+              {type_filter}
+              AND (
+                j.type != 'crawl_url'
+                OR (
+                  (
+                    SELECT COUNT(*)
+                    FROM jobs running
+                    WHERE running.type = 'crawl_url'
+                      AND running.status = 'running'
+                  ) < ?
+                  AND (
+                    j.target_url_id IS NULL
+                    OR NOT EXISTS (
+                      SELECT 1
+                      FROM jobs same_url
+                      WHERE same_url.type = 'crawl_url'
+                        AND same_url.status = 'running'
+                        AND same_url.target_url_id = j.target_url_id
+                    )
+                  )
+                )
+              )
             ORDER BY j.id
             LIMIT 1
-            """
+            """,
+            (*params, url_crawl_concurrency()),
         ).fetchone()
         if not row:
+            if worker_slot_key:
+                conn.execute(
+                    """
+                    UPDATE worker_slots
+                    SET status = CASE WHEN status = 'running' THEN status ELSE 'idle' END,
+                        heartbeat_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE slot_key = ?
+                    """,
+                    (worker_slot_key,),
+                )
             conn.commit()
             return None
 
         updated = conn.execute(
             """
             UPDATE jobs
-            SET status = 'running'
+            SET status = 'running',
+                worker_slot_key = ?,
+                run_token = ?,
+                heartbeat_at = CURRENT_TIMESTAMP
             WHERE id = ?
               AND status = 'pending'
             """,
-            (row["id"],),
+            (worker_slot_key, run_token, row["id"]),
         ).rowcount
+        if updated == 1 and worker_slot_key:
+            conn.execute(
+                """
+                UPDATE worker_slots
+                SET status = 'running',
+                    job_id = ?,
+                    queue_id = ?,
+                    target_url_id = ?,
+                    target_queue_item_id = ?,
+                    run_token = ?,
+                    thread_name = ?,
+                    pid = ?,
+                    started_at = CURRENT_TIMESTAMP,
+                    heartbeat_at = CURRENT_TIMESTAMP,
+                    finished_at = NULL,
+                    error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE slot_key = ?
+                """,
+                (
+                    row["id"],
+                    row["queue_id"],
+                    row["target_url_id"],
+                    row["target_queue_item_id"],
+                    run_token,
+                    threading.current_thread().name,
+                    os.getpid(),
+                    worker_slot_key,
+                ),
+            )
         conn.commit()
         if updated != 1:
             return None
-        return dict(row)
+        claimed = dict(row)
+        claimed["run_token"] = run_token
+        claimed["worker_slot_key"] = worker_slot_key
+        return claimed
 
 
 def validate_search_job_payload(conn: Connection, job: dict[str, object], payload: dict[str, object]):
@@ -230,11 +408,243 @@ def validate_crawl_job_payload(conn: Connection, job: dict[str, object], payload
     return row
 
 
-def run_one() -> str:
-    job = claim_next_job()
+def heartbeat_job(job_id: int, run_token: str, worker_slot_key: str | None = None) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET heartbeat_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND run_token = ?
+              AND status = 'running'
+            """,
+            (job_id, run_token),
+        )
+        if worker_slot_key:
+            conn.execute(
+                """
+                UPDATE worker_slots
+                SET heartbeat_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE slot_key = ?
+                  AND run_token = ?
+                  AND status = 'running'
+                """,
+                (worker_slot_key, run_token),
+            )
+
+
+def release_worker_slot(
+    worker_slot_key: str | None,
+    run_token: str | None,
+    status: str = "idle",
+    error: str | None = None,
+) -> None:
+    if not worker_slot_key or not run_token:
+        return
+    with connect() as conn:
+        release_worker_slot_on_conn(conn, worker_slot_key, run_token, status, error)
+
+
+def release_worker_slot_on_conn(
+    conn: Connection,
+    worker_slot_key: str | None,
+    run_token: str | None,
+    status: str = "idle",
+    error: str | None = None,
+) -> None:
+    if not worker_slot_key or not run_token:
+        return
+    conn.execute(
+        """
+        UPDATE worker_slots
+        SET status = ?,
+            job_id = NULL,
+            queue_id = NULL,
+            target_url_id = NULL,
+            target_queue_item_id = NULL,
+            run_token = NULL,
+            finished_at = CURRENT_TIMESTAMP,
+            error = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE slot_key = ?
+          AND run_token = ?
+        """,
+        (status, error, worker_slot_key, run_token),
+    )
+
+
+def start_job_heartbeat(
+    job_id: int,
+    run_token: str,
+    worker_slot_key: str | None,
+) -> tuple[threading.Event, threading.Thread]:
+    stop_event = threading.Event()
+    interval = worker_heartbeat_seconds()
+
+    def beat() -> None:
+        while not stop_event.wait(interval):
+            try:
+                heartbeat_job(job_id, run_token, worker_slot_key)
+            except Exception:
+                pass
+
+    thread = threading.Thread(
+        target=beat,
+        name=f"heartbeat-{job_id}",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event, thread
+
+
+def ensure_job_lease(conn: Connection, job_id: int | None, run_token: str | None) -> None:
+    if not job_id or not run_token:
+        return
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM jobs
+        WHERE id = ?
+          AND run_token = ?
+          AND status = 'running'
+        """,
+        (job_id, run_token),
+    ).fetchone()
+    if not row:
+        raise LeaseLostJob(f"Job #{job_id} lease is no longer active.")
+
+
+def recover_stale_worker_slots(stale_seconds: int | None = None) -> int:
+    stale_seconds = stale_seconds or worker_slot_stale_seconds()
+    heartbeat_cutoff = f"-{int(stale_seconds)} seconds"
+    max_runtime_cutoff = f"-{worker_slot_max_seconds()} seconds"
+    recovered = 0
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM worker_slots
+            WHERE status = 'running'
+              AND (
+                heartbeat_at IS NULL
+                OR heartbeat_at < datetime('now', ?)
+                OR (
+                  worker_type = 'crawl_url'
+                  AND started_at IS NOT NULL
+                  AND started_at < datetime('now', ?)
+                )
+              )
+            """,
+            (heartbeat_cutoff, max_runtime_cutoff),
+        ).fetchall()
+        for slot in rows:
+            message = f"Recovered stale worker slot {slot['slot_key']}."
+            if slot["worker_type"] == "crawl_url" and slot["started_at"]:
+                maxed_out = conn.execute(
+                    "SELECT ? < datetime('now', ?)",
+                    (slot["started_at"], max_runtime_cutoff),
+                ).fetchone()
+                if maxed_out and maxed_out[0]:
+                    message = f"Recovered overrun crawl slot {slot['slot_key']}."
+            job = None
+            if slot["job_id"] and slot["run_token"]:
+                job = conn.execute(
+                    """
+                    SELECT *
+                    FROM jobs
+                    WHERE id = ?
+                      AND status = 'running'
+                      AND run_token = ?
+                    """,
+                    (slot["job_id"], slot["run_token"]),
+                ).fetchone()
+            if job:
+                payload = {}
+                try:
+                    payload = json.loads(job["payload"] or "{}")
+                except Exception:
+                    payload = {}
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'pending',
+                        started_at = NULL,
+                        worker_slot_key = NULL,
+                        run_token = NULL,
+                        heartbeat_at = NULL,
+                        error = ?
+                    WHERE id = ?
+                    """,
+                    (message, job["id"]),
+                )
+                if job["type"] == "crawl_url":
+                    item_id = payload_int(payload, "url_queue_item_id")
+                    url_id = payload_int(payload, "url_id")
+                    if item_id:
+                        conn.execute(
+                            """
+                            UPDATE url_queue_items
+                            SET status = 'pending',
+                                error = ?
+                            WHERE id = ?
+                              AND status = 'running'
+                            """,
+                            (message, item_id),
+                        )
+                    if url_id:
+                        conn.execute(
+                            """
+                            UPDATE urls
+                            SET crawl_status = 'not_crawled',
+                                crawl_error = ?
+                            WHERE id = ?
+                              AND crawl_status = 'crawling'
+                            """,
+                            (message, url_id),
+                        )
+                if job["queue_id"]:
+                    refresh_queue_status(conn, int(job["queue_id"]))
+            conn.execute(
+                """
+                UPDATE worker_slots
+                SET status = 'idle',
+                    job_id = NULL,
+                    queue_id = NULL,
+                    target_url_id = NULL,
+                    target_queue_item_id = NULL,
+                    run_token = NULL,
+                    finished_at = CURRENT_TIMESTAMP,
+                    error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (message, slot["id"]),
+            )
+            recovered += 1
+        conn.commit()
+    return recovered
+
+
+def run_one(
+    job_types: tuple[str, ...] | None = None,
+    worker_slot_key: str | None = None,
+    worker_type: str | None = None,
+) -> str:
+    recover_stale_worker_slots()
+    job = claim_next_job(job_types=job_types, worker_slot_key=worker_slot_key, worker_type=worker_type)
     if not job:
         return "No pending job."
 
+    run_token = str(job.get("run_token") or "")
+    heartbeat_stop, heartbeat_thread = start_job_heartbeat(
+        int(job["id"]),
+        run_token,
+        worker_slot_key,
+    )
+    final_slot_status = "idle"
+    final_slot_error = None
     with connect() as conn:
         queue_id = job["queue_id"]
         conn.execute(
@@ -244,8 +654,10 @@ def run_one() -> str:
                 started_at = CURRENT_TIMESTAMP,
                 finished_at = NULL
             WHERE id = ?
+              AND run_token = ?
+              AND status = 'running'
             """,
-            (job["id"],),
+            (job["id"], run_token),
         )
 
         payload: dict[str, object] = {}
@@ -275,29 +687,47 @@ def run_one() -> str:
                     int(payload["url_id"]),
                     queue_id=int(queue_id) if queue_id else None,
                     url_queue_item_id=url_queue_item_id,
+                    job_id=int(job["id"]),
+                    run_token=run_token,
                 )
                 mark_url_queue_item(conn, url_queue_item_id, "done")
                 remove_url_from_queue_items(conn, int(payload["url_id"]))
             else:
                 raise ValueError(f"Unsupported job type: {job['type']}")
 
+            ensure_job_lease(conn, int(job["id"]), run_token)
             conn.execute(
-                "UPDATE jobs SET status = 'done', finished_at = CURRENT_TIMESTAMP, error = NULL WHERE id = ?",
-                (job["id"],),
+                """
+                UPDATE jobs
+                SET status = 'done',
+                    finished_at = CURRENT_TIMESTAMP,
+                    error = NULL,
+                    run_token = NULL,
+                    heartbeat_at = NULL
+                WHERE id = ?
+                  AND run_token = ?
+                """,
+                (job["id"], run_token),
             )
             if queue_id:
                 refresh_queue_status(conn, int(queue_id))
             return f"Job #{job['id']} completed."
+        except LeaseLostJob as exc:
+            final_slot_error = str(exc)
+            return f"Job #{job['id']} lease lost."
         except PausedJob:
             conn.execute(
                 """
                 UPDATE jobs
                 SET status = 'paused',
                     finished_at = CURRENT_TIMESTAMP,
-                    error = NULL
+                    error = NULL,
+                    run_token = NULL,
+                    heartbeat_at = NULL
                 WHERE id = ?
+                  AND run_token = ?
                 """,
-                (job["id"],),
+                (job["id"], run_token),
             )
             mark_url_queue_item_if_not_pending_review(conn, payload.get("url_queue_item_id"), "paused")
             mark_search_queue_item(conn, payload.get("search_queue_item_id"), "paused")
@@ -309,15 +739,30 @@ def run_one() -> str:
                 error_text = str(exc)
             else:
                 error_text = traceback.format_exc(limit=5)
+            final_slot_status = "error"
+            final_slot_error = error_text
             mark_url_queue_item(conn, payload.get("url_queue_item_id"), "failed", error_text)
             mark_search_queue_item(conn, payload.get("search_queue_item_id"), "failed", error_text)
             conn.execute(
-                "UPDATE jobs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, error = ? WHERE id = ?",
-                (error_text, job["id"]),
+                """
+                UPDATE jobs
+                SET status = 'failed',
+                    finished_at = CURRENT_TIMESTAMP,
+                    error = ?,
+                    run_token = NULL,
+                    heartbeat_at = NULL
+                WHERE id = ?
+                  AND run_token = ?
+                """,
+                (error_text, job["id"], run_token),
             )
             if queue_id:
                 refresh_queue_status(conn, int(queue_id))
             return f"Job #{job['id']} failed: {exc}"
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1)
+            release_worker_slot_on_conn(conn, worker_slot_key, run_token, final_slot_status, final_slot_error)
 
 
 def run_all(limit: int = 25) -> list[str]:
@@ -552,7 +997,10 @@ def process_crawl_url(
     url_id: int,
     queue_id: int | None = None,
     url_queue_item_id: int | None = None,
+    job_id: int | None = None,
+    run_token: str | None = None,
 ) -> None:
+    ensure_job_lease(conn, job_id, run_token)
     target = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
     if not target:
         raise ValueError(f"URL not found: {url_id}")
@@ -596,6 +1044,7 @@ def process_crawl_url(
                 result.error = f"CloakBrowser failed; HTTP text fallback used: {exc}"
     except Exception:
         error_text = traceback.format_exc(limit=5)
+        ensure_job_lease(conn, job_id, run_token)
         conn.execute(
             """
             UPDATE urls
@@ -606,6 +1055,7 @@ def process_crawl_url(
             (error_text, url_id),
         )
         raise
+    ensure_job_lease(conn, job_id, run_token)
     next_crawl_status = "crawled" if result.is_text else "metadata_only"
     conn.execute(
         """
@@ -637,6 +1087,7 @@ def process_crawl_url(
     if not result.is_text:
         return
 
+    ensure_job_lease(conn, job_id, run_token)
     rules = conn.execute(
         "SELECT * FROM extraction_rules WHERE enabled = 1 ORDER BY priority, id"
     ).fetchall()
@@ -651,6 +1102,7 @@ def process_crawl_url(
     iocs = extract_iocs_by_rules(extraction_input, rules)
 
     for ioc in iocs:
+        ensure_job_lease(conn, job_id, run_token)
         ioc_id = upsert_ioc(conn, ioc.type, ioc.raw, ioc.norm)
         conn.execute(
             """

@@ -15,6 +15,70 @@
 {% block content %}
   <section class="panel">
     <div class="panel-head">
+      <h2>Worker Slots</h2>
+      <span class="muted">queue_url concurrency: {{ url_crawl_concurrency }}</span>
+    </div>
+    <div class="table-wrap">
+      <table class="worker-slots-table">
+        <thead>
+          <tr>
+            <th>Slot</th>
+            <th>Type</th>
+            <th>Status</th>
+            <th>Job</th>
+            <th>Queue</th>
+            <th>URL</th>
+            <th>Heartbeat</th>
+            <th>Error</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for slot in worker_slots %}
+            <tr>
+              <td><code>{{ slot.slot_key }}</code></td>
+              <td><code>{{ slot.worker_type }}</code></td>
+              <td><span class="badge {{ slot.status }}">{{ slot.status|status_label }}</span></td>
+              <td>
+                {% if slot.job_id %}
+                  #{{ slot.job_id }}
+                {% else %}
+                  <span class="muted">-</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if slot.queue_id %}
+                  <a href="{{ url_for('queue_detail', queue_id=slot.queue_id) }}">#{{ slot.queue_id }} · {{ slot.queue_name }}</a>
+                {% else %}
+                  <span class="muted">-</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if slot.target_url_id %}
+                  #{{ slot.target_url_id }}
+                {% else %}
+                  <span class="muted">-</span>
+                {% endif %}
+              </td>
+              <td>{{ slot.heartbeat_at or slot.updated_at }}</td>
+              <td>
+                {% if slot.error %}
+                  <details>
+                    <summary>View</summary>
+                    <pre>{{ slot.error }}</pre>
+                  </details>
+                {% endif %}
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="8" class="empty">Worker slots will appear after the background runner starts.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
       <h2>Job Queue</h2>
       <span class="muted">
         {% if auto_worker_enabled %}

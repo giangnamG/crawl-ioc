@@ -935,6 +935,7 @@ tbody tr:hover .queue-actions-cell {
 .rules-table,
 .whitelist-table,
 .jobs-table,
+.worker-slots-table,
 .keyword-search-status-table,
 .queue-keyword-items-table,
 .queue-search-results-table,
@@ -958,6 +959,8 @@ tbody tr:hover .queue-actions-cell {
 .whitelist-table td,
 .jobs-table th,
 .jobs-table td,
+.worker-slots-table th,
+.worker-slots-table td,
 .keyword-search-status-table th,
 .keyword-search-status-table td,
 .queue-keyword-items-table th,
@@ -1096,6 +1099,38 @@ tbody tr:hover .queue-actions-cell {
 .jobs-table th:nth-child(8),
 .jobs-table td:nth-child(8) {
   width: 112px;
+}
+
+.worker-slots-table th:nth-child(1),
+.worker-slots-table td:nth-child(1) {
+  width: 120px;
+}
+
+.worker-slots-table th:nth-child(2),
+.worker-slots-table td:nth-child(2) {
+  width: 92px;
+}
+
+.worker-slots-table th:nth-child(3),
+.worker-slots-table td:nth-child(3) {
+  width: 82px;
+}
+
+.worker-slots-table th:nth-child(4),
+.worker-slots-table td:nth-child(4),
+.worker-slots-table th:nth-child(6),
+.worker-slots-table td:nth-child(6) {
+  width: 58px;
+}
+
+.worker-slots-table th:nth-child(5),
+.worker-slots-table td:nth-child(5) {
+  width: 17%;
+}
+
+.worker-slots-table th:nth-child(7),
+.worker-slots-table td:nth-child(7) {
+  width: 132px;
 }
 
 .keyword-search-status-table th:nth-child(1),
