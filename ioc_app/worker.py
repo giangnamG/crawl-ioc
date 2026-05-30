@@ -531,10 +531,14 @@ def enqueue_discovered_url_if_new(
         return None
 
     target = conn.execute(
-        "SELECT crawl_status FROM urls WHERE id = ?",
+        "SELECT review_status, crawl_status FROM urls WHERE id = ?",
         (url_id,),
     ).fetchone()
-    if not target or target["crawl_status"] in TERMINAL_CRAWL_STATUSES:
+    if (
+        not target
+        or target["review_status"] != "pending_review"
+        or target["crawl_status"] in TERMINAL_CRAWL_STATUSES
+    ):
         return None
 
     existing_item = conn.execute(
@@ -813,13 +817,11 @@ def enqueue_url_to_queue(
         return None
     if is_media_asset_url(target["url_norm"]) or is_url_whitelisted(conn, target["url_norm"]):
         return None
+    if target["review_status"] != "pending_review":
+        return None
 
-    if target["review_status"] == "approved":
-        initial_status = "pending" if queue["status"] == "running" else "paused"
-        job_status = initial_status
-    else:
-        initial_status = "pending_review"
-        job_status = "paused"
+    initial_status = "pending_review"
+    job_status = "paused"
 
     conn.execute(
         """
@@ -1002,13 +1004,7 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
             """,
             (1 if whitelisted else 0, url_id),
         )
-        if whitelisted:
-            remove_url_from_queue_items(conn, url_id)
-        else:
-            conn.execute(
-                "UPDATE url_queue_items SET status = 'paused' WHERE url_id = ? AND status IN ('pending', 'running')",
-                (url_id,),
-            )
+        remove_url_from_queue_items(conn, url_id)
         return False
     if target["review_status"] != "pending_review":
         return False
@@ -1064,7 +1060,7 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
 
 
 def reject_url(conn: Connection, url_id: int) -> bool:
-    return (
+    changed = (
         conn.execute(
             """
             UPDATE urls
@@ -1076,6 +1072,9 @@ def reject_url(conn: Connection, url_id: int) -> bool:
         ).rowcount
         > 0
     )
+    if changed:
+        remove_url_from_queue_items(conn, url_id)
+    return changed
 
 
 def reject_domain(conn: Connection, domain: str) -> bool:
@@ -1093,6 +1092,21 @@ def reject_domain(conn: Connection, domain: str) -> bool:
     )
     if not changed:
         return False
+    url_rows = conn.execute(
+        """
+        SELECT id
+        FROM urls
+        WHERE domain = ?
+          AND review_status = 'pending_review'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM whitelist_urls wu
+            WHERE wu.url_norm = urls.url_norm
+              AND wu.enabled = 1
+          )
+        """,
+        (domain,),
+    ).fetchall()
     conn.execute(
         """
         UPDATE urls
@@ -1108,6 +1122,8 @@ def reject_domain(conn: Connection, domain: str) -> bool:
         """,
         (domain,),
     )
+    for row in url_rows:
+        remove_url_from_queue_items(conn, int(row["id"]))
     return True
 
 
