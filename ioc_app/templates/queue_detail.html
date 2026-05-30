@@ -16,7 +16,11 @@
     <div class="panel-head">
       <div>
         <h2>#{{ selected_queue.id }} · {{ selected_queue.name }}</h2>
-        <span class="badge {{ selected_queue.status }}">{{ selected_queue.status|status_label }}</span>
+        <span
+          class="badge {{ selected_queue.status }}"
+          data-queue-status-badge
+          data-status="{{ selected_queue.status }}"
+        >{{ selected_queue.status|status_label }}</span>
       </div>
       <div class="row-actions">
         {% if selected_queue.status == "running" %}

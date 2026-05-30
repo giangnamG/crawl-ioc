@@ -29,6 +29,14 @@ GOOGLE_BLOCK_PATTERNS = (
     "detected unusual traffic",
 )
 
+PROXY_RETRY_PATTERNS = (
+    "ERR_INVALID_AUTH_CREDENTIALS",
+    "ERR_PROXY_AUTH_UNSUPPORTED",
+    "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_SOCKS_CONNECTION_FAILED",
+)
+
 
 @dataclass
 class SearchResult:
@@ -86,35 +94,45 @@ class BrowserClient:
 
     def __init__(self) -> None:
         self.provider = os.environ.get("BROWSER_PROVIDER", "cloak").strip().lower()
-        self.max_pages = int(os.environ.get("SEARCH_MAX_PAGES", "0"))
+        self.max_pages = int(os.environ.get("SEARCH_MAX_PAGES", "1"))
         self.search_hard_page_limit = int(os.environ.get("SEARCH_HARD_PAGE_LIMIT", "100"))
         self.timeout_ms = int(float(os.environ.get("BROWSER_TIMEOUT", "45")) * 1000)
-        self.fast_mode = env_bool("SEARCH_FAST_MODE", True)
+        self.fast_mode = env_bool("SEARCH_FAST_MODE", False)
         self.headless = env_bool("CLOAK_HEADLESS", False)
         self.humanize = env_bool("CLOAK_HUMANIZE", True)
-        self.human_preset = os.environ.get("CLOAK_HUMAN_PRESET", "default")
+        self.human_preset = os.environ.get("CLOAK_HUMAN_PRESET", "careful")
         self.type_delay_min = int(os.environ.get("SEARCH_TYPE_DELAY_MIN", "0" if self.fast_mode else "8"))
         self.type_delay_max = int(os.environ.get("SEARCH_TYPE_DELAY_MAX", "5" if self.fast_mode else "35"))
         self.locale = os.environ.get("CLOAK_LOCALE", "en-US")
         self.timezone = os.environ.get("CLOAK_TIMEZONE", "Asia/Saigon")
-        self.proxy = os.environ.get("CLOAK_PROXY") or None
+        self.proxy_candidates = proxy_candidates_from_env()
+        self.proxy = select_proxy(self.proxy_candidates)
         self.geoip = env_bool("CLOAK_GEOIP", bool(self.proxy))
+        self.backend = os.environ.get("CLOAK_BACKEND") or None
+        self.stealth_args = env_bool("CLOAK_STEALTH_ARGS", True)
         self.fingerprint_seed = os.environ.get("CLOAK_FINGERPRINT_SEED")
+        self.fingerprint_noise = os.environ.get("CLOAK_FINGERPRINT_NOISE", "false").strip().lower()
+        self.storage_quota = os.environ.get("CLOAK_STORAGE_QUOTA", "5000").strip()
+        self.disable_http2 = env_bool("CLOAK_DISABLE_HTTP2", False)
+        self.viewport_width = int(os.environ.get("CLOAK_VIEWPORT_WIDTH", "1920"))
+        self.viewport_height = int(os.environ.get("CLOAK_VIEWPORT_HEIGHT", "1080"))
+        self.screen_width = int(os.environ.get("CLOAK_SCREEN_WIDTH", str(self.viewport_width)))
+        self.screen_height = int(os.environ.get("CLOAK_SCREEN_HEIGHT", str(self.viewport_height)))
         self.search_entry = os.environ.get("GOOGLE_SEARCH_ENTRY", "homepage").strip().lower()
         self.next_fallback_direct = env_bool("GOOGLE_NEXT_FALLBACK_DIRECT", True)
-        self.page_delay_min = float(os.environ.get("SEARCH_PAGE_DELAY_MIN", "0" if self.fast_mode else "1.5"))
-        self.page_delay_max = float(os.environ.get("SEARCH_PAGE_DELAY_MAX", "0" if self.fast_mode else "4.0"))
+        self.page_delay_min = float(os.environ.get("SEARCH_PAGE_DELAY_MIN", "0" if self.fast_mode else "2.5"))
+        self.page_delay_max = float(os.environ.get("SEARCH_PAGE_DELAY_MAX", "0" if self.fast_mode else "6.0"))
         self.profile_root = Path(os.environ.get("CLOAK_PROFILE_ROOT", ROOT_DIR / "data" / "cloak_profiles"))
 
     def search_google(self, query_text: str) -> list[SearchResult]:
         if self.provider == "http":
             return HttpFallbackClient(self.max_pages, self.timeout_ms).search_google(query_text)
-        return self._search_google_with_cloak(query_text)
+        return self._run_with_proxy_retries(lambda: self._search_google_with_cloak(query_text))
 
     def fetch_url(self, url: str) -> FetchResult:
         if self.provider == "http":
             return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_url(url)
-        return self._fetch_url_with_cloak(url)
+        return self._run_with_proxy_retries(lambda: self._fetch_url_with_cloak(url))
 
     def fetch_text_resource(self, url: str, fetch_method: str = "http_text") -> FetchResult:
         return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_text_resource(
@@ -124,6 +142,30 @@ class BrowserClient:
 
     def fetch_binary_metadata(self, url: str) -> FetchResult:
         return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_binary_metadata(url)
+
+    def _run_with_proxy_retries(self, operation):
+        attempts = self._proxy_attempts()
+        last_exc: Exception | None = None
+        for index, proxy in enumerate(attempts):
+            self.proxy = proxy
+            try:
+                return operation()
+            except Exception as exc:
+                last_exc = exc
+                if index == len(attempts) - 1 or not is_retryable_proxy_error(exc):
+                    raise
+        if last_exc:
+            raise last_exc
+        return operation()
+
+    def _proxy_attempts(self) -> list[str | None]:
+        if not self.proxy_candidates:
+            return [None]
+
+        selected = self.proxy or select_proxy(self.proxy_candidates)
+        attempts = [selected] if selected else []
+        attempts.extend(proxy for proxy in self.proxy_candidates if proxy != selected)
+        return attempts or [None]
 
     def _search_google_with_cloak(self, query_text: str) -> list[SearchResult]:
         results: list[SearchResult] = []
@@ -153,8 +195,13 @@ class BrowserClient:
                     break
 
                 self._sleep_between_pages()
-                if not self._go_google_next_page_prefer_link(page, query_text, next_page_no):
-                    break
+                try:
+                    if not self._go_google_next_page_prefer_link(page, query_text, next_page_no):
+                        break
+                except RuntimeError as exc:
+                    if "anti-bot/CAPTCHA" in str(exc) and results:
+                        break
+                    raise
                 page_no = next_page_no
 
             return results
@@ -283,12 +330,25 @@ class BrowserClient:
             "human_preset": self.human_preset,
             "locale": self.locale,
             "timezone": self.timezone,
-            "viewport": {"width": 1440, "height": 1000},
+            "viewport": {"width": self.viewport_width, "height": self.viewport_height},
             "geoip": self.geoip,
+            "stealth_args": self.stealth_args,
         }
+        if self.backend:
+            kwargs["backend"] = self.backend
         args = []
         if self.fingerprint_seed:
             args.append(f"--fingerprint={self.fingerprint_seed}")
+        if self.fingerprint_noise in {"true", "false"}:
+            args.append(f"--fingerprint-noise={self.fingerprint_noise}")
+        if self.screen_width > 0:
+            args.append(f"--fingerprint-screen-width={self.screen_width}")
+        if self.screen_height > 0:
+            args.append(f"--fingerprint-screen-height={self.screen_height}")
+        if self.storage_quota:
+            args.append(f"--fingerprint-storage-quota={self.storage_quota}")
+        if self.disable_http2:
+            args.append("--disable-http2")
         if args:
             kwargs["args"] = args
         if self.proxy:
@@ -818,3 +878,70 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_retryable_proxy_error(exc: Exception) -> bool:
+    message = str(exc)
+    return any(pattern in message for pattern in PROXY_RETRY_PATTERNS)
+
+
+def normalize_proxy_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    proxy = value.strip().strip("\"'")
+    if not proxy:
+        return None
+    if "://" in proxy:
+        return proxy
+
+    parts = proxy.split(":")
+    if len(parts) >= 4:
+        host = parts[0].strip()
+        port = parts[1].strip()
+        username = parts[2].strip()
+        password = ":".join(parts[3:]).strip()
+        if host and port and username and password:
+            return (
+                "http://"
+                f"{urllib.parse.quote(username, safe='')}:"
+                f"{urllib.parse.quote(password, safe='')}@"
+                f"{host}:{port}"
+            )
+    return f"http://{proxy}"
+
+
+def proxy_candidates_from_env() -> list[str]:
+    candidates: list[str] = []
+
+    for name in ("CLOAK_PROXY", "CLOAK_PROXY_BACKUP"):
+        proxy = normalize_proxy_value(os.environ.get(name))
+        if proxy:
+            candidates.append(proxy)
+
+    pool = os.environ.get("CLOAK_PROXY_POOL")
+    if pool:
+        for raw_proxy in re.split(r"[\s,]+", pool):
+            proxy = normalize_proxy_value(raw_proxy)
+            if proxy:
+                candidates.append(proxy)
+
+    return dedupe_keep_order(candidates)
+
+
+def select_proxy(candidates: list[str]) -> str | None:
+    if not candidates:
+        return None
+
+    raw_index = os.environ.get("CLOAK_PROXY_INDEX")
+    if raw_index is not None:
+        try:
+            index = int(raw_index)
+            if 0 <= index < len(candidates):
+                return candidates[index]
+        except ValueError:
+            pass
+
+    strategy = os.environ.get("CLOAK_PROXY_STRATEGY", "first").strip().lower()
+    if strategy == "random":
+        return random.choice(candidates)
+    return candidates[0]

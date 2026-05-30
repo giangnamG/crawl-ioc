@@ -343,7 +343,7 @@ def create_app(start_worker: bool = False) -> Flask:
     def queue_crawling_urls_api(queue_id: int):
         with connect() as conn:
             queue = conn.execute(
-                "SELECT id, name, queue_type FROM queues WHERE id = ?",
+                "SELECT id, name, queue_type, status FROM queues WHERE id = ?",
                 (queue_id,),
             ).fetchone()
             if not queue:
@@ -356,6 +356,7 @@ def create_app(start_worker: bool = False) -> Flask:
                     "id": queue["id"],
                     "name": queue["name"],
                     "queue_type": queue["queue_type"],
+                    "status": queue["status"],
                 },
                 "count": len(rows),
                 "items": [dict(row) for row in rows],
@@ -366,7 +367,7 @@ def create_app(start_worker: bool = False) -> Flask:
     def queue_keyword_search_status_api(queue_id: int):
         with connect() as conn:
             queue = conn.execute(
-                "SELECT id, name, queue_type FROM queues WHERE id = ?",
+                "SELECT id, name, queue_type, status FROM queues WHERE id = ?",
                 (queue_id,),
             ).fetchone()
             if not queue:
@@ -379,6 +380,7 @@ def create_app(start_worker: bool = False) -> Flask:
                     "id": queue["id"],
                     "name": queue["name"],
                     "queue_type": queue["queue_type"],
+                    "status": queue["status"],
                 },
                 "count": len(rows),
                 "items": [dict(row) for row in rows],
@@ -396,6 +398,12 @@ def create_app(start_worker: bool = False) -> Flask:
                 flash("Bind this Keyword Search Queue to a specific URL Crawl Queue before starting it.", "error")
                 return redirect(url_for("queue_detail", queue_id=queue_id))
             jobs_started, items_started = start_queue_work(conn, queue_id)
+        if queue["queue_type"] == "keyword_search" and jobs_started == 0 and items_started == 0:
+            flash(
+                f"No pending keyword searches are ready in queue '{queue['name']}'. Add new keywords to search again.",
+                "error",
+            )
+            return redirect(url_for("queue_detail", queue_id=queue_id))
         if queue["queue_type"] == "url_crawl" and jobs_started == 0 and items_started == 0:
             flash(
                 f"No approved URL/domain items are ready in queue '{queue['name']}'. Approve items in Review first, then start the queue again.",
@@ -465,7 +473,10 @@ def create_app(start_worker: bool = False) -> Flask:
                 keywords_imported = 0
                 queries_created = 0
                 queries_requeued = 0
-                runnable_now = queue["status"] == "running" and output_url_queue_id is not None
+                runnable_now = (
+                    queue["status"] in {"running", "done"}
+                    and output_url_queue_id is not None
+                )
                 initial_work_status = "pending" if runnable_now else "paused"
 
                 for text in keyword_lines:
@@ -480,6 +491,18 @@ def create_app(start_worker: bool = False) -> Flask:
                         )
                         if created:
                             queries_created += 1
+                        conn.execute(
+                            """
+                            UPDATE search_queries
+                            SET status = ?,
+                                last_error = NULL,
+                                started_at = NULL,
+                                finished_at = NULL
+                            WHERE id = ?
+                              AND status != 'running'
+                            """,
+                            (initial_work_status, search_query_id),
+                        )
                         conn.execute(
                             """
                             UPDATE search_queries
@@ -519,7 +542,7 @@ def create_app(start_worker: bool = False) -> Flask:
                 refresh_queue_status(conn, queue_id)
 
                 next_step = (
-                    "New queries were queued because the queue is running."
+                    "New queries were queued because the queue is active."
                     if runnable_now
                     else "Start the queue when ready."
                 )
@@ -1620,17 +1643,6 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
         return 0, 0
     if queue["queue_type"] == "keyword_search" and not get_output_url_queue(conn, queue_id):
         return 0, 0
-    conn.execute(
-        """
-        UPDATE queues
-        SET status = 'running',
-            started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
-            stopped_at = NULL,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-        """,
-        (queue_id,),
-    )
 
     if queue["queue_type"] == "keyword_search":
         output_url_queue = get_output_url_queue(conn, queue_id)
@@ -1645,6 +1657,20 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
             """,
             (queue_id,),
         ).fetchall()
+        if not item_rows:
+            refresh_queue_status(conn, queue_id)
+            return 0, 0
+        conn.execute(
+            """
+            UPDATE queues
+            SET status = 'running',
+                started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                stopped_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (queue_id,),
+        )
         query_count = conn.execute(
             """
             UPDATE search_queue_items
@@ -1658,6 +1684,21 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
             """,
             (output_url_queue_id, queue_id),
         ).rowcount
+        search_query_ids = [int(item["search_query_id"]) for item in item_rows]
+        if search_query_ids:
+            placeholders = ",".join("?" for _ in search_query_ids)
+            conn.execute(
+                f"""
+                UPDATE search_queries
+                SET status = 'pending',
+                    last_error = NULL,
+                    started_at = NULL,
+                    finished_at = NULL
+                WHERE id IN ({placeholders})
+                  AND status != 'running'
+                """,
+                search_query_ids,
+            )
         url_count = 0
         jobs_started = 0
         for item in item_rows:
@@ -1670,6 +1711,17 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
                 initial_status="pending",
             )
     else:
+        conn.execute(
+            """
+            UPDATE queues
+            SET status = 'running',
+                started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                stopped_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (queue_id,),
+        )
         url_count = conn.execute(
             """
             UPDATE url_queue_items
@@ -2102,7 +2154,7 @@ def reactivate_search_queue_item(
     conn.execute(
         """
         UPDATE search_queries
-        SET status = 'pending',
+        SET status = ?,
             result_count = 0,
             page_count = 0,
             last_error = NULL,
@@ -2111,7 +2163,7 @@ def reactivate_search_queue_item(
         WHERE id = ?
           AND status != 'running'
         """,
-        (search_query_id,),
+        (initial_work_status, search_query_id),
     )
     return True
 

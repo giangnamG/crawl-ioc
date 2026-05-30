@@ -284,6 +284,27 @@
       .join("");
   }
 
+  function updateQueueStatus(queue) {
+    if (!queue || !queue.status) {
+      return;
+    }
+    const badge = document.querySelector("[data-queue-status-badge]");
+    if (!badge) {
+      return;
+    }
+    const previous = badge.getAttribute("data-status") || "";
+    const status = String(queue.status);
+    if (previous === status) {
+      return;
+    }
+    if (previous) {
+      badge.classList.remove(statusClass(previous));
+    }
+    badge.classList.add(statusClass(status));
+    badge.setAttribute("data-status", status);
+    badge.textContent = statusLabel(status);
+  }
+
   function startPolling(panelSelector, bodySelector, countSelector, renderRows) {
     const panel = document.querySelector(panelSelector);
     const body = document.querySelector(bodySelector);
@@ -310,6 +331,7 @@
         }
         const payload = await response.json();
         const rows = Array.isArray(payload.items) ? payload.items : [];
+        updateQueueStatus(payload.queue);
         renderRows(body, rows);
         if (count) {
           count.textContent = String(rows.length);

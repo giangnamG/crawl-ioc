@@ -6,7 +6,7 @@ import traceback
 import urllib.parse
 from sqlite3 import Connection
 
-from .browser import BrowserClient
+from .browser import BrowserClient, is_retryable_proxy_error
 from .db import connect, is_url_whitelisted
 from .extractor import extract_iocs_by_rules
 from .normalizers import get_domain, is_media_asset_url, normalize_domain, normalize_url
@@ -305,7 +305,10 @@ def run_one() -> str:
                 refresh_queue_status(conn, int(queue_id))
             return f"Job #{job['id']} paused."
         except Exception as exc:
-            error_text = traceback.format_exc(limit=5)
+            if "anti-bot/CAPTCHA" in str(exc) or is_retryable_proxy_error(exc):
+                error_text = str(exc)
+            else:
+                error_text = traceback.format_exc(limit=5)
             mark_url_queue_item(conn, payload.get("url_queue_item_id"), "failed", error_text)
             mark_search_queue_item(conn, payload.get("search_queue_item_id"), "failed", error_text)
             conn.execute(

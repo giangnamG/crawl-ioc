@@ -24,6 +24,15 @@ Chạy server:
 python app.py
 ```
 
+`app.py` tự đọc file `.env` nằm cùng cấp với `app.py` trước khi tạo Flask app. Biến đã set sẵn trong shell sẽ được ưu tiên hơn giá trị trong `.env`.
+
+`python app.py` mặc định bật background worker. Nếu chỉ muốn mở UI mà không xử lý queue:
+
+```powershell
+$env:AUTO_WORKER_ENABLED="0"
+python app.py
+```
+
 Mở:
 
 ```text
@@ -47,22 +56,35 @@ HTTP fallback chỉ dùng khi set env BROWSER_PROVIDER=http để test nội b�
 Cấu hình CloakBrowser qua environment:
 
 ```powershell
-$env:CLOAK_HEADLESS="false"       # false khuyến nghị khi search Google
-$env:CLOAK_HUMANIZE="true"
-$env:CLOAK_HUMAN_PRESET="default" # dùng careful nếu bị bot mạnh hơn
-$env:SEARCH_FAST_MODE="true"
-$env:SEARCH_TYPE_DELAY_MIN="0"
-$env:SEARCH_TYPE_DELAY_MAX="5"
-$env:SEARCH_PAGE_DELAY_MIN="0"
-$env:SEARCH_PAGE_DELAY_MAX="0"
+$env:CLOAK_HEADLESS="false"       # headed mode khuyến nghị khi search Google
+$env:CLOAK_HUMANIZE="true"        # bật mouse/keyboard/scroll human-like
+$env:CLOAK_HUMAN_PRESET="careful" # chậm hơn default, ổn định hơn cho anti-bot
+$env:SEARCH_FAST_MODE="false"
+$env:SEARCH_TYPE_DELAY_MIN="8"
+$env:SEARCH_TYPE_DELAY_MAX="35"
+$env:SEARCH_PAGE_DELAY_MIN="2.5"
+$env:SEARCH_PAGE_DELAY_MAX="6.0"
 $env:CLOAK_LOCALE="en-US"
 $env:CLOAK_TIMEZONE="Asia/Saigon"
 $env:CLOAK_PROXY="http://user:pass@host:port"  # optional
+$env:CLOAK_PROXY_BACKUP="host:port:user:pass"  # optional, sẽ tự đổi sang http://user:pass@host:port
+$env:CLOAK_PROXY_POOL="http://user:pass@host1:port,http://user:pass@host2:port"
+$env:CLOAK_PROXY_STRATEGY="first"              # first ổn định hơn random cho persistent profile
+$env:CLOAK_PROXY_INDEX="0"                     # chọn proxy trong pool theo index nếu cần
 $env:CLOAK_GEOIP="true"                       # bật khi dùng proxy để match timezone/locale
+$env:CLOAK_VIEWPORT_WIDTH="1920"
+$env:CLOAK_VIEWPORT_HEIGHT="1080"
+$env:CLOAK_SCREEN_WIDTH="1920"
+$env:CLOAK_SCREEN_HEIGHT="1080"
+$env:CLOAK_STORAGE_QUOTA="5000"                # non-incognito-like storage quota
+$env:CLOAK_FINGERPRINT_NOISE="false"
 $env:CLOAK_FINGERPRINT_SEED="12345"           # optional, giữ fingerprint ổn định
-$env:SEARCH_MAX_PAGES="0"        # 0 = chạy tới khi Google không còn Next/result
-$env:SEARCH_HARD_PAGE_LIMIT="100" # giới hạn an toàn khi SEARCH_MAX_PAGES=0
+$env:CLOAK_DISABLE_HTTP2="false"               # bật tạm thời nếu cần warm up profile mới
+$env:SEARCH_MAX_PAGES="1"                      # mặc định chỉ lấy trang đầu để giảm CAPTCHA
+$env:SEARCH_HARD_PAGE_LIMIT="100"              # giới hạn an toàn khi SEARCH_MAX_PAGES=0
 ```
+
+Nếu proxy hiện tại trả lỗi auth/connect, backend sẽ thử proxy kế tiếp trong `CLOAK_PROXY_POOL` trước khi đánh dấu job failed.
 
 Binary CloakBrowser:
 
@@ -86,7 +108,19 @@ $env:CLOAK_GEOIP="true"
 python .\app.py
 ```
 
-CloakBrowser giúp browser fingerprint giống trình duyệt thật hơn, nhưng không phải CAPTCHA solver. Với Google Search, IP/VPN/datacenter proxy kém uy tín vẫn có thể bị block dù đang dùng CloakBrowser.
+Nếu profile mới liên tục bị challenge, có thể warm up thủ công ở headed mode:
+
+```powershell
+$env:CLOAK_HEADLESS="false"
+$env:CLOAK_HUMANIZE="true"
+$env:CLOAK_HUMAN_PRESET="careful"
+$env:SEARCH_MAX_PAGES="1"
+python .\app.py
+```
+
+Mở cửa sổ CloakBrowser, login/accept consent/solve challenge nếu có, rồi giữ nguyên profile `data/cloak_profiles/google` cho các lần chạy sau.
+
+CloakBrowser giúp browser fingerprint giống trình duyệt thật hơn, nhưng không phải CAPTCHA solver. Với Google Search, IP/VPN/datacenter proxy kém uy tín vẫn có thể bị block dù đang dùng CloakBrowser. Cấu hình ổn định nhất là headed mode + humanize careful + persistent profile + proxy residential có geoip khớp timezone/locale.
 
 Các màn chính:
 
