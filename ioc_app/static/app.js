@@ -252,9 +252,41 @@
       .join("");
   }
 
-  function startCrawlingUrlPolling() {
-    const panel = document.querySelector("[data-crawling-url-panel]");
-    const body = document.querySelector("[data-crawling-url-body]");
+  function renderKeywordSearchRows(body, rows) {
+    if (!rows || rows.length === 0) {
+      body.innerHTML = '<tr><td colspan="9" class="empty">No CloakBrowser keyword searches are running or waiting.</td></tr>';
+      return;
+    }
+
+    body.innerHTML = rows
+      .map(function (item) {
+        const searchStatus = item.search_status || "";
+        const jobStatus = item.job_status || item.queue_item_status || "";
+        const outputQueue = item.output_url_queue_id
+          ? `#${escapeHtml(item.output_url_queue_id)} · ${escapeHtml(item.output_url_queue_name || "queue_url")}`
+          : '<span class="badge failed">Not Bound</span>';
+        const error = item.queue_item_error || item.search_error || item.job_error || "";
+        const started = item.queue_item_started_at || item.search_started_at || item.job_started_at || "";
+        return `
+          <tr>
+            <td>#${escapeHtml(item.queue_item_id || "")}</td>
+            <td><strong>${escapeHtml(item.keyword_text || "")}</strong></td>
+            <td><code class="truncate-line" title="${escapeHtml(item.query_text || "")}">${escapeHtml(item.query_text || "")}</code></td>
+            <td>${outputQueue}</td>
+            <td><span class="badge ${statusClass(searchStatus)}">${escapeHtml(statusLabel(searchStatus))}</span></td>
+            <td><span class="badge ${statusClass(jobStatus)}">${escapeHtml(statusLabel(jobStatus))}</span></td>
+            <td>${escapeHtml(item.attempts || 0)}</td>
+            <td>${escapeHtml(started)}</td>
+            <td><code class="truncate-line" title="${escapeHtml(error)}">${escapeHtml(error)}</code></td>
+          </tr>
+        `;
+      })
+      .join("");
+  }
+
+  function startPolling(panelSelector, bodySelector, countSelector, renderRows) {
+    const panel = document.querySelector(panelSelector);
+    const body = document.querySelector(bodySelector);
     if (!panel || !body) {
       return;
     }
@@ -262,7 +294,7 @@
     if (!endpoint) {
       return;
     }
-    const count = document.querySelector("[data-crawling-url-count]");
+    const count = document.querySelector(countSelector);
 
     async function refresh() {
       if (document.hidden) {
@@ -278,7 +310,7 @@
         }
         const payload = await response.json();
         const rows = Array.isArray(payload.items) ? payload.items : [];
-        renderCrawlingUrlRows(body, rows);
+        renderRows(body, rows);
         if (count) {
           count.textContent = String(rows.length);
         }
@@ -289,6 +321,24 @@
 
     refresh();
     window.setInterval(refresh, 1500);
+  }
+
+  function startCrawlingUrlPolling() {
+    startPolling(
+      "[data-crawling-url-panel]",
+      "[data-crawling-url-body]",
+      "[data-crawling-url-count]",
+      renderCrawlingUrlRows
+    );
+  }
+
+  function startKeywordSearchPolling() {
+    startPolling(
+      "[data-keyword-search-panel]",
+      "[data-keyword-search-body]",
+      "[data-keyword-search-count]",
+      renderKeywordSearchRows
+    );
   }
 
   function restoreScroll() {
@@ -329,9 +379,11 @@
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", restoreScroll, { once: true });
     document.addEventListener("DOMContentLoaded", startCrawlingUrlPolling, { once: true });
+    document.addEventListener("DOMContentLoaded", startKeywordSearchPolling, { once: true });
   } else {
     restoreScroll();
     startCrawlingUrlPolling();
+    startKeywordSearchPolling();
   }
   window.addEventListener("pageshow", restoreScroll);
 })();

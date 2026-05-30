@@ -1,0 +1,281 @@
+{% extends "base.html" %}
+
+{% block title %}Queue #{{ selected_queue.id }} · IOC Investigator{% endblock %}
+{% block heading %}#{{ selected_queue.id }} · {{ selected_queue.name }}{% endblock %}
+{% block eyebrow %}Queue detail{% endblock %}
+
+{% block actions %}
+  <a class="button" href="{{ url_for('queues') }}">View Queue List</a>
+  {% if selected_queue.queue_type == "keyword_search" %}
+    <a class="button" href="{{ url_for('keywords', queue_id=selected_queue.id) }}">Add Keywords</a>
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>#{{ selected_queue.id }} · {{ selected_queue.name }}</h2>
+        <span class="badge {{ selected_queue.status }}">{{ selected_queue.status|status_label }}</span>
+      </div>
+      <div class="row-actions">
+        {% if selected_queue.status == "running" %}
+          <form method="post" action="{{ url_for('stop_queue', queue_id=selected_queue.id) }}">
+            <button class="button small" type="submit">Stop</button>
+          </form>
+        {% elif selected_queue.status == "paused" %}
+          <form method="post" action="{{ url_for('resume_queue', queue_id=selected_queue.id) }}">
+            <button class="button small primary" type="submit">Resume</button>
+          </form>
+        {% elif selected_queue.queue_type != "keyword_search" or selected_queue.output_url_queue_id %}
+          <form method="post" action="{{ url_for('start_queue', queue_id=selected_queue.id) }}">
+            <button class="button small primary" type="submit">Start</button>
+          </form>
+        {% else %}
+          <a class="button small" href="{{ url_for('queue_create') }}">Bind First</a>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if selected_queue.queue_type == "keyword_search" %}
+      <div class="route-note">
+        {% if selected_queue.output_url_queue_id %}
+          Output queue_url: <a href="{{ url_for('queue_detail', queue_id=selected_queue.output_url_queue_id) }}">#{{ selected_queue.output_url_queue_id }} · {{ selected_queue.output_url_queue_name }}</a>
+        {% else %}
+          <span class="badge failed">No output queue_url bound. This keyword queue cannot start yet.</span>
+        {% endif %}
+      </div>
+
+      <div
+        class="subsection-head"
+        data-keyword-search-panel
+        data-endpoint="{{ url_for('queue_keyword_search_status_api', queue_id=selected_queue.id) }}"
+      >
+        <h2>CloakBrowser Keyword Status</h2>
+        <span class="muted"><span data-keyword-search-count>{{ selected_keyword_search_status|length }}</span> rows · updates every 1.5s</span>
+      </div>
+      <div class="table-wrap queue-detail-wrap">
+        <table class="keyword-search-status-table">
+          <thead>
+            <tr>
+              <th>Queue Item</th>
+              <th>Keyword</th>
+              <th>Query</th>
+              <th>Output URL Queue</th>
+              <th>Search</th>
+              <th>Job</th>
+              <th>Attempts</th>
+              <th>Started</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody data-keyword-search-body>
+            {% for item in selected_keyword_search_status %}
+              <tr>
+                <td>#{{ item.queue_item_id }}</td>
+                <td><strong>{{ item.keyword_text }}</strong></td>
+                <td><code class="truncate-line" title="{{ item.query_text }}">{{ item.query_text }}</code></td>
+                <td>
+                  {% if item.output_url_queue_id %}
+                    #{{ item.output_url_queue_id }} · {{ item.output_url_queue_name or "queue_url" }}
+                  {% else %}
+                    <span class="badge failed">Not Bound</span>
+                  {% endif %}
+                </td>
+                <td><span class="badge {{ item.search_status }}">{{ item.search_status|status_label }}</span></td>
+                <td><span class="badge {{ item.job_status or item.queue_item_status }}">{{ (item.job_status or item.queue_item_status)|status_label }}</span></td>
+                <td>{{ item.attempts or 0 }}</td>
+                <td>{{ item.queue_item_started_at or item.search_started_at or item.job_started_at or "" }}</td>
+                <td><code class="truncate-line" title="{{ item.queue_item_error or item.search_error or item.job_error or '' }}">{{ item.queue_item_error or item.search_error or item.job_error or "" }}</code></td>
+              </tr>
+            {% else %}
+              <tr><td colspan="9" class="empty">No CloakBrowser keyword searches are running or waiting.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="subsection-head">
+        <h2>Keyword Queue Items</h2>
+        <span class="muted">All keyword queries generated for this queue.</span>
+      </div>
+      <div class="table-wrap queue-detail-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Keyword</th>
+              <th>Query</th>
+              <th>Output URL Queue</th>
+              <th>Status</th>
+              <th>Results</th>
+              <th>Pages</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in selected_queries %}
+              <tr>
+                <td>#{{ item.id }}</td>
+                <td><strong>{{ item.keyword_text }}</strong></td>
+                <td><code class="truncate-line" title="{{ item.query_text }}">{{ item.query_text }}</code></td>
+                <td>
+                  {% if item.output_url_queue_id %}
+                    #{{ item.output_url_queue_id }} · {{ item.output_url_queue_name or "queue_url" }}
+                  {% else %}
+                    <span class="badge failed">Not Bound</span>
+                  {% endif %}
+                </td>
+                <td><span class="badge {{ item.status }}">{{ item.status|status_label }}</span></td>
+                <td>{{ item.result_count }}</td>
+                <td>{{ item.page_count }}</td>
+                <td><code class="truncate-line" title="{{ item.error or '' }}">{{ item.error or "" }}</code></td>
+              </tr>
+            {% else %}
+              <tr><td colspan="8" class="empty">No keyword search items in this queue.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="subsection-head" id="add-url-queue">
+        <h2>Add URL/Domain To Queue</h2>
+        <span class="muted">Add work items directly to this queue_url.</span>
+      </div>
+        <form method="post" class="stacked-form" action="{{ url_for('queue_detail', queue_id=selected_queue.id) }}">
+          <input type="hidden" name="action" value="add_urls">
+          <input type="hidden" name="queue_id" value="{{ selected_queue.id }}">
+          <label>
+            <span>Domains Or URLs</span>
+            <textarea name="targets" rows="5" placeholder="https://88ii.club/&#10;88ii.club"></textarea>
+          </label>
+          <div class="form-actions">
+            <button class="button primary" type="submit">Add To This URL Queue</button>
+          </div>
+        </form>
+
+      <div
+        class="subsection-head"
+        data-crawling-url-panel
+        data-endpoint="{{ url_for('queue_crawling_urls_api', queue_id=selected_queue.id) }}"
+      >
+        <h2>Currently Crawling URLs</h2>
+        <span class="muted"><span data-crawling-url-count>{{ selected_crawling_urls|length }}</span> rows · updates every 1.5s</span>
+      </div>
+      <div class="table-wrap queue-detail-wrap">
+        <table class="crawling-url-table">
+          <thead>
+            <tr>
+              <th>Queue Item</th>
+              <th>Domain</th>
+              <th>URL</th>
+              <th>Queue</th>
+              <th>Crawl</th>
+              <th>Status Code</th>
+              <th>Fetch Method</th>
+              <th>Started</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody data-crawling-url-body>
+            {% for item in selected_crawling_urls %}
+              <tr>
+                <td>#{{ item.queue_item_id }}</td>
+                <td><strong>{{ item.domain }}</strong></td>
+                <td><a class="truncate-line" href="{{ item.url_norm }}" target="_blank" rel="noreferrer" title="{{ item.url_norm }}">{{ item.url_norm }}</a></td>
+                <td><span class="badge {{ item.queue_status }}">{{ item.queue_status|status_label }}</span></td>
+                <td><span class="badge {{ item.crawl_status }}">{{ item.crawl_status|status_label }}</span></td>
+                <td>{{ item.status_code or "" }}</td>
+                <td><code>{{ item.fetch_method or "" }}</code></td>
+                <td>{{ item.queue_started_at or item.job_started_at or "" }}</td>
+                <td><code class="truncate-line" title="{{ item.queue_error or item.crawl_error or '' }}">{{ item.queue_error or item.crawl_error or "" }}</code></td>
+              </tr>
+            {% else %}
+              <tr><td colspan="9" class="empty">No URLs are currently crawling.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="table-wrap queue-detail-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Domain</th>
+              <th>URL</th>
+              <th>Queue Status</th>
+              <th>Source Queue</th>
+              <th>Crawl Status</th>
+              <th>Error</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in selected_url_items %}
+              <tr>
+                <td>#{{ item.id }}</td>
+                <td><strong>{{ item.domain }}</strong></td>
+                <td><code class="truncate-line" title="{{ item.url_norm }}">{{ item.url_norm }}</code></td>
+                <td><span class="badge {{ item.status }}">{{ item.status|status_label }}</span></td>
+                <td>
+                  {% if item.source_queue_id %}
+                    #{{ item.source_queue_id }}{% if item.source_queue_name %} · {{ item.source_queue_name }}{% endif %}
+                  {% else %}
+                    -
+                  {% endif %}
+                </td>
+                <td><span class="badge {{ item.crawl_status }}">{{ item.crawl_status|status_label }}</span></td>
+                <td><code class="truncate-line" title="{{ item.error or '' }}">{{ item.error or "" }}</code></td>
+                <td class="cell-actions">
+                  {% if item.status == "running" %}
+                    <span class="muted">Running</span>
+                  {% else %}
+                    <form method="post" action="{{ url_for('delete_url_queue_item_route', item_id=item.id) }}">
+                      <button class="button small danger" type="submit">Remove</button>
+                    </form>
+                  {% endif %}
+                </td>
+              </tr>
+            {% else %}
+              <tr><td colspan="8" class="empty">No URL/domain items in this queue.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+
+    <div class="subsection-head">
+      <h2>Queue Jobs</h2>
+      <span class="muted">Technical jobs generated from this queue.</span>
+    </div>
+    <div class="table-wrap queue-detail-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Type</th>
+            <th>Status</th>
+            <th>Attempts</th>
+            <th>Payload</th>
+            <th>Error</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for job in selected_jobs %}
+            <tr>
+              <td>#{{ job.id }}</td>
+              <td><code>{{ job.type }}</code></td>
+              <td><span class="badge {{ job.status }}">{{ job.status|status_label }}</span></td>
+              <td>{{ job.attempts }}</td>
+              <td><code class="truncate-line" title="{{ job.payload }}">{{ job.payload }}</code></td>
+              <td><code class="truncate-line" title="{{ job.error or '' }}">{{ job.error or "" }}</code></td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6" class="empty">No jobs generated for this queue.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

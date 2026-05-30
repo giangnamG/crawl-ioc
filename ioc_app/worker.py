@@ -689,6 +689,8 @@ def process_crawl_url(
             if discovered_domain:
                 discovered_url = normalize_url(f"https://{discovered_domain}/")
                 if discovered_url:
+                    if is_media_asset_url(discovered_url) or is_url_whitelisted(conn, discovered_url):
+                        continue
                     discovered_url_id = upsert_url(
                         conn, discovered_url, discovered_url, discovered_domain, "extracted_from_crawl"
                     )
@@ -1141,7 +1143,7 @@ def mark_search_queue_item(
 
 
 def refresh_queue_status(conn: Connection, queue_id: int) -> None:
-    queue = conn.execute("SELECT status FROM queues WHERE id = ?", (queue_id,)).fetchone()
+    queue = conn.execute("SELECT status, started_at FROM queues WHERE id = ?", (queue_id,)).fetchone()
     if not queue:
         return
 
@@ -1164,6 +1166,13 @@ def refresh_queue_status(conn: Connection, queue_id: int) -> None:
         next_status = "draft"
     elif counts["running_count"] or counts["pending_count"]:
         next_status = "running"
+    elif (
+        counts["paused_count"]
+        and not counts["failed_count"]
+        and not counts["done_count"]
+        and not queue["started_at"]
+    ):
+        next_status = "draft"
     elif counts["paused_count"]:
         next_status = "paused"
     elif counts["failed_count"]:

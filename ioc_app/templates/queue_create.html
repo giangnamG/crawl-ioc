@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+
+{% block title %}Create Queue · IOC Investigator{% endblock %}
+{% block heading %}Create Queue{% endblock %}
+{% block eyebrow %}Queue setup{% endblock %}
+
+{% block actions %}
+  <a class="button" href="{{ url_for('queues') }}">View Queue List</a>
+{% endblock %}
+
+{% block content %}
+  <section class="queue-control-grid">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Create Queue</h2>
+        <span class="muted">Create a workflow container first, then add work items.</span>
+      </div>
+      <form method="post" class="grid-form queue-create-form" action="{{ url_for('queue_create') }}">
+        <input type="hidden" name="action" value="create">
+        <label class="wide">
+          <span>Name</span>
+          <input name="name" placeholder="88i keyword search batch">
+        </label>
+        <label>
+          <span>Type</span>
+          <select name="queue_type">
+            <option value="keyword_search">Keyword Search</option>
+            <option value="url_crawl">URL Crawl</option>
+          </select>
+        </label>
+        <div class="form-actions">
+          <button class="button primary" type="submit">Create Queue</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div class="helper-title">
+          <h2>Bind Keyword To URL Queue</h2>
+          <span class="helper-tip">
+            <button
+              class="helper-icon"
+              type="button"
+              aria-label="Explain queue binding"
+              aria-describedby="bind-queue-help"
+            >?</button>
+            <span class="helper-popover" id="bind-queue-help" role="tooltip">
+              Select one keyword search queue and one output URL crawl queue. Press Bind Queues to save or update that mapping. After binding, this keyword queue can start, and every Google result it finds will be inserted only into the selected URL queue.
+            </span>
+          </span>
+        </div>
+        <span class="muted">Search results from queue_keyword go only to its bound queue_url.</span>
+      </div>
+      <form method="post" class="stacked-form" action="{{ url_for('queue_create') }}">
+        <input type="hidden" name="action" value="link_queues">
+        <label>
+          <span>Keyword Search Queue (required)</span>
+          <select name="keyword_queue_id" required>
+            <option value="" disabled selected>Select queue_keyword</option>
+            {% for queue in keyword_queues %}
+              <option value="{{ queue.id }}">#{{ queue.id }} · {{ queue.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          <span>Output URL Crawl Queue (required)</span>
+          <select name="url_queue_id" required>
+            <option value="" disabled selected>Select queue_url</option>
+            {% for queue in url_queues %}
+              <option value="{{ queue.id }}">{{ queue.name }} · #{{ queue.id }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div class="form-actions">
+          <button class="button primary" type="submit">Bind Queues</button>
+        </div>
+      </form>
+    </section>
+  </section>
+{% endblock %}

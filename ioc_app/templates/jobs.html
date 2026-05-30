@@ -44,7 +44,7 @@
               <td>#{{ row.id }}</td>
               <td>
                 {% if row.queue_id %}
-                  <a href="{{ url_for('queues', queue_id=row.queue_id) }}">#{{ row.queue_id }} · {{ row.queue_name }}</a>
+                  <a href="{{ url_for('queue_detail', queue_id=row.queue_id) }}">#{{ row.queue_id }} · {{ row.queue_name }}</a>
                 {% else %}
                   <span class="muted">Manual</span>
                 {% endif %}

@@ -8,7 +8,7 @@
   <section class="panel">
     <div class="panel-head">
       <div class="helper-title">
-        <h2>Add URLs</h2>
+        <h2>Add URL Patterns</h2>
         <span class="helper-tip">
           <button
             class="helper-icon"
@@ -17,16 +17,16 @@
             aria-describedby="whitelist-url-help"
           >?</button>
           <span class="helper-popover helper-popover-wide" id="whitelist-url-help" role="tooltip">
-            Whitelist dùng URL chính xác sau normalize. Nếu URL collect được trùng whitelist, hệ thống sẽ không đưa URL đó vào URL Review Queue hoặc URL Crawl Queue. URL đã có sẵn sẽ được đánh dấu ignored_whitelist và gỡ khỏi queue/job nếu chưa chạy.
+            Whitelist hỗ trợ URL chính xác hoặc wildcard cuối URL. Ví dụ https://example.com/* sẽ bỏ qua URL gốc và mọi path nối thêm từ URL đó. URL đã có sẵn sẽ được đánh dấu ignored_whitelist và gỡ khỏi queue/job nếu chưa chạy.
           </span>
         </span>
       </div>
-      <span class="muted">One URL per line. Fragments after # are ignored.</span>
+      <span class="muted">One URL or trailing-wildcard pattern per line. Fragments after # are ignored.</span>
     </div>
     <form method="post" class="stacked-form">
       <label>
         <span>URLs</span>
-        <textarea name="urls" rows="7" placeholder="https://example.com/blocked-path&#10;https://example.com/tracker?x=1"></textarea>
+        <textarea name="urls" rows="7" placeholder="https://example.com/blocked-path&#10;https://example.com/*"></textarea>
       </label>
       <label>
         <span>Note</span>
@@ -48,10 +48,11 @@
         <thead>
           <tr>
             <th>ID</th>
-            <th>Normalized URL</th>
+            <th>URL Pattern</th>
+            <th>Type</th>
             <th>Note</th>
             <th>Status</th>
-            <th>Existing URL</th>
+            <th>Matched URLs</th>
             <th>Queue Items</th>
             <th>Created</th>
             <th>Actions</th>
@@ -62,7 +63,15 @@
             <tr>
               <td class="cell-id">#{{ row.id }}</td>
               <td>
-                <a class="truncate-line" href="{{ row.url_norm }}" target="_blank" rel="noreferrer" title="{{ row.url_norm }}">{{ row.url_norm }}</a>
+                <a class="truncate-line" href="{{ row.match_value or row.url_norm }}" target="_blank" rel="noreferrer" title="{{ row.url_raw }}">{{ row.url_raw }}</a>
+                <small class="muted truncate-line" title="{{ row.match_value or row.url_norm }}">Match: {{ row.match_value or row.url_norm }}</small>
+              </td>
+              <td>
+                {% if row.match_type == "prefix" %}
+                  <span class="badge pending">Prefix</span>
+                {% else %}
+                  <span class="badge done">Exact</span>
+                {% endif %}
               </td>
               <td><span class="truncate-line" title="{{ row.note or '' }}">{{ row.note or "-" }}</span></td>
               <td>
@@ -72,15 +81,8 @@
                   <span class="badge paused">Disabled</span>
                 {% endif %}
               </td>
-              <td>
-                {% if row.url_id %}
-                  <span class="badge {{ row.review_status }}">{{ row.review_status|status_label }}</span>
-                  <span class="badge {{ row.crawl_status }}">{{ row.crawl_status|status_label }}</span>
-                {% else %}
-                  <span class="muted">Not collected</span>
-                {% endif %}
-              </td>
-              <td>{{ row.queue_item_count }}</td>
+              <td class="cell-count">{{ row.matched_url_count }}</td>
+              <td class="cell-count">{{ row.queue_item_count }}</td>
               <td>{{ row.created_at }}</td>
               <td class="cell-actions">
                 <form method="post" action="{{ url_for('delete_whitelist_url', item_id=row.id) }}">
@@ -89,7 +91,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="8" class="empty">No whitelist URLs yet.</td></tr>
+            <tr><td colspan="9" class="empty">No whitelist URLs yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>

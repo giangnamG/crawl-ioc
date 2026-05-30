@@ -4,10 +4,11 @@ import json
 import os
 import threading
 import time
+from urllib.parse import urlsplit
 
 from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
 
-from .db import connect, db_path, init_db, is_url_whitelisted
+from .db import connect, db_path, init_db, is_url_whitelisted, whitelist_match_sql
 from .extractor import test_rule, validate_rule
 from .normalizers import get_domain, is_media_asset_url, normalize_url
 from .worker import (
@@ -113,26 +114,36 @@ def create_app(start_worker: bool = False) -> Flask:
                 removed_jobs = 0
                 ignored_urls = 0
                 for item in parse_lines(raw_urls):
-                    url_norm = normalize_url(item)
-                    if not url_norm:
+                    whitelist_entry = normalize_whitelist_entry(item)
+                    if not whitelist_entry:
                         skipped += 1
                         continue
                     before = conn.total_changes
                     conn.execute(
                         """
-                        INSERT INTO whitelist_urls(url_raw, url_norm, note, enabled)
-                        VALUES (?, ?, ?, 1)
+                        INSERT INTO whitelist_urls(
+                          url_raw, url_norm, match_type, match_value, note, enabled
+                        )
+                        VALUES (?, ?, ?, ?, ?, 1)
                         ON CONFLICT(url_norm) DO UPDATE SET
                             url_raw = excluded.url_raw,
+                            match_type = excluded.match_type,
+                            match_value = excluded.match_value,
                             note = COALESCE(excluded.note, whitelist_urls.note),
                             enabled = 1,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        (item, url_norm, note),
+                        (
+                            item,
+                            whitelist_entry["url_norm"],
+                            whitelist_entry["match_type"],
+                            whitelist_entry["match_value"],
+                            note,
+                        ),
                     )
                     if conn.total_changes > before:
                         added += 1
-                    cleanup = apply_url_whitelist(conn, url_norm)
+                    cleanup = apply_url_whitelist(conn, whitelist_entry["url_norm"])
                     ignored_urls += cleanup["ignored_urls"]
                     removed_items += cleanup["removed_items"]
                     removed_jobs += cleanup["removed_jobs"]
@@ -143,16 +154,20 @@ def create_app(start_worker: bool = False) -> Flask:
                 return redirect(url_for("whitelist"))
 
             rows = conn.execute(
-                """
+                f"""
                 SELECT wu.*,
-                       u.id AS url_id,
-                       u.review_status,
-                       u.crawl_status,
-                       COUNT(DISTINCT qi.id) AS queue_item_count
+                       (
+                         SELECT COUNT(*)
+                         FROM urls u
+                         WHERE {whitelist_match_sql('u.url_norm', 'wu')}
+                       ) AS matched_url_count,
+                       (
+                         SELECT COUNT(DISTINCT qi.id)
+                         FROM url_queue_items qi
+                         JOIN urls u ON u.id = qi.url_id
+                         WHERE {whitelist_match_sql('u.url_norm', 'wu')}
+                       ) AS queue_item_count
                 FROM whitelist_urls wu
-                LEFT JOIN urls u ON u.url_norm = wu.url_norm
-                LEFT JOIN url_queue_items qi ON qi.url_id = u.id
-                GROUP BY wu.id
                 ORDER BY wu.enabled DESC, wu.id DESC
                 LIMIT 500
                 """
@@ -170,117 +185,158 @@ def create_app(start_worker: bool = False) -> Flask:
                 flash(f"Removed whitelist URL: {row['url_norm']}", "success")
         return redirect(url_for("whitelist"))
 
+    def handle_queue_post(conn, default_queue_id: int | None = None):
+        action = request.form.get("action")
+        if action == "create":
+            name = request.form.get("name", "").strip()
+            queue_type = request.form.get("queue_type", "keyword_search")
+            if not name:
+                flash("Queue name is required.", "error")
+                return redirect(url_for("queue_create"))
+            if queue_type not in {"keyword_search", "url_crawl"}:
+                flash("Queue type is invalid.", "error")
+                return redirect(url_for("queue_create"))
+            queue_id = get_or_create_queue(conn, name, queue_type)
+            flash(f"Queue created: {name}", "success")
+            return redirect(url_for("queue_detail", queue_id=queue_id))
+
+        if action == "add_urls":
+            queue_id = request.form.get("queue_id", type=int) or default_queue_id
+            queue = get_queue(conn, queue_id, "url_crawl")
+            if not queue:
+                flash("URL queue is required.", "error")
+                return redirect(url_for("queues"))
+            added, requeued, skipped = add_urls_to_queue(
+                conn, queue_id, request.form.get("targets", "")
+            )
+            flash(
+                f"Added {added} URL/domain targets and requeued {requeued} existing targets in queue '{queue['name']}'. Skipped {skipped}. Start the queue when ready.",
+                "success" if added or requeued else "error",
+            )
+            return redirect(url_for("queue_detail", queue_id=queue_id))
+
+        if action == "link_queues":
+            keyword_queue_id = request.form.get("keyword_queue_id", type=int)
+            url_queue_id = request.form.get("url_queue_id", type=int)
+            ok, message = bind_keyword_queue_to_url_queue(conn, keyword_queue_id, url_queue_id)
+            flash(message, "success" if ok else "error")
+            if keyword_queue_id:
+                return redirect(url_for("queue_detail", queue_id=keyword_queue_id))
+            if url_queue_id:
+                return redirect(url_for("queue_detail", queue_id=url_queue_id))
+            return redirect(url_for("queue_create"))
+
+        flash("Queue action is invalid.", "error")
+        return redirect(url_for("queues"))
+
+    @app.get("/queue")
+    def queue_singular():
+        if request.args.get("queue_id", type=int):
+            return redirect(url_for("queue_detail", queue_id=request.args.get("queue_id", type=int)))
+        return redirect(url_for("queues"))
+
+    @app.get("/queue/new")
+    def queue_create_singular():
+        return redirect(url_for("queue_create"))
+
+    @app.get("/queue/<int:queue_id>")
+    def queue_detail_singular(queue_id: int):
+        return redirect(url_for("queue_detail", queue_id=queue_id))
+
     @app.route("/queues", methods=["GET", "POST"])
     def queues():
         with connect() as conn:
             if request.method == "POST":
-                action = request.form.get("action")
-                if action == "create":
-                    name = request.form.get("name", "").strip()
-                    queue_type = request.form.get("queue_type", "keyword_search")
-                    if not name:
-                        flash("Queue name is required.", "error")
-                    elif queue_type not in {"keyword_search", "url_crawl"}:
-                        flash("Queue type is invalid.", "error")
-                    else:
-                        queue_id = get_or_create_queue(conn, name, queue_type)
-                        flash(f"Queue created: {name}", "success")
-                        return redirect(url_for("queues", queue_id=queue_id))
+                return handle_queue_post(conn)
 
-                if action == "add_urls":
-                    queue_id = request.form.get("queue_id", type=int)
-                    queue = get_queue(conn, queue_id, "url_crawl")
-                    if not queue:
-                        flash("URL queue is required.", "error")
-                    else:
-                        added, requeued, skipped = add_urls_to_queue(
-                            conn, queue_id, request.form.get("targets", "")
-                        )
-                        flash(
-                            f"Added {added} URL/domain targets and requeued {requeued} existing targets in queue '{queue['name']}'. Skipped {skipped}. Start the queue when ready.",
-                            "success" if added or requeued else "error",
-                        )
-                        return redirect(url_for("queues", queue_id=queue_id))
-
-                if action == "link_queues":
-                    keyword_queue_id = request.form.get("keyword_queue_id", type=int)
-                    url_queue_id = request.form.get("url_queue_id", type=int)
-                    ok, message = bind_keyword_queue_to_url_queue(conn, keyword_queue_id, url_queue_id)
-                    flash(message, "success" if ok else "error")
-                    return redirect(url_for("queues", queue_id=keyword_queue_id or url_queue_id))
+            selected_queue_id = request.args.get("queue_id", type=int)
+            if selected_queue_id:
+                return redirect(url_for("queue_detail", queue_id=selected_queue_id))
 
             rows = query_queues(conn)
             url_overview = query_url_overview(conn)
+        return render_template("queues.html", rows=rows, url_overview=url_overview)
+
+    @app.route("/queues/new", methods=["GET", "POST"])
+    def queue_create():
+        with connect() as conn:
+            if request.method == "POST":
+                return handle_queue_post(conn)
             keyword_queues = conn.execute(
                 "SELECT * FROM queues WHERE queue_type = 'keyword_search' ORDER BY id DESC"
             ).fetchall()
             url_queues = conn.execute(
                 "SELECT * FROM queues WHERE queue_type = 'url_crawl' ORDER BY id DESC"
             ).fetchall()
-            selected_queue_id = request.args.get("queue_id", type=int)
-            selected_queue = None
-            selected_jobs = []
-            selected_url_items = []
-            selected_queries = []
-            selected_crawling_urls = []
-            if selected_queue_id:
-                selected_queue = conn.execute(
-                    "SELECT * FROM queues WHERE id = ?", (selected_queue_id,)
-                ).fetchone()
-                selected_jobs = conn.execute(
-                    """
-                    SELECT * FROM jobs
-                    WHERE queue_id = ?
-                    ORDER BY id DESC
-                    LIMIT 80
-                    """,
-                    (selected_queue_id,),
-                ).fetchall()
-                selected_url_items = conn.execute(
-                    """
-                    SELECT qi.*,
-                           u.url_norm,
-                           u.domain,
-                           u.crawl_status,
-                           source_q.name AS source_queue_name,
-                           source_q.queue_type AS source_queue_type
-                    FROM url_queue_items qi
-                    JOIN urls u ON u.id = qi.url_id
-                    LEFT JOIN queues source_q ON source_q.id = qi.source_queue_id
-                    WHERE qi.queue_id = ?
-                    ORDER BY qi.id DESC
-                    LIMIT 120
-                    """,
-                    (selected_queue_id,),
-                ).fetchall()
-                selected_queries = conn.execute(
-                    """
-                    SELECT sqi.*,
-                           sq.query_text,
-                           k.text AS keyword_text,
-                           output_q.name AS output_url_queue_name
-                    FROM search_queue_items sqi
-                    JOIN search_queries sq ON sq.id = sqi.search_query_id
-                    JOIN keywords k ON k.id = sqi.keyword_id
-                    LEFT JOIN queues output_q ON output_q.id = sqi.output_url_queue_id
-                    WHERE sqi.queue_id = ?
-                    ORDER BY sqi.id DESC
-                    LIMIT 120
-                    """,
-                    (selected_queue_id,),
-                ).fetchall()
-                selected_crawling_urls = query_crawling_urls(conn, selected_queue_id)
         return render_template(
-            "queues.html",
-            rows=rows,
-            url_overview=url_overview,
+            "queue_create.html",
             keyword_queues=keyword_queues,
             url_queues=url_queues,
+        )
+
+    @app.route("/queues/<int:queue_id>", methods=["GET", "POST"])
+    def queue_detail(queue_id: int):
+        with connect() as conn:
+            if request.method == "POST":
+                return handle_queue_post(conn, default_queue_id=queue_id)
+
+            selected_rows = query_queues(conn, queue_id=queue_id)
+            selected_queue = selected_rows[0] if selected_rows else None
+            if not selected_queue:
+                flash("Queue not found.", "error")
+                return redirect(url_for("queues"))
+            selected_jobs = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE queue_id = ?
+                ORDER BY id DESC
+                LIMIT 80
+                """,
+                (queue_id,),
+            ).fetchall()
+            selected_url_items = conn.execute(
+                """
+                SELECT qi.*,
+                       u.url_norm,
+                       u.domain,
+                       u.crawl_status,
+                       source_q.name AS source_queue_name,
+                       source_q.queue_type AS source_queue_type
+                FROM url_queue_items qi
+                JOIN urls u ON u.id = qi.url_id
+                LEFT JOIN queues source_q ON source_q.id = qi.source_queue_id
+                WHERE qi.queue_id = ?
+                ORDER BY qi.id DESC
+                LIMIT 120
+                """,
+                (queue_id,),
+            ).fetchall()
+            selected_queries = conn.execute(
+                """
+                SELECT sqi.*,
+                       sq.query_text,
+                       k.text AS keyword_text,
+                       output_q.name AS output_url_queue_name
+                FROM search_queue_items sqi
+                JOIN search_queries sq ON sq.id = sqi.search_query_id
+                JOIN keywords k ON k.id = sqi.keyword_id
+                LEFT JOIN queues output_q ON output_q.id = sqi.output_url_queue_id
+                WHERE sqi.queue_id = ?
+                ORDER BY sqi.id DESC
+                LIMIT 120
+                """,
+                (queue_id,),
+            ).fetchall()
+            selected_crawling_urls = query_crawling_urls(conn, queue_id)
+            selected_keyword_search_status = query_keyword_search_status(conn, queue_id)
+        return render_template(
+            "queue_detail.html",
             selected_queue=selected_queue,
             selected_jobs=selected_jobs,
             selected_url_items=selected_url_items,
             selected_queries=selected_queries,
             selected_crawling_urls=selected_crawling_urls,
+            selected_keyword_search_status=selected_keyword_search_status,
         )
 
     @app.get("/api/queues/<int:queue_id>/crawling-urls")
@@ -306,6 +362,29 @@ def create_app(start_worker: bool = False) -> Flask:
             }
         )
 
+    @app.get("/api/queues/<int:queue_id>/keyword-search-status")
+    def queue_keyword_search_status_api(queue_id: int):
+        with connect() as conn:
+            queue = conn.execute(
+                "SELECT id, name, queue_type FROM queues WHERE id = ?",
+                (queue_id,),
+            ).fetchone()
+            if not queue:
+                return jsonify({"ok": False, "error": "Queue not found."}), 404
+            rows = query_keyword_search_status(conn, queue_id)
+        return jsonify(
+            {
+                "ok": True,
+                "queue": {
+                    "id": queue["id"],
+                    "name": queue["name"],
+                    "queue_type": queue["queue_type"],
+                },
+                "count": len(rows),
+                "items": [dict(row) for row in rows],
+            }
+        )
+
     @app.post("/queues/<int:queue_id>/start")
     def start_queue(queue_id: int):
         with connect() as conn:
@@ -315,19 +394,19 @@ def create_app(start_worker: bool = False) -> Flask:
                 return redirect(url_for("queues"))
             if queue["queue_type"] == "keyword_search" and not get_output_url_queue(conn, queue_id):
                 flash("Bind this Keyword Search Queue to a specific URL Crawl Queue before starting it.", "error")
-                return redirect(url_for("queues", queue_id=queue_id))
+                return redirect(url_for("queue_detail", queue_id=queue_id))
             jobs_started, items_started = start_queue_work(conn, queue_id)
         if queue["queue_type"] == "url_crawl" and jobs_started == 0 and items_started == 0:
             flash(
                 f"No approved URL/domain items are ready in queue '{queue['name']}'. Approve items in Review first, then start the queue again.",
                 "error",
             )
-            return redirect(url_for("queues", queue_id=queue_id))
+            return redirect(url_for("queue_detail", queue_id=queue_id))
         flash(
             f"Started queue '{queue['name']}'. Requeued {jobs_started} jobs and {items_started} items.",
             "success",
         )
-        return redirect(url_for("queues", queue_id=queue_id))
+        return redirect(url_for("queue_detail", queue_id=queue_id))
 
     @app.post("/queues/<int:queue_id>/stop")
     def stop_queue(queue_id: int):
@@ -342,7 +421,7 @@ def create_app(start_worker: bool = False) -> Flask:
             f"Stopped queue '{queue['name']}'. Paused {jobs_paused} jobs and {items_paused} items.{suffix}",
             "success",
         )
-        return redirect(url_for("queues", queue_id=queue_id))
+        return redirect(url_for("queue_detail", queue_id=queue_id))
 
     @app.post("/queues/<int:queue_id>/resume")
     def resume_queue(queue_id: int):
@@ -359,7 +438,7 @@ def create_app(start_worker: bool = False) -> Flask:
             f"Removed URL item #{item_id} from queue. Removed {job_count} crawl jobs. URL/domain/IOC records were kept.",
             "success",
         )
-        return redirect(url_for("queues", queue_id=queue_id))
+        return redirect(url_for("queue_detail", queue_id=queue_id))
 
     @app.route("/keywords", methods=["GET", "POST"])
     def keywords():
@@ -386,6 +465,8 @@ def create_app(start_worker: bool = False) -> Flask:
                 keywords_imported = 0
                 queries_created = 0
                 queries_requeued = 0
+                runnable_now = queue["status"] == "running" and output_url_queue_id is not None
+                initial_work_status = "pending" if runnable_now else "paused"
 
                 for text in keyword_lines:
                     keyword_id = upsert_keyword(conn, text)
@@ -409,7 +490,12 @@ def create_app(start_worker: bool = False) -> Flask:
                         )
                         existing_item = get_search_queue_item(conn, queue_id, search_query_id)
                         queue_item_id = upsert_search_queue_item(
-                            conn, queue_id, search_query_id, keyword_id, output_url_queue_id
+                            conn,
+                            queue_id,
+                            search_query_id,
+                            keyword_id,
+                            output_url_queue_id,
+                            initial_work_status=initial_work_status,
                         )
                         if existing_item:
                             if reactivate_search_queue_item(
@@ -417,6 +503,7 @@ def create_app(start_worker: bool = False) -> Flask:
                                 queue_item_id,
                                 search_query_id,
                                 output_url_queue_id,
+                                initial_work_status=initial_work_status,
                             ):
                                 queries_requeued += 1
                         queue_search_job(
@@ -425,17 +512,22 @@ def create_app(start_worker: bool = False) -> Flask:
                             search_query_id=search_query_id,
                             queue_item_id=queue_item_id,
                             output_url_queue_id=output_url_queue_id,
-                            initial_status="paused",
+                            initial_status=initial_work_status,
                         )
                     refresh_keyword_status(conn, keyword_id)
 
                 refresh_queue_status(conn, queue_id)
 
+                next_step = (
+                    "New queries were queued because the queue is running."
+                    if runnable_now
+                    else "Start the queue when ready."
+                )
                 flash(
-                    f"Added {keywords_imported} keyword lines, created {queries_created} search queries, and requeued {queries_requeued} existing queries. Start the queue when ready.",
+                    f"Added {keywords_imported} keyword lines, created {queries_created} search queries, and requeued {queries_requeued} existing queries. {next_step}",
                     "success",
                 )
-                return redirect(url_for("queues", queue_id=queue_id))
+                return redirect(url_for("queue_detail", queue_id=queue_id))
 
             dorks = conn.execute("SELECT * FROM search_dorks ORDER BY enabled DESC, id").fetchall()
             keyword_queues = conn.execute(
@@ -857,6 +949,33 @@ def unique_ints(values: list[str]) -> list[int]:
         seen.add(item)
         rows.append(item)
     return rows
+
+
+def normalize_whitelist_entry(value: str) -> dict[str, str] | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+
+    match_type = "prefix" if raw.endswith("*") else "exact"
+    candidate = raw[:-1].strip() if match_type == "prefix" else raw
+    if not candidate:
+        return None
+
+    url_norm = normalize_url(candidate)
+    if not url_norm:
+        return None
+    match_value = url_norm
+    if match_type == "prefix":
+        parts = urlsplit(url_norm)
+        if not parts.path and not parts.query:
+            match_value = f"{url_norm}/"
+
+    return {
+        "url_raw": raw,
+        "url_norm": url_norm,
+        "match_type": match_type,
+        "match_value": match_value,
+    }
 
 
 def upsert_keyword(conn, text: str) -> int:
@@ -1344,9 +1463,11 @@ def bind_keyword_queue_to_url_queue(
     return True, f"Bound keyword queue '{keyword_queue['name']}' to URL queue '{url_queue['name']}'."
 
 
-def query_queues(conn):
+def query_queues(conn, queue_id: int | None = None):
+    where_sql = "WHERE q.id = ?" if queue_id else ""
+    params = (queue_id,) if queue_id else ()
     return conn.execute(
-        """
+        f"""
         SELECT q.*,
                COUNT(DISTINCT j.id) AS job_count,
                COUNT(DISTINCT CASE WHEN j.status = 'pending' THEN j.id END) AS pending_jobs,
@@ -1383,10 +1504,12 @@ def query_queues(conn):
         LEFT JOIN urls queue_url ON queue_url.id = uqi.url_id
         LEFT JOIN queue_routes qr ON qr.keyword_queue_id = q.id
         LEFT JOIN queues uq ON uq.id = qr.url_queue_id
+        {where_sql}
         GROUP BY q.id
         ORDER BY q.id DESC
         LIMIT 200
-        """
+        """,
+        params,
     ).fetchall()
 
 
@@ -1442,6 +1565,49 @@ def query_crawling_urls(conn, queue_id: int):
             OR j.id IS NOT NULL
           )
         ORDER BY COALESCE(qi.started_at, j.started_at, qi.created_at) DESC, qi.id DESC
+        LIMIT 200
+        """,
+        (queue_id,),
+    ).fetchall()
+
+
+def query_keyword_search_status(conn, queue_id: int):
+    return conn.execute(
+        """
+        SELECT sqi.id AS queue_item_id,
+               sqi.status AS queue_item_status,
+               sqi.started_at AS queue_item_started_at,
+               sqi.error AS queue_item_error,
+               sq.id AS search_query_id,
+               sq.query_text,
+               sq.status AS search_status,
+               sq.result_count,
+               sq.page_count,
+               sq.last_error AS search_error,
+               sq.started_at AS search_started_at,
+               k.text AS keyword_text,
+               output_q.id AS output_url_queue_id,
+               output_q.name AS output_url_queue_name,
+               j.id AS job_id,
+               j.status AS job_status,
+               j.attempts,
+               j.started_at AS job_started_at,
+               j.error AS job_error
+        FROM search_queue_items sqi
+        JOIN search_queries sq ON sq.id = sqi.search_query_id
+        JOIN keywords k ON k.id = sqi.keyword_id
+        LEFT JOIN queues output_q ON output_q.id = sqi.output_url_queue_id
+        LEFT JOIN jobs j ON j.type = 'search_query'
+          AND j.queue_id = sqi.queue_id
+          AND j.dedupe_key = 'queue:' || sqi.queue_id || ':search:' || sqi.search_query_id
+          AND j.status IN ('pending', 'running')
+        WHERE sqi.queue_id = ?
+          AND (
+            sqi.status IN ('pending', 'running')
+            OR sq.status IN ('pending', 'running')
+            OR j.id IS NOT NULL
+          )
+        ORDER BY COALESCE(sqi.started_at, sq.started_at, j.started_at, sqi.created_at) DESC, sqi.id DESC
         LIMIT 200
         """,
         (queue_id,),
@@ -1741,20 +1907,45 @@ def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int, 
 
 
 def apply_url_whitelist(conn, url_norm: str) -> dict[str, int]:
-    row = conn.execute("SELECT id FROM urls WHERE url_norm = ?", (url_norm,)).fetchone()
-    if not row:
+    whitelist = conn.execute(
+        "SELECT * FROM whitelist_urls WHERE url_norm = ? AND enabled = 1",
+        (url_norm,),
+    ).fetchone()
+    if not whitelist:
         return {"ignored_urls": 0, "removed_items": 0, "removed_jobs": 0}
-    url_id = int(row["id"])
+
+    match_value = whitelist["match_value"] or whitelist["url_norm"]
+    if whitelist["match_type"] == "prefix":
+        params: list[object] = [match_value, len(match_value), match_value]
+        where = "(url_norm = ? OR substr(url_norm, 1, ?) = ?)"
+        if match_value.endswith("/"):
+            root_match_value = match_value.rstrip("/")
+            where = f"({where} OR url_norm = ? OR substr(url_norm, 1, ?) = ?)"
+            params.extend([root_match_value, len(match_value), f"{root_match_value}?"])
+    else:
+        params = [whitelist["url_norm"]]
+        where = "url_norm = ?"
+
+    rows = conn.execute(f"SELECT id FROM urls WHERE {where}", params).fetchall()
+    if not rows:
+        return {"ignored_urls": 0, "removed_items": 0, "removed_jobs": 0}
+    url_ids = [int(row["id"]) for row in rows]
+    placeholders = ",".join("?" for _ in url_ids)
     ignored_urls = conn.execute(
-        """
+        f"""
         UPDATE urls
         SET review_status = 'ignored_whitelist'
-        WHERE id = ?
+        WHERE id IN ({placeholders})
           AND review_status != 'ignored_whitelist'
         """,
-        (url_id,),
+        url_ids,
     ).rowcount
-    removed_items, removed_jobs = remove_url_from_queue_items(conn, url_id)
+    removed_items = 0
+    removed_jobs = 0
+    for url_id in url_ids:
+        item_count, job_count = remove_url_from_queue_items(conn, url_id)
+        removed_items += item_count
+        removed_jobs += job_count
     return {
         "ignored_urls": max(ignored_urls, 0),
         "removed_items": removed_items,
@@ -1831,15 +2022,22 @@ def upsert_search_queue_item(
     search_query_id: int,
     keyword_id: int,
     output_url_queue_id: int | None = None,
+    initial_work_status: str = "paused",
 ) -> int:
     conn.execute(
         """
         INSERT OR IGNORE INTO search_queue_items(
           queue_id, search_query_id, keyword_id, output_url_queue_id, status
         )
-        VALUES (?, ?, ?, ?, 'paused')
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (queue_id, search_query_id, keyword_id, output_url_queue_id),
+        (
+            queue_id,
+            search_query_id,
+            keyword_id,
+            output_url_queue_id,
+            initial_work_status,
+        ),
     )
     if output_url_queue_id:
         conn.execute(
@@ -1878,6 +2076,7 @@ def reactivate_search_queue_item(
     queue_item_id: int,
     search_query_id: int,
     output_url_queue_id: int | None,
+    initial_work_status: str = "paused",
 ) -> bool:
     row = conn.execute(
         "SELECT status FROM search_queue_items WHERE id = ?",
@@ -1889,7 +2088,7 @@ def reactivate_search_queue_item(
     conn.execute(
         """
         UPDATE search_queue_items
-        SET status = 'paused',
+        SET status = ?,
             output_url_queue_id = COALESCE(?, output_url_queue_id),
             result_count = 0,
             page_count = 0,
@@ -1898,7 +2097,7 @@ def reactivate_search_queue_item(
             finished_at = NULL
         WHERE id = ?
         """,
-        (output_url_queue_id, queue_item_id),
+        (initial_work_status, output_url_queue_id, queue_item_id),
     )
     conn.execute(
         """
@@ -2095,12 +2294,12 @@ def query_review_urls(conn, status: str, q: str):
     where.append("u.crawl_status NOT IN ('crawled', 'metadata_only')")
     where.append("u.review_status != 'ignored_whitelist'")
     where.append(
-        """
+        f"""
         NOT EXISTS (
           SELECT 1
           FROM whitelist_urls wu
-          WHERE wu.url_norm = u.url_norm
-            AND wu.enabled = 1
+          WHERE wu.enabled = 1
+            AND {whitelist_match_sql('u.url_norm', 'wu')}
         )
         """
     )

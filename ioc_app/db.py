@@ -24,17 +24,42 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def whitelist_match_sql(url_expr: str, alias: str = "wu") -> str:
+    match_value = f"COALESCE({alias}.match_value, {alias}.url_norm)"
+    match_type = f"COALESCE({alias}.match_type, 'exact')"
+    return f"""
+    (
+      ({match_type} = 'exact' AND {alias}.url_norm = {url_expr})
+      OR (
+        {match_type} = 'prefix'
+        AND (
+          {url_expr} = {match_value}
+          OR substr({url_expr}, 1, length({match_value})) = {match_value}
+          OR (
+            substr({match_value}, -1) = '/'
+            AND (
+              {url_expr} = substr({match_value}, 1, length({match_value}) - 1)
+              OR substr({url_expr}, 1, length({match_value})) =
+                substr({match_value}, 1, length({match_value}) - 1) || '?'
+            )
+          )
+        )
+      )
+    )
+    """
+
+
 def is_url_whitelisted(conn: sqlite3.Connection, url_norm: str) -> bool:
     return bool(
         conn.execute(
-            """
+            f"""
             SELECT 1
-            FROM whitelist_urls
-            WHERE url_norm = ?
-              AND enabled = 1
+            FROM whitelist_urls wu
+            WHERE wu.enabled = 1
+              AND {whitelist_match_sql(':url_norm', 'wu')}
             LIMIT 1
             """,
-            (url_norm,),
+            {"url_norm": url_norm},
         ).fetchone()
     )
 
@@ -65,6 +90,31 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "urls", "content_length", "INTEGER")
     ensure_column(conn, "urls", "fetch_method", "TEXT")
     ensure_column(conn, "urls", "crawl_error", "TEXT")
+    ensure_column(conn, "whitelist_urls", "match_type", "TEXT NOT NULL DEFAULT 'exact'")
+    ensure_column(conn, "whitelist_urls", "match_value", "TEXT")
+    conn.execute(
+        """
+        UPDATE whitelist_urls
+        SET match_type = COALESCE(match_type, 'exact'),
+            match_value = COALESCE(match_value, url_norm)
+        """
+    )
+    conn.execute(
+        """
+        UPDATE queues
+        SET status = 'draft',
+            stopped_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'paused'
+          AND started_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM jobs j
+            WHERE j.queue_id = queues.id
+              AND j.status IN ('pending', 'running', 'failed', 'done')
+          )
+        """
+    )
     migrate_domain_tables_into_urls(conn)
     remove_crawled_urls_from_queue_items(conn)
     conn.executescript(
@@ -77,6 +127,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_queue_routes_keyword ON queue_routes(keyword_queue_id);
         CREATE INDEX IF NOT EXISTS idx_queue_routes_url ON queue_routes(url_queue_id);
         CREATE INDEX IF NOT EXISTS idx_whitelist_urls_enabled ON whitelist_urls(enabled, url_norm);
+        CREATE INDEX IF NOT EXISTS idx_whitelist_urls_match ON whitelist_urls(enabled, match_type, match_value);
         """
     )
 
@@ -708,6 +759,8 @@ CREATE TABLE IF NOT EXISTS whitelist_urls (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   url_raw TEXT NOT NULL,
   url_norm TEXT NOT NULL UNIQUE,
+  match_type TEXT NOT NULL DEFAULT 'exact',
+  match_value TEXT,
   note TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
