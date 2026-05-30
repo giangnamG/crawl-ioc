@@ -114,6 +114,37 @@ ADDRESS_SIGNAL_RE = re.compile(
     r"street|ward|district|city)\b",
     re.IGNORECASE,
 )
+PHONE_CONTACT_CONTEXT_RE = re.compile(
+    r"\b(?:sdt|sđt|phone|tel|telephone|mobile|hotline|call|zalo|contact|"
+    r"liên\s*hệ|lien\s*he|điện\s*thoại|dien\s*thoai)\b|tel\s*:",
+    re.IGNORECASE,
+)
+PHONE_STRUCTURED_NOISE_RE = re.compile(
+    r"(<\s*svg\b|<\s*path\b|\\u003cpath|\bd\s*=\s*[\\\"']|viewbox|xmlns|"
+    r"currentcolor|fill\s*=|stroke\s*=|clippath|fontawesome|"
+    r"font-size\s*:|line-height\s*:|padding\s*:|box-sizing|background-color|"
+    r"\b(?:px|rem|em|vh|vw)\b|"
+    r"(?<![A-Za-z])[MmZzLlHhVvCcSsQqTtAa][-+]?\d|\d(?:\.\d|\s)+[A-Z]\d)",
+    re.IGNORECASE,
+)
+PHONE_URL_NOISE_RE = re.compile(
+    r"(https?://|www\.|/[a-z0-9_-]*\d{6,}[a-z0-9_-]*|[?&](?:q|url|u)=)",
+    re.IGNORECASE,
+)
+PHONE_BUSINESS_ID_CONTEXT_RE = re.compile(
+    r"\b(?:mã\s*số\s*(?:doanh\s*nghiệp|thuế)|ma\s*so\s*(?:doanh\s*nghiep|thue)|"
+    r"\bmst\b|tax\s*(?:id|code)|business\s*(?:id|registration)|"
+    r"enterprise\s*(?:id|registration)|registration\s*(?:number|no))\b",
+    re.IGNORECASE,
+)
+PHONE_DATE_CONTEXT_RE = re.compile(
+    r"\b(?:ngày|ngay|date|joined|last\s*activity|hoạt\s*động|hoat\s*dong|"
+    r"tham\s*gia|copyright|bản\s*quyền|ban\s*quyen)\b",
+    re.IGNORECASE,
+)
+PHONE_DATE_PATTERN_RE = re.compile(
+    r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b|\b\d{4}\s*[-–]\s*\d{4}\b|\b\d{1,2}:\d{2}\b"
+)
 
 
 def normalize_url(value: str) -> str | None:
@@ -231,12 +262,48 @@ def normalize_email(value: str) -> str | None:
 
 
 def normalize_phone_vn(value: str) -> str | None:
-    digits = re.sub(r"\D+", "", value or "")
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if re.search(r"[A-Za-z_=/<>\"'{}[\];]|\\u[0-9a-fA-F]{4}", raw):
+        return None
+    groups = re.findall(r"\d+", raw)
+    if not groups:
+        return None
+    if len(groups) >= 5 and sum(1 for group in groups if len(group) == 1) >= 4:
+        return None
+    if "." in raw and max(len(group) for group in groups) <= 2:
+        return None
+    digits = "".join(groups)
     if digits.startswith("84") and len(digits) == 11 and digits[2] in "35789":
         return "+" + digits
     if digits.startswith("0") and len(digits) == 10 and digits[1] in "35789":
         return "+84" + digits[1:]
     return None
+
+
+def is_probable_phone_vn_evidence(value: str, evidence: str | None, raw_value: str | None = None) -> bool:
+    normalized = normalize_phone_vn(raw_value or value)
+    if not normalized:
+        normalized = normalize_phone_vn(value)
+    if not normalized:
+        return False
+
+    text = evidence or ""
+    if not text:
+        return True
+
+    has_contact_context = bool(PHONE_CONTACT_CONTEXT_RE.search(text))
+    decimal_token_count = len(re.findall(r"(?<![A-Za-z0-9])-?\d+\.\d+", text))
+    if PHONE_STRUCTURED_NOISE_RE.search(text) or (decimal_token_count >= 5 and not has_contact_context):
+        return has_contact_context and "tel" in text.lower()
+    if PHONE_URL_NOISE_RE.search(text) and not has_contact_context:
+        return False
+    if PHONE_BUSINESS_ID_CONTEXT_RE.search(text) and not has_contact_context:
+        return False
+    if PHONE_DATE_CONTEXT_RE.search(text) and PHONE_DATE_PATTERN_RE.search(text) and not has_contact_context:
+        return False
+    return True
 
 
 def normalize_hash(value: str) -> str | None:
@@ -270,7 +337,7 @@ def normalize_by_rule(value: str, normalizer: str, ioc_type: str) -> str | None:
         return normalize_domain(value)
     if normalizer == "email" or ioc_type == "email":
         return normalize_email(value)
-    if normalizer == "phone_vn":
+    if normalizer == "phone_vn" or ioc_type == "phone":
         return normalize_phone_vn(value)
     if normalizer == "hash" or ioc_type.startswith("hash_"):
         return normalize_hash(value)

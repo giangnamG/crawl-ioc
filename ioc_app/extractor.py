@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from sqlite3 import Row
 
-from .normalizers import normalize_by_rule
+from .normalizers import is_probable_phone_vn_evidence, normalize_by_rule
 
 
 MAX_INPUT_CHARS = 500_000
@@ -91,12 +91,20 @@ def extract_iocs_by_rules(
             if not norm_value:
                 continue
 
+            evidence = get_context(source_text, match.start(), match.end())
+            if rule["ioc_type"] == "phone" and not is_probable_phone_vn_evidence(
+                norm_value,
+                evidence,
+                raw_value,
+            ):
+                continue
+
             found.append(
                 ExtractedIOC(
                     type=rule["ioc_type"],
                     raw=raw_value.strip(),
                     norm=norm_value,
-                    evidence=get_context(source_text, match.start(), match.end()),
+                    evidence=evidence,
                     rule_id=rule["id"],
                 )
             )

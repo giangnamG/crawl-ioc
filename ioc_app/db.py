@@ -4,7 +4,13 @@ import re
 import sqlite3
 from pathlib import Path
 
-from .normalizers import get_domain, is_media_asset_url, normalize_by_rule, normalize_url
+from .normalizers import (
+    get_domain,
+    is_media_asset_url,
+    is_probable_phone_vn_evidence,
+    normalize_by_rule,
+    normalize_url,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -543,7 +549,7 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
                 (
                     "Vietnam mobile phone",
                     "phone",
-                    r"(?<!\d)(?:\+?84|0)[\s.\-]?(?:3|5|7|8|9)(?:[\s.\-]?\d){8}(?!\d)",
+                    r"(?<![A-Za-z0-9+])(?:(?:\+?84|0)(?:3|5|7|8|9)\d{8}|(?:\+?84|0)[\s.\-]?(?:3|5|7|8|9)\d{1,2}[\s.\-]?\d{3}[\s.\-]?\d{3,4})(?![A-Za-z0-9])",
                     "",
                     0,
                     "text",
@@ -653,13 +659,13 @@ def refresh_builtin_extraction_rules(conn: sqlite3.Connection) -> None:
         ),
         (
             "Vietnam mobile phone",
-            r"(?<![\d+])(?:\+84|84|0)[\s.\-]?(?:3|5|7|8|9)(?:[\s.\-]?\d){8}(?!\d)",
+            r"(?<![A-Za-z0-9+])(?:(?:\+?84|0)(?:3|5|7|8|9)\d{8}|(?:\+?84|0)[\s.\-]?(?:3|5|7|8|9)\d{1,2}[\s.\-]?\d{3}[\s.\-]?\d{3,4})(?![A-Za-z0-9])",
             "",
             0,
             "text",
             None,
             "phone_vn",
-            "Vietnam mobile phone extraction for 0xxx, +84xxx, and spaced/dotted forms.",
+            "Vietnam mobile phone extraction with strict grouping and code/URL false-positive guards.",
         ),
         (
             "Address context",
@@ -708,11 +714,16 @@ def cleanup_invalid_iocs(conn: sqlite3.Connection) -> None:
         """
     ).fetchall()
     for row in rows:
-        normalized = normalize_by_rule(row["value_norm"], row["type"], row["type"])
+        normalizer = "phone_vn" if row["type"] == "phone" else row["type"]
+        normalized = normalize_by_rule(row["value_norm"], normalizer, row["type"])
         if row["type"] == "domain" and domain_ioc_is_email_localpart(conn, int(row["id"]), row["value_norm"]):
             normalized = None
         if row["type"] == "domain" and domain_ioc_is_full_url_host(conn, int(row["id"]), row["value_norm"]):
             normalized = None
+        if row["type"] == "phone" and normalized:
+            cleanup_invalid_phone_sources(conn, int(row["id"]), normalized)
+            if not conn.execute("SELECT 1 FROM ioc_sources WHERE ioc_id = ? LIMIT 1", (row["id"],)).fetchone():
+                normalized = None
         if normalized == row["value_norm"]:
             continue
         if normalized:
@@ -720,6 +731,21 @@ def cleanup_invalid_iocs(conn: sqlite3.Connection) -> None:
         else:
             conn.execute("DELETE FROM ioc_sources WHERE ioc_id = ?", (row["id"],))
             conn.execute("DELETE FROM iocs WHERE id = ?", (row["id"],))
+
+
+def cleanup_invalid_phone_sources(conn: sqlite3.Connection, ioc_id: int, value_norm: str) -> None:
+    sources = conn.execute(
+        """
+        SELECT id, evidence_text
+        FROM ioc_sources
+        WHERE ioc_id = ?
+        """,
+        (ioc_id,),
+    ).fetchall()
+    for source in sources:
+        if is_probable_phone_vn_evidence(value_norm, source["evidence_text"]):
+            continue
+        conn.execute("DELETE FROM ioc_sources WHERE id = ?", (source["id"],))
 
 
 def merge_or_update_ioc(conn: sqlite3.Connection, ioc_id: int, ioc_type: str, normalized: str) -> None:
