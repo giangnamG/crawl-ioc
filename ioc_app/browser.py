@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import ipaddress
 import os
 import random
 import re
@@ -46,6 +47,15 @@ PROXY_RETRY_PATTERNS = (
     "ERR_TUNNEL_CONNECTION_FAILED",
     "ERR_SOCKS_CONNECTION_FAILED",
     "net::ERR_TIMED_OUT",
+    "CLOAK_PROXY_PREFLIGHT_FAILED",
+    "No usable CloakBrowser proxy",
+)
+
+_PROXY_PREFLIGHT_CACHE: dict[str, tuple[bool, float, str | None]] = {}
+PROXY_PREFLIGHT_URLS = (
+    "https://api.ipify.org",
+    "https://checkip.amazonaws.com",
+    "https://ifconfig.me/ip",
 )
 
 
@@ -120,6 +130,13 @@ class BrowserClient:
         self.proxy = select_proxy(self.proxy_candidates)
         self.direct_fallback = env_bool("CLOAK_DIRECT_FALLBACK", True)
         self.geoip = env_bool("CLOAK_GEOIP", bool(self.proxy))
+        self.require_proxy_for_search = env_bool(
+            "CLOAK_REQUIRE_PROXY_FOR_SEARCH",
+            self.geoip and bool(self.proxy_candidates),
+        )
+        self.proxy_preflight = env_bool("CLOAK_PROXY_PREFLIGHT", True)
+        self.proxy_preflight_timeout = float(os.environ.get("CLOAK_PROXY_PREFLIGHT_TIMEOUT", "5"))
+        self.proxy_preflight_ttl = float(os.environ.get("CLOAK_PROXY_PREFLIGHT_TTL_SECONDS", "300"))
         self.backend = os.environ.get("CLOAK_BACKEND") or None
         self.stealth_args = env_bool("CLOAK_STEALTH_ARGS", True)
         self.fingerprint_seed = os.environ.get("CLOAK_FINGERPRINT_SEED")
@@ -139,12 +156,20 @@ class BrowserClient:
     def search_google(self, query_text: str) -> list[SearchResult]:
         if self.provider == "http":
             return HttpFallbackClient(self.max_pages, self.timeout_ms).search_google(query_text)
-        return self._run_with_proxy_retries(lambda: self._search_google_with_cloak(query_text))
+        return self._run_with_proxy_retries(
+            lambda: self._search_google_with_cloak(query_text),
+            allow_direct=not self.require_proxy_for_search,
+            operation_name="Google search",
+        )
 
     def fetch_url(self, url: str) -> FetchResult:
         if self.provider == "http":
             return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_url(url)
-        return self._run_with_proxy_retries(lambda: self._fetch_url_with_cloak(url))
+        return self._run_with_proxy_retries(
+            lambda: self._fetch_url_with_cloak(url),
+            allow_direct=True,
+            operation_name="URL crawl",
+        )
 
     def fetch_text_resource(self, url: str, fetch_method: str = "http_text") -> FetchResult:
         return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_text_resource(
@@ -155,11 +180,24 @@ class BrowserClient:
     def fetch_binary_metadata(self, url: str) -> FetchResult:
         return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_binary_metadata(url)
 
-    def _run_with_proxy_retries(self, operation):
-        attempts = self._proxy_attempts()
+    def _run_with_proxy_retries(self, operation, *, allow_direct: bool, operation_name: str):
+        attempts = self._proxy_attempts(allow_direct=allow_direct)
         last_exc: Exception | None = None
+        if not attempts:
+            raise RuntimeError(
+                f"No usable CloakBrowser proxy for {operation_name}. "
+                "Configure CLOAK_PROXY/CLOAK_PROXY_POOL or disable CLOAK_REQUIRE_PROXY_FOR_SEARCH."
+            )
         for index, proxy in enumerate(attempts):
             self.proxy = proxy
+            if proxy and not self._proxy_ready(proxy):
+                _ok, message = proxy_preflight(proxy, self.proxy_preflight_timeout, self.proxy_preflight_ttl)
+                last_exc = RuntimeError(
+                    f"CLOAK_PROXY_PREFLIGHT_FAILED: Proxy {proxy_label(proxy)} cannot discover exit IP. "
+                    "Check proxy credentials/connectivity before launching CloakBrowser with geoip=True. "
+                    f"Last error: {message}"
+                )
+                continue
             try:
                 return operation()
             except Exception as exc:
@@ -170,16 +208,22 @@ class BrowserClient:
             raise last_exc
         return operation()
 
-    def _proxy_attempts(self) -> list[str | None]:
+    def _proxy_attempts(self, *, allow_direct: bool) -> list[str | None]:
         if not self.proxy_candidates:
-            return [None]
+            return [None] if allow_direct else []
 
         selected = self.proxy or select_proxy(self.proxy_candidates)
         attempts = [selected] if selected else []
         attempts.extend(proxy for proxy in self.proxy_candidates if proxy != selected)
-        if self.direct_fallback:
+        if self.direct_fallback and allow_direct:
             attempts.append(None)
         return attempts or [None]
+
+    def _proxy_ready(self, proxy: str) -> bool:
+        if not self.proxy_preflight:
+            return True
+        ok, _message = proxy_preflight(proxy, self.proxy_preflight_timeout, self.proxy_preflight_ttl)
+        return ok
 
     def _search_google_with_cloak(self, query_text: str) -> list[SearchResult]:
         results: list[SearchResult] = []
@@ -892,6 +936,44 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def proxy_label(proxy: str) -> str:
+    parsed = urllib.parse.urlparse(proxy)
+    host = parsed.hostname or "unknown-host"
+    port = f":{parsed.port}" if parsed.port else ""
+    scheme = parsed.scheme or "http"
+    return f"{scheme}://{host}{port}"
+
+
+def proxy_preflight(proxy: str, timeout: float, ttl_seconds: float) -> tuple[bool, str | None]:
+    now = time.monotonic()
+    cached = _PROXY_PREFLIGHT_CACHE.get(proxy)
+    if cached and cached[1] > now:
+        return cached[0], cached[2]
+
+    timeout = max(1.0, timeout)
+    errors: list[str] = []
+    try:
+        import httpx
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        _PROXY_PREFLIGHT_CACHE[proxy] = (False, now + max(1.0, ttl_seconds), message)
+        return False, message
+
+    for url in PROXY_PREFLIGHT_URLS:
+        try:
+            response = httpx.get(url, proxy=proxy, timeout=timeout)
+            response.raise_for_status()
+            ipaddress.ip_address(response.text.strip())
+            _PROXY_PREFLIGHT_CACHE[proxy] = (True, now + max(1.0, ttl_seconds), None)
+            return True, None
+        except Exception as exc:
+            errors.append(f"{url}: {type(exc).__name__}: {exc}")
+
+    message = "; ".join(errors)
+    _PROXY_PREFLIGHT_CACHE[proxy] = (False, now + max(1.0, ttl_seconds), message)
+    return False, message
 
 
 def is_retryable_proxy_error(exc: Exception) -> bool:
