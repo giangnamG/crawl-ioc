@@ -92,6 +92,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "search_queries", "last_error", "TEXT")
     ensure_column(conn, "search_queries", "started_at", "TEXT")
     ensure_column(conn, "search_queries", "finished_at", "TEXT")
+    ensure_column(conn, "keywords", "paused_by_user", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "jobs", "queue_id", "INTEGER REFERENCES queues(id)")
     ensure_column(conn, "jobs", "target_url_id", "INTEGER")
     ensure_column(conn, "jobs", "target_queue_item_id", "INTEGER")
@@ -828,6 +829,7 @@ CREATE TABLE IF NOT EXISTS keywords (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   text TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL DEFAULT 'pending',
+  paused_by_user INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -30,11 +30,22 @@ GOOGLE_BLOCK_PATTERNS = (
 )
 
 PROXY_RETRY_PATTERNS = (
+    "TimeoutError",
+    "ERR_TIMED_OUT",
+    "ERR_CONNECTION_TIMED_OUT",
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED",
+    "ERR_EMPTY_RESPONSE",
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_ADDRESS_UNREACHABLE",
+    "ERR_INTERNET_DISCONNECTED",
+    "ERR_NETWORK_CHANGED",
     "ERR_INVALID_AUTH_CREDENTIALS",
     "ERR_PROXY_AUTH_UNSUPPORTED",
     "ERR_PROXY_CONNECTION_FAILED",
     "ERR_TUNNEL_CONNECTION_FAILED",
     "ERR_SOCKS_CONNECTION_FAILED",
+    "net::ERR_TIMED_OUT",
 )
 
 
@@ -107,6 +118,7 @@ class BrowserClient:
         self.timezone = os.environ.get("CLOAK_TIMEZONE", "Asia/Saigon")
         self.proxy_candidates = proxy_candidates_from_env()
         self.proxy = select_proxy(self.proxy_candidates)
+        self.direct_fallback = env_bool("CLOAK_DIRECT_FALLBACK", True)
         self.geoip = env_bool("CLOAK_GEOIP", bool(self.proxy))
         self.backend = os.environ.get("CLOAK_BACKEND") or None
         self.stealth_args = env_bool("CLOAK_STEALTH_ARGS", True)
@@ -165,6 +177,8 @@ class BrowserClient:
         selected = self.proxy or select_proxy(self.proxy_candidates)
         attempts = [selected] if selected else []
         attempts.extend(proxy for proxy in self.proxy_candidates if proxy != selected)
+        if self.direct_fallback:
+            attempts.append(None)
         return attempts or [None]
 
     def _search_google_with_cloak(self, query_text: str) -> list[SearchResult]:

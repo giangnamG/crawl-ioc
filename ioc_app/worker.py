@@ -107,6 +107,10 @@ def worker_heartbeat_seconds() -> float:
     return env_float("WORKER_HEARTBEAT_SECONDS", 5.0, minimum=1.0)
 
 
+def search_job_max_attempts() -> int:
+    return env_int("SEARCH_JOB_MAX_ATTEMPTS", 3, minimum=1, maximum=20)
+
+
 def payload_int(payload: dict[str, object], key: str) -> int | None:
     value = payload.get(key)
     try:
@@ -739,6 +743,58 @@ def run_one(
                 error_text = str(exc)
             else:
                 error_text = traceback.format_exc(limit=5)
+            current_attempts = int(
+                conn.execute("SELECT attempts FROM jobs WHERE id = ?", (job["id"],)).fetchone()["attempts"]
+            )
+            if (
+                job["type"] == "search_query"
+                and is_retryable_proxy_error(exc)
+                and current_attempts < search_job_max_attempts()
+            ):
+                query_id = payload.get("search_query_id")
+                search_item_id = payload.get("search_queue_item_id")
+                if query_id:
+                    conn.execute(
+                        """
+                        UPDATE search_queries
+                        SET status = 'pending',
+                            last_error = ?,
+                            finished_at = NULL
+                        WHERE id = ?
+                        """,
+                        (error_text, query_id),
+                    )
+                if search_item_id:
+                    conn.execute(
+                        """
+                        UPDATE search_queue_items
+                        SET status = 'pending',
+                            error = ?,
+                            finished_at = NULL
+                        WHERE id = ?
+                        """,
+                        (error_text, search_item_id),
+                    )
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'pending',
+                        started_at = NULL,
+                        finished_at = NULL,
+                        error = ?,
+                        run_token = NULL,
+                        heartbeat_at = NULL
+                    WHERE id = ?
+                      AND run_token = ?
+                    """,
+                    (error_text, job["id"], run_token),
+                )
+                if queue_id:
+                    refresh_queue_status(conn, int(queue_id))
+                return (
+                    f"Job #{job['id']} retrying transient search error "
+                    f"({current_attempts}/{search_job_max_attempts()}): {exc}"
+                )
             final_slot_status = "error"
             final_slot_error = error_text
             mark_url_queue_item(conn, payload.get("url_queue_item_id"), "failed", error_text)
@@ -823,9 +879,10 @@ def process_search_query(
         raise RuntimeError("Keyword queue has no bound URL crawl queue.")
 
     keyword = conn.execute(
-        "SELECT status FROM keywords WHERE id = ?", (search_query["keyword_id"],)
+        "SELECT status, COALESCE(paused_by_user, 0) AS paused_by_user FROM keywords WHERE id = ?",
+        (search_query["keyword_id"],),
     ).fetchone()
-    if keyword and keyword["status"] == "paused":
+    if keyword and keyword["paused_by_user"]:
         conn.execute(
             "UPDATE search_queries SET status = 'paused' WHERE id = ?",
             (search_query_id,),
@@ -1468,8 +1525,11 @@ def reject_url(conn: Connection, url_id: int) -> bool:
 
 
 def refresh_keyword_status(conn: Connection, keyword_id: int) -> None:
-    keyword = conn.execute("SELECT status FROM keywords WHERE id = ?", (keyword_id,)).fetchone()
-    if not keyword or keyword["status"] == "paused":
+    keyword = conn.execute(
+        "SELECT status, COALESCE(paused_by_user, 0) AS paused_by_user FROM keywords WHERE id = ?",
+        (keyword_id,),
+    ).fetchone()
+    if not keyword or keyword["paused_by_user"]:
         return
 
     counts = conn.execute(

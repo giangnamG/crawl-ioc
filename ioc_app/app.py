@@ -1054,7 +1054,8 @@ def upsert_keyword(conn, text: str) -> int:
     conn.execute(
         """
         UPDATE keywords
-        SET status = 'pending'
+        SET status = 'pending',
+            paused_by_user = 0
         WHERE text = ? AND status IN ('paused', 'failed', 'done')
         """,
         (text,),
@@ -1079,7 +1080,7 @@ def pause_keyword_work(conn, keyword_id: int) -> tuple[int, int, int]:
         (keyword_id,),
     )
 
-    conn.execute("UPDATE keywords SET status = 'paused' WHERE id = ?", (keyword_id,))
+    conn.execute("UPDATE keywords SET status = 'paused', paused_by_user = 1 WHERE id = ?", (keyword_id,))
     if not query_ids:
         return 0, 0, running_queries
 
@@ -1142,7 +1143,7 @@ def resume_keyword_work(conn, keyword_id: int) -> int:
         """,
         (keyword_id,),
     ).fetchall()
-    conn.execute("UPDATE keywords SET status = 'pending' WHERE id = ?", (keyword_id,))
+    conn.execute("UPDATE keywords SET status = 'pending', paused_by_user = 0 WHERE id = ?", (keyword_id,))
     resumed_count = 0
 
     for row in query_rows:
@@ -1791,17 +1792,21 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
         output_url_queue_id = int(output_url_queue["id"])
         item_rows = conn.execute(
             """
-            SELECT id, search_query_id
-            FROM search_queue_items
-            WHERE queue_id = ?
-              AND status IN ('pending', 'paused', 'failed')
-            ORDER BY id
+            SELECT sqi.id, sqi.search_query_id
+            FROM search_queue_items sqi
+            JOIN keywords k ON k.id = sqi.keyword_id
+            WHERE sqi.queue_id = ?
+              AND sqi.status IN ('pending', 'paused', 'failed')
+              AND COALESCE(k.paused_by_user, 0) = 0
+            ORDER BY sqi.id
             """,
             (queue_id,),
         ).fetchall()
         if not item_rows:
             refresh_queue_status(conn, queue_id)
             return 0, 0
+        item_ids = [int(item["id"]) for item in item_rows]
+        item_placeholders = ",".join("?" for _ in item_ids)
         conn.execute(
             """
             UPDATE queues
@@ -1814,17 +1819,16 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
             (queue_id,),
         )
         query_count = conn.execute(
-            """
+            f"""
             UPDATE search_queue_items
             SET status = 'pending',
                 output_url_queue_id = ?,
                 started_at = NULL,
                 finished_at = NULL,
                 error = NULL
-            WHERE queue_id = ?
-              AND status IN ('pending', 'paused', 'failed')
+            WHERE id IN ({item_placeholders})
             """,
-            (output_url_queue_id, queue_id),
+            (output_url_queue_id, *item_ids),
         ).rowcount
         search_query_ids = [int(item["search_query_id"]) for item in item_rows]
         if search_query_ids:
@@ -1838,6 +1842,19 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
                     finished_at = NULL
                 WHERE id IN ({placeholders})
                   AND status != 'running'
+                """,
+                search_query_ids,
+            )
+            conn.execute(
+                f"""
+                UPDATE keywords
+                SET status = 'pending'
+                WHERE COALESCE(paused_by_user, 0) = 0
+                  AND id IN (
+                    SELECT keyword_id
+                    FROM search_queries
+                    WHERE id IN ({placeholders})
+                  )
                 """,
                 search_query_ids,
             )
