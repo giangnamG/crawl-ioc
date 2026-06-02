@@ -86,6 +86,8 @@ Nếu đang đứng trong thư mục `deploy` trên VPS:
 docker compose --env-file ../.env up -d --build
 ```
 
+`deploy/docker-compose.yml` khai báo `env_file: ../.env` cho backend để các cấu hình runtime như `SEARCH_MAX_PAGES`, proxy CloakBrowser, timeout, delay và worker settings được truyền vào container. `--env-file` của Docker Compose chỉ phục vụ nội suy biến trong file compose, không tự động đưa toàn bộ `.env` vào container nếu service không khai báo `env_file`.
+
 Các file production chính:
 
 ```text
