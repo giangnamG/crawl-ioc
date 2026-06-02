@@ -32,6 +32,7 @@ services:
       FLASK_DEBUG: "0"
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       DB_BACKEND: postgresql
+      HOME: /home/appuser
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_DB: ${POSTGRES_DB:-ioc_investigator}
@@ -40,6 +41,7 @@ services:
       AUTO_WORKER_ENABLED: ${AUTO_WORKER_ENABLED:-true}
       CLOAK_HEADLESS: "1"
       BROWSER_PROVIDER: cloak
+      CLOAKBROWSER_CACHE_DIR: /home/appuser/.cloakbrowser
       CLOAK_PROFILE_ROOT: /data/cloak_profiles
     expose:
       - "5000"
