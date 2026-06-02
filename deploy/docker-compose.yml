@@ -7,11 +7,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-ioc_app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
     volumes:
-      - type: bind
-        source: /opt/url-hunter/postgresql/data
-        target: /var/lib/postgresql/data
-        bind:
-          create_host_path: false
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
@@ -75,3 +71,4 @@ services:
 
 volumes:
   backend-data:
+  postgres-data:
