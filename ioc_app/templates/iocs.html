@@ -11,7 +11,7 @@
         <h2>Search IOCs</h2>
         <span class="muted">Filter by type, IOC value, source, rule, or evidence.</span>
       </div>
-      <span class="ioc-filter-count">{{ rows|length }} matches</span>
+      <span class="ioc-filter-count">{{ pagination.total }} matches</span>
     </div>
     <form method="get" class="ioc-filter-form" role="search">
       <label class="ioc-filter-type">
@@ -66,6 +66,7 @@
             <tr>
               <th>Source URL</th>
               <th>Domain</th>
+              <th>Source</th>
               <th>Rule</th>
               <th>Evidence</th>
             </tr>
@@ -75,11 +76,12 @@
               <tr>
                 <td><a class="source-url-full" href="{{ row.url_norm }}" target="_blank" rel="noreferrer">{{ row.url_norm }}</a></td>
                 <td>{{ row.domain }}</td>
+                <td>{{ row.source_type or "crawl" }}</td>
                 <td>{{ row.rule_name or "" }}</td>
                 <td>{{ row.evidence_text }}</td>
               </tr>
             {% else %}
-              <tr><td colspan="4" class="empty">No source rows found for this IOC.</td></tr>
+              <tr><td colspan="5" class="empty">No source rows found for this IOC.</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -90,7 +92,7 @@
   <section class="panel">
     <div class="panel-head">
       <h2>IOC Table</h2>
-      <span class="muted">{{ rows|length }} rows</span>
+      <span class="muted">Page {{ pagination.page }}/{{ pagination.total_pages }} · {{ rows|length }} visible rows</span>
     </div>
     <form
       id="bulk-ioc-delete-form"
@@ -101,9 +103,23 @@
     >
       <input type="hidden" name="type" value="{{ ioc_type }}">
       <input type="hidden" name="q" value="{{ q }}">
+      <input type="hidden" name="page" value="{{ pagination.page }}">
       <span class="muted">Select IOC rows, then delete them in one action.</span>
       <button class="button small danger" type="submit">Delete Selected</button>
     </form>
+    <div class="pagination-bar" aria-label="IOC pagination">
+      {% if pagination.has_prev %}
+        <a class="button small" href="{{ url_for('iocs', type=ioc_type, q=q, page=pagination.prev_page, page_size=pagination.page_size) }}">Previous</a>
+      {% else %}
+        <span class="button small disabled">Previous</span>
+      {% endif %}
+      <span class="muted">{{ pagination.total }} matches · {{ pagination.page_size }} per page</span>
+      {% if pagination.has_next %}
+        <a class="button small" href="{{ url_for('iocs', type=ioc_type, q=q, page=pagination.next_page, page_size=pagination.page_size) }}">Next</a>
+      {% else %}
+        <span class="button small disabled">Next</span>
+      {% endif %}
+    </div>
     <div class="bulk-pattern-bar" data-pattern-scope="ioc">
       <label>
         <span>Auto tick field</span>
@@ -113,6 +129,7 @@
           <option value="value">Value</option>
           <option value="domain">Source domain</option>
           <option value="url">Source URL</option>
+          <option value="source">Source type</option>
           <option value="rule">Rule</option>
         </select>
       </label>
@@ -132,6 +149,7 @@
           <col class="ioc-col-type">
           <col class="ioc-col-value">
           <col class="ioc-col-sources">
+          <col class="ioc-col-source-type">
           <col class="ioc-col-count">
           <col class="ioc-col-rules">
           <col class="ioc-col-action">
@@ -145,6 +163,7 @@
             <th>Type</th>
             <th>Normalized Value</th>
             <th>Source Domain / URL</th>
+            <th>Source</th>
             <th>Count</th>
             <th>Rules</th>
             <th class="actions-col">Action</th>
@@ -158,6 +177,7 @@
               data-pattern-value="{{ row.value_norm }}"
               data-pattern-domain="{{ row.source_domains or '' }}"
               data-pattern-url="{{ row.source_urls or '' }}"
+              data-pattern-source="{{ row.source_types or '' }}"
               data-pattern-rule="{{ row.rule_names or '' }}"
             >
               <td class="cell-select">
@@ -178,19 +198,29 @@
                   {% endfor %}
                 </div>
               </td>
+              <td>
+                <div class="source-type-list">
+                  {% for source_type in (row.source_types.split(",") if row.source_types else []) %}
+                    <span class="tag">{{ source_type }}</span>
+                  {% else %}
+                    <span class="muted">No source</span>
+                  {% endfor %}
+                </div>
+              </td>
               <td>{{ row.source_count }}</td>
               <td>{{ row.rule_names or "" }}</td>
               <td class="cell-actions">
-                <a class="button small" href="{{ url_for('iocs', ioc_id=row.id, type=ioc_type, q=q) }}#ioc-evidence" title="View Evidence">View</a>
+                <a class="button small" href="{{ url_for('iocs', ioc_id=row.id, type=ioc_type, q=q, page=pagination.page, page_size=pagination.page_size) }}#ioc-evidence" title="View Evidence">View</a>
                 <form method="post" action="{{ url_for('delete_ioc', ioc_id=row.id) }}" onsubmit="return confirm('Delete this IOC and its evidence rows? Source URLs will be kept.');">
                   <input type="hidden" name="type" value="{{ ioc_type }}">
                   <input type="hidden" name="q" value="{{ q }}">
+                  <input type="hidden" name="page" value="{{ pagination.page }}">
                   <button class="button small danger" type="submit">Delete</button>
                 </form>
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="8" class="empty">No IOCs extracted yet.</td></tr>
+            <tr><td colspan="9" class="empty">No IOCs extracted yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>

@@ -460,6 +460,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "whitelist_urls", "matched_url_count", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "whitelist_urls", "queue_item_count", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "whitelist_urls", "counts_updated_at", "TEXT")
+    ensure_column(conn, "ioc_sources", "source_type", "TEXT NOT NULL DEFAULT 'crawl'")
     conn.execute(
         """
         UPDATE whitelist_urls
@@ -504,6 +505,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     remove_ignored_asset_urls_from_queue_items(conn)
     migrate_job_targets(conn)
     migrate_url_bodies(conn)
+    backfill_keyword_search_url_iocs(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS worker_slots (
@@ -541,6 +543,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_url_sources_search_query ON url_sources(search_query_id);
         CREATE INDEX IF NOT EXISTS idx_ioc_sources_ioc ON ioc_sources(ioc_id);
         CREATE INDEX IF NOT EXISTS idx_ioc_sources_source_url ON ioc_sources(source_url_id);
+        CREATE INDEX IF NOT EXISTS idx_ioc_sources_type ON ioc_sources(source_type);
         CREATE INDEX IF NOT EXISTS idx_queue_routes_keyword ON queue_routes(keyword_queue_id);
         CREATE INDEX IF NOT EXISTS idx_queue_routes_url ON queue_routes(url_queue_id);
         CREATE INDEX IF NOT EXISTS idx_whitelist_urls_enabled ON whitelist_urls(enabled, url_norm);
@@ -594,6 +597,228 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
             )
         }
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def upsert_ioc_source(
+    conn: sqlite3.Connection,
+    ioc_id: int,
+    source_url_id: int,
+    source_type: str,
+    extraction_rule_id: int | None = None,
+    evidence_text: str | None = None,
+) -> int:
+    source_type = source_type or "crawl"
+    if extraction_rule_id is None:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM ioc_sources
+            WHERE ioc_id = ?
+              AND source_url_id = ?
+              AND source_type = ?
+              AND extraction_rule_id IS NULL
+            LIMIT 1
+            """,
+            (ioc_id, source_url_id, source_type),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM ioc_sources
+            WHERE ioc_id = ?
+              AND source_url_id = ?
+              AND source_type = ?
+              AND extraction_rule_id = ?
+            LIMIT 1
+            """,
+            (ioc_id, source_url_id, source_type, extraction_rule_id),
+        ).fetchone()
+
+    if row:
+        source_id = int(row["id"])
+        if evidence_text:
+            conn.execute(
+                """
+                UPDATE ioc_sources
+                SET evidence_text = CASE
+                    WHEN evidence_text IS NULL OR evidence_text = '' THEN ?
+                    ELSE evidence_text
+                END
+                WHERE id = ?
+                """,
+                (evidence_text, source_id),
+            )
+        return source_id
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO ioc_sources(
+          ioc_id, source_url_id, source_type, extraction_rule_id, evidence_text
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (ioc_id, source_url_id, source_type, extraction_rule_id, evidence_text),
+    )
+
+    if extraction_rule_id is None:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM ioc_sources
+            WHERE ioc_id = ?
+              AND source_url_id = ?
+              AND source_type = ?
+              AND extraction_rule_id IS NULL
+            ORDER BY id
+            LIMIT 1
+            """,
+            (ioc_id, source_url_id, source_type),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM ioc_sources
+            WHERE ioc_id = ?
+              AND source_url_id = ?
+              AND source_type = ?
+              AND extraction_rule_id = ?
+            ORDER BY id
+            LIMIT 1
+            """,
+            (ioc_id, source_url_id, source_type, extraction_rule_id),
+        ).fetchone()
+
+    if row:
+        return int(row["id"])
+
+    fallback = conn.execute(
+        """
+        SELECT id
+        FROM ioc_sources
+        WHERE ioc_id = ?
+          AND source_url_id = ?
+          AND (
+            (? IS NULL AND extraction_rule_id IS NULL)
+            OR extraction_rule_id = ?
+          )
+        ORDER BY id
+        LIMIT 1
+        """,
+        (ioc_id, source_url_id, extraction_rule_id, extraction_rule_id),
+    ).fetchone()
+    return int(fallback["id"]) if fallback else 0
+
+
+def keyword_search_url_source_context(conn: sqlite3.Connection, url_id: int):
+    if not table_exists(conn, "url_sources"):
+        return None
+    return conn.execute(
+        """
+        SELECT us.title,
+               us.snippet,
+               us.rank,
+               us.page_no,
+               k.text AS keyword_text,
+               sq.query_text
+        FROM url_sources us
+        LEFT JOIN keywords k ON k.id = us.keyword_id
+        LEFT JOIN search_queries sq ON sq.id = us.search_query_id
+        WHERE us.url_id = ?
+          AND us.source_type = 'google_search'
+        ORDER BY COALESCE(us.page_no, 0),
+                 COALESCE(us.rank, 0),
+                 us.id
+        LIMIT 1
+        """,
+        (url_id,),
+    ).fetchone()
+
+
+def build_keyword_search_ioc_evidence(row) -> str:
+    parts = ["source=keyword_search"]
+    if row["keyword_text"]:
+        parts.append(f"keyword={row['keyword_text']}")
+    if row["query_text"]:
+        parts.append(f"query={row['query_text']}")
+    if row["page_no"]:
+        parts.append(f"page={row['page_no']}")
+    if row["rank"]:
+        parts.append(f"rank={row['rank']}")
+    if row["title"]:
+        parts.append(f"title={row['title']}")
+    if row["snippet"]:
+        parts.append(f"snippet={row['snippet']}")
+    return " | ".join(parts)
+
+
+def record_keyword_search_url_ioc(conn: sqlite3.Connection, url_id: int) -> bool:
+    if not all(table_exists(conn, table) for table in ("urls", "url_sources", "iocs", "ioc_sources")):
+        return False
+
+    row = conn.execute(
+        """
+        SELECT u.id, u.url_raw, u.url_norm
+        FROM urls u
+        WHERE u.id = ?
+          AND u.review_status = 'approved'
+          AND EXISTS (
+            SELECT 1
+            FROM url_sources us
+            WHERE us.url_id = u.id
+              AND us.source_type = 'google_search'
+          )
+        """,
+        (url_id,),
+    ).fetchone()
+    if not row:
+        return False
+
+    url_norm = normalize_url(row["url_norm"] or row["url_raw"])
+    if not url_norm or is_media_asset_url(url_norm):
+        return False
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO iocs(type, value_raw, value_norm)
+        VALUES ('url', ?, ?)
+        """,
+        (row["url_raw"] or url_norm, url_norm),
+    )
+    ioc = conn.execute(
+        "SELECT id FROM iocs WHERE type = 'url' AND value_norm = ?",
+        (url_norm,),
+    ).fetchone()
+    source_context = keyword_search_url_source_context(conn, int(row["id"]))
+    if not ioc or not source_context:
+        return False
+
+    upsert_ioc_source(
+        conn,
+        int(ioc["id"]),
+        int(row["id"]),
+        "keyword_search",
+        extraction_rule_id=None,
+        evidence_text=build_keyword_search_ioc_evidence(source_context),
+    )
+    return True
+
+
+def backfill_keyword_search_url_iocs(conn: sqlite3.Connection) -> None:
+    if not all(table_exists(conn, table) for table in ("urls", "url_sources", "iocs", "ioc_sources")):
+        return
+    rows = conn.execute(
+        """
+        SELECT DISTINCT u.id
+        FROM urls u
+        JOIN url_sources us ON us.url_id = u.id
+        WHERE u.review_status = 'approved'
+          AND us.source_type = 'google_search'
+        """
+    ).fetchall()
+    for row in rows:
+        record_keyword_search_url_ioc(conn, int(row["id"]))
 
 
 def migrate_job_targets(conn: sqlite3.Connection) -> None:
@@ -971,7 +1196,7 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
                     r"@(example|test)\.",
                     "email",
                     10,
-                    "General email extraction from rendered text, links, and HTML.",
+                    "General email extraction from rendered text, links, HTML, and encoded variants.",
                 ),
                 (
                     "HTTP URL",
@@ -1086,7 +1311,7 @@ def refresh_builtin_extraction_rules(conn: sqlite3.Connection) -> None:
             "all",
             r"@(example|test|invalid|localhost)\.",
             "email",
-            "Strict email extraction from rendered text, links, and HTML with validated domain/TLD.",
+            "Strict email extraction from rendered text, links, HTML, and encoded variants with validated domain/TLD.",
         ),
         (
             "HTTP URL",
@@ -1222,26 +1447,20 @@ def merge_or_update_ioc(conn: sqlite3.Connection, ioc_id: int, ioc_type: str, no
 
     sources = conn.execute(
         """
-        SELECT source_url_id, extraction_rule_id, evidence_text
+        SELECT source_url_id, source_type, extraction_rule_id, evidence_text
         FROM ioc_sources
         WHERE ioc_id = ?
         """,
         (ioc_id,),
     ).fetchall()
     for source in sources:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO ioc_sources(
-              ioc_id, source_url_id, extraction_rule_id, evidence_text
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                existing_id,
-                source["source_url_id"],
-                source["extraction_rule_id"],
-                source["evidence_text"],
-            ),
+        upsert_ioc_source(
+            conn,
+            existing_id,
+            int(source["source_url_id"]),
+            source["source_type"] or "crawl",
+            extraction_rule_id=source["extraction_rule_id"],
+            evidence_text=source["evidence_text"],
         )
     conn.execute("DELETE FROM ioc_sources WHERE ioc_id = ?", (ioc_id,))
     conn.execute("DELETE FROM iocs WHERE id = ?", (ioc_id,))
@@ -1469,6 +1688,7 @@ CREATE TABLE IF NOT EXISTS ioc_sources (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ioc_id INTEGER NOT NULL REFERENCES iocs(id),
   source_url_id INTEGER NOT NULL REFERENCES urls(id),
+  source_type TEXT NOT NULL DEFAULT 'crawl',
   extraction_rule_id INTEGER REFERENCES extraction_rules(id),
   evidence_text TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

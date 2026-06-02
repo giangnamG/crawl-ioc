@@ -10,7 +10,13 @@ import uuid
 from sqlite3 import Connection
 
 from .browser import BrowserClient, is_retryable_proxy_error
-from .db import connect, is_url_whitelisted, is_url_whitelisted_latest
+from .db import (
+    connect,
+    is_url_whitelisted,
+    is_url_whitelisted_latest,
+    record_keyword_search_url_ioc,
+    upsert_ioc_source,
+)
 from .extractor import extract_iocs_by_rules
 from .normalizers import get_domain, is_media_asset_url, normalize_domain, normalize_url
 
@@ -1219,14 +1225,13 @@ def process_crawl_url(
     for ioc in iocs:
         ensure_job_lease(conn, job_id, run_token)
         ioc_id = upsert_ioc(conn, ioc.type, ioc.raw, ioc.norm)
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO ioc_sources(
-              ioc_id, source_url_id, extraction_rule_id, evidence_text
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (ioc_id, url_id, ioc.rule_id, ioc.evidence),
+        upsert_ioc_source(
+            conn,
+            ioc_id,
+            url_id,
+            "crawl",
+            extraction_rule_id=ioc.rule_id,
+            evidence_text=ioc.evidence,
         )
 
         if ioc.type == "url":
@@ -1521,6 +1526,7 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
         "UPDATE urls SET review_status = 'approved' WHERE id = ? AND review_status = 'pending_review'",
         (url_id,),
     )
+    record_keyword_search_url_ioc(conn, url_id)
     queue_rows = []
     if queue_id:
         queue_rows = conn.execute(

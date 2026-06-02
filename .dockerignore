@@ -11,11 +11,19 @@ deploy/nginx/.htpasswd-*
 
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+build/
+dist/
+*.egg-info/
 
 .venv/
 venv/
 env/
 .vscode/
+node_modules/
 
 data/
 *.sqlite3

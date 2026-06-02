@@ -1974,6 +1974,7 @@ def build_ioc_filters(ioc_type: str, q: str) -> tuple[str, list[object]]:
                   AND (
                     u2.domain LIKE ?
                     OR u2.url_norm LIKE ?
+                    OR s2.source_type LIKE ?
                     OR r2.name LIKE ?
                     OR s2.evidence_text LIKE ?
                   )
@@ -1981,7 +1982,7 @@ def build_ioc_filters(ioc_type: str, q: str) -> tuple[str, list[object]]:
             )
             """
         )
-        params.extend([like, like, like, like, like, like])
+        params.extend([like, like, like, like, like, like, like])
     where_sql = "WHERE " + " AND ".join(where) if where else ""
     return where_sql, params
 
@@ -2005,6 +2006,7 @@ def query_iocs(conn, ioc_type: str, q: str, limit: int = DEFAULT_IOC_PAGE_SIZE, 
         f"""
         SELECT i.*,
                COUNT(DISTINCT s.id) AS source_count,
+               GROUP_CONCAT(DISTINCT s.source_type) AS source_types,
                GROUP_CONCAT(DISTINCT u.domain) AS source_domains,
                GROUP_CONCAT(DISTINCT u.url_norm) AS source_urls,
                GROUP_CONCAT(DISTINCT r.name) AS rule_names

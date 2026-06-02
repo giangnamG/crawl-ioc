@@ -1,6 +1,7 @@
-import re
+import html
 import ipaddress
-from urllib.parse import urlsplit, urlunsplit
+import re
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 MEDIA_ASSET_EXTENSIONS = {
@@ -100,6 +101,25 @@ EMAIL_RE = re.compile(
     r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$",
     re.IGNORECASE,
 )
+
+
+def decode_encoded_text_variants(value: str, max_rounds: int = 3) -> list[str]:
+    current = str(value or "")
+    variants = [current]
+    for _ in range(max_rounds):
+        decoded = unquote(html.unescape(current))
+        if decoded == current:
+            break
+        if decoded not in variants:
+            variants.append(decoded)
+        current = decoded
+    return variants
+
+
+def decode_encoded_value(value: str, max_rounds: int = 3) -> str:
+    return decode_encoded_text_variants(value, max_rounds=max_rounds)[-1].strip()
+
+
 CODELIKE_ADDRESS_RE = re.compile(
     r"[{}();=<>]|\b(?:window|function|jquery|document|location\.|addEventListener|parseInt|const|let)\b",
     re.IGNORECASE,
@@ -249,7 +269,9 @@ def is_valid_domain(value: str) -> bool:
 
 
 def normalize_email(value: str) -> str | None:
-    value = (value or "").strip().strip(".,;:)]}'\"")
+    value = decode_encoded_value(value).strip(".,;:)]}'\"")
+    if value.lower().startswith("mailto:"):
+        value = value[7:].split("?", 1)[0].strip().strip(".,;:)]}'\"")
     if not EMAIL_RE.fullmatch(value):
         return None
     local, domain = value.rsplit("@", 1)

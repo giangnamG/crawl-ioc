@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import html
 import re
-import urllib.parse
 from dataclasses import dataclass
 from sqlite3 import Row
 
-from .normalizers import is_probable_phone_vn_evidence, normalize_by_rule
+from .normalizers import (
+    decode_encoded_text_variants,
+    decode_encoded_value,
+    is_probable_phone_vn_evidence,
+    normalize_by_rule,
+)
 
 
 MAX_INPUT_CHARS = 500_000
@@ -94,6 +97,8 @@ def extract_iocs_by_rules(
                 continue
 
             evidence = get_context(source_text, match.start(), match.end())
+            if rule["ioc_type"] == "email":
+                evidence = decode_encoded_value(evidence)
             if rule["ioc_type"] == "phone" and not is_probable_phone_vn_evidence(
                 norm_value,
                 evidence,
@@ -101,10 +106,12 @@ def extract_iocs_by_rules(
             ):
                 continue
 
+            stored_raw = norm_value if rule["ioc_type"] == "email" else raw_value.strip()
+
             found.append(
                 ExtractedIOC(
                     type=rule["ioc_type"],
-                    raw=raw_value.strip(),
+                    raw=stored_raw,
                     norm=norm_value,
                     evidence=evidence,
                     rule_id=rule["id"],
@@ -165,14 +172,7 @@ def build_input_by_scope(extraction_input: dict[str, object], scope: str) -> str
 
 
 def expand_encoded_text(text: str) -> str:
-    variants = [text]
-    unescaped = html.unescape(text)
-    if unescaped != text:
-        variants.append(unescaped)
-    unquoted = urllib.parse.unquote(unescaped)
-    if unquoted != unescaped and unquoted != text:
-        variants.append(unquoted)
-    return "\n".join(variants)
+    return "\n".join(decode_encoded_text_variants(text))
 
 
 def get_context(text: str, start: int, end: int, size: int = 80) -> str:

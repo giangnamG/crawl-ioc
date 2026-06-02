@@ -591,11 +591,15 @@ tbody tr:hover .review-url-actions-cell {
 }
 
 .ioc-col-value {
-  width: 24%;
+  width: 22%;
 }
 
 .ioc-col-sources {
-  width: 32%;
+  width: 28%;
+}
+
+.ioc-col-source-type {
+  width: 104px;
 }
 
 .ioc-col-count {
@@ -748,6 +752,12 @@ tbody tr:hover .review-url-actions-cell {
 .source-inline-list .source-domain {
   color: #334155;
   font-weight: 700;
+}
+
+.source-type-list {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
 }
 
 .source-url-full {
