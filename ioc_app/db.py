@@ -217,7 +217,12 @@ def is_postgres_connection(conn) -> bool:
 
 def translate_postgres_sql(sql: str, params: Any = None) -> tuple[str, Any]:
     translated = sql
-    translated = re.sub(r"\bBEGIN\s+IMMEDIATE\b", "BEGIN", translated, flags=re.IGNORECASE)
+    translated = re.sub(
+        r"\bBEGIN\s+IMMEDIATE\b",
+        "SELECT pg_advisory_xact_lock(hashtext('url_hunter_write_transaction'))",
+        translated,
+        flags=re.IGNORECASE,
+    )
     translated = translate_postgres_ddl(translated)
     translated = re.sub(
         r"datetime\('now'\s*,\s*\?\)",

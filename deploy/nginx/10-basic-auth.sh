@@ -18,4 +18,5 @@ esac
 printf '%s\n' "$NGINX_BASIC_AUTH_PASSWORD" \
     | htpasswd -i -cB "$auth_file" "$NGINX_BASIC_AUTH_USER" >/dev/null
 
+chown root:nginx "$auth_file"
 chmod 640 "$auth_file"
