@@ -86,6 +86,8 @@ def init_db() -> None:
 
 
 def migrate_db(conn: sqlite3.Connection) -> None:
+    ensure_column(conn, "queues", "max_concurrent_jobs", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "queues", "active_max_concurrent_jobs", "INTEGER")
     ensure_column(conn, "search_queries", "queue_id", "INTEGER REFERENCES queues(id)")
     ensure_column(conn, "search_queries", "result_count", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "search_queries", "page_count", "INTEGER NOT NULL DEFAULT 0")
@@ -111,11 +113,30 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "urls", "crawl_error", "TEXT")
     ensure_column(conn, "whitelist_urls", "match_type", "TEXT NOT NULL DEFAULT 'exact'")
     ensure_column(conn, "whitelist_urls", "match_value", "TEXT")
+    ensure_column(conn, "whitelist_urls", "matched_url_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "whitelist_urls", "queue_item_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "whitelist_urls", "counts_updated_at", "TEXT")
     conn.execute(
         """
         UPDATE whitelist_urls
         SET match_type = COALESCE(match_type, 'exact'),
             match_value = COALESCE(match_value, url_norm)
+        """
+    )
+    conn.execute(
+        """
+        UPDATE queues
+        SET max_concurrent_jobs = 1
+        WHERE max_concurrent_jobs IS NULL
+           OR max_concurrent_jobs < 1
+        """
+    )
+    conn.execute(
+        """
+        UPDATE queues
+        SET active_max_concurrent_jobs = max_concurrent_jobs
+        WHERE active_max_concurrent_jobs IS NULL
+           OR active_max_concurrent_jobs < 1
         """
     )
     conn.execute(
@@ -138,6 +159,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     remove_crawled_urls_from_queue_items(conn)
     remove_ignored_asset_urls_from_queue_items(conn)
     migrate_job_targets(conn)
+    migrate_url_bodies(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS worker_slots (
@@ -160,13 +182,21 @@ def migrate_db(conn: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        DROP INDEX IF EXISTS idx_jobs_status_type_id;
         CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(queue_id, status, id);
+        CREATE INDEX IF NOT EXISTS idx_jobs_type_status_id ON jobs(type, status, id);
         CREATE INDEX IF NOT EXISTS idx_jobs_crawl_target ON jobs(type, status, target_url_id);
         CREATE INDEX IF NOT EXISTS idx_jobs_worker_slot ON jobs(worker_slot_key, status);
         CREATE INDEX IF NOT EXISTS idx_search_queries_queue ON search_queries(queue_id, status);
         CREATE INDEX IF NOT EXISTS idx_search_queue_items_queue ON search_queue_items(queue_id, status);
         CREATE INDEX IF NOT EXISTS idx_search_queue_items_output ON search_queue_items(output_url_queue_id);
         CREATE INDEX IF NOT EXISTS idx_url_queue_items_queue ON url_queue_items(queue_id, status);
+        CREATE INDEX IF NOT EXISTS idx_url_queue_items_url ON url_queue_items(url_id, queue_id, status);
+        CREATE INDEX IF NOT EXISTS idx_url_sources_url ON url_sources(url_id);
+        CREATE INDEX IF NOT EXISTS idx_url_sources_queue_type ON url_sources(queue_id, source_type, created_at);
+        CREATE INDEX IF NOT EXISTS idx_url_sources_search_query ON url_sources(search_query_id);
+        CREATE INDEX IF NOT EXISTS idx_ioc_sources_ioc ON ioc_sources(ioc_id);
+        CREATE INDEX IF NOT EXISTS idx_ioc_sources_source_url ON ioc_sources(source_url_id);
         CREATE INDEX IF NOT EXISTS idx_queue_routes_keyword ON queue_routes(keyword_queue_id);
         CREATE INDEX IF NOT EXISTS idx_queue_routes_url ON queue_routes(url_queue_id);
         CREATE INDEX IF NOT EXISTS idx_whitelist_urls_enabled ON whitelist_urls(enabled, url_norm);
@@ -223,6 +253,44 @@ def migrate_job_targets(conn: sqlite3.Connection) -> None:
             """,
             (target_url_id, target_queue_item_id, row["id"]),
         )
+
+
+def migrate_url_bodies(conn: sqlite3.Connection) -> None:
+    if not table_exists(conn, "urls"):
+        return
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS url_bodies (
+          url_id INTEGER PRIMARY KEY REFERENCES urls(id) ON DELETE CASCADE,
+          html TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(urls)")}
+    if "html" not in columns:
+        return
+    conn.execute(
+        """
+        INSERT INTO url_bodies(url_id, html, updated_at)
+        SELECT id, html, CURRENT_TIMESTAMP
+        FROM urls
+        WHERE html IS NOT NULL
+          AND html != ''
+        ON CONFLICT(url_id) DO UPDATE SET
+            html = excluded.html,
+            updated_at = CURRENT_TIMESTAMP
+        """
+    )
+    conn.execute(
+        """
+        UPDATE urls
+        SET html = NULL
+        WHERE html IS NOT NULL
+          AND html != ''
+        """
+    )
 
 
 def migrate_domain_tables_into_urls(conn: sqlite3.Connection) -> None:
@@ -477,6 +545,15 @@ def recover_interrupted_jobs(conn: sqlite3.Connection) -> None:
             error = COALESCE(error, 'Recovered after interrupted process.'),
             started_at = NULL
         WHERE status = 'running'
+        """
+    )
+    conn.execute(
+        """
+        UPDATE queues
+        SET status = 'paused',
+            stopped_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'stopping'
         """
     )
 
@@ -838,6 +915,8 @@ CREATE TABLE IF NOT EXISTS queues (
   name TEXT NOT NULL,
   queue_type TEXT NOT NULL CHECK(queue_type IN ('keyword_search', 'url_crawl')),
   status TEXT NOT NULL DEFAULT 'draft',
+  max_concurrent_jobs INTEGER NOT NULL DEFAULT 1,
+  active_max_concurrent_jobs INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   started_at TEXT,
@@ -939,6 +1018,16 @@ CREATE TABLE IF NOT EXISTS whitelist_urls (
   match_value TEXT,
   note TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
+  matched_url_count INTEGER NOT NULL DEFAULT 0,
+  queue_item_count INTEGER NOT NULL DEFAULT 0,
+  counts_updated_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS url_bodies (
+  url_id INTEGER PRIMARY KEY REFERENCES urls(id) ON DELETE CASCADE,
+  html TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

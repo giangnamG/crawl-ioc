@@ -47,6 +47,7 @@
           <col class="queue-col-number">
           <col class="queue-col-number">
           <col class="queue-col-number">
+          <col class="queue-col-number">
           <col class="queue-col-actions">
         </colgroup>
         <thead>
@@ -56,6 +57,7 @@
             <th>Type</th>
             <th>Output URL Queue</th>
             <th>Status</th>
+            <th class="queue-cell-number" title="Max concurrent jobs for this queue">Max</th>
             <th class="queue-cell-number">Items</th>
             <th class="queue-cell-number" title="Total URLs">URLs</th>
             <th class="queue-cell-number" title="Crawling URLs">Crawl</th>
@@ -89,6 +91,7 @@
                 {% endif %}
               </td>
               <td><span class="badge {{ row.status }}">{{ row.status|status_label }}</span></td>
+              <td class="queue-cell-number" title="Configured: {{ row.max_concurrent_jobs or 1 }} · Active: {{ row.active_max_concurrent_jobs or 1 }}">{{ row.max_concurrent_jobs if row.queue_type == "url_crawl" else "-" }}</td>
               <td class="queue-cell-number">{{ row.search_query_count if row.queue_type == "keyword_search" else row.url_item_count }}</td>
               <td class="queue-cell-number">{{ row.queue_url_total if row.queue_type == "url_crawl" else "-" }}</td>
               <td class="queue-cell-number">{{ row.queue_url_crawling if row.queue_type == "url_crawl" else "-" }}</td>
@@ -105,6 +108,8 @@
                     <form method="post" action="{{ url_for('stop_queue', queue_id=row.id) }}">
                       <button class="button small" type="submit">Stop</button>
                     </form>
+                  {% elif row.status == "stopping" %}
+                    <button class="button small" type="button" disabled>Stopping</button>
                   {% elif row.status == "paused" %}
                     <form method="post" action="{{ url_for('resume_queue', queue_id=row.id) }}">
                       <button class="button small primary" type="submit">Resume</button>
@@ -126,7 +131,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="16" class="empty">No queues yet.</td></tr>
+            <tr><td colspan="17" class="empty">No queues yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>

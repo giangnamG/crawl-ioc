@@ -27,6 +27,8 @@
           <form method="post" action="{{ url_for('stop_queue', queue_id=selected_queue.id) }}">
             <button class="button small" type="submit">Stop</button>
           </form>
+        {% elif selected_queue.status == "stopping" %}
+          <button class="button small" type="button" disabled>Stopping</button>
         {% elif selected_queue.status == "paused" %}
           <form method="post" action="{{ url_for('resume_queue', queue_id=selected_queue.id) }}">
             <button class="button small primary" type="submit">Resume</button>
@@ -40,6 +42,32 @@
         {% endif %}
       </div>
     </div>
+
+    {% if selected_queue.queue_type == "url_crawl" %}
+      <div class="queue-settings-bar">
+        <form method="post" class="queue-concurrency-form" action="{{ url_for('queue_detail', queue_id=selected_queue.id) }}">
+          <input type="hidden" name="action" value="update_concurrency">
+          <input type="hidden" name="queue_id" value="{{ selected_queue.id }}">
+          <label>
+            <span>Max Concurrent Jobs</span>
+            <input
+              type="number"
+              name="max_concurrent_jobs"
+              min="1"
+              max="{{ url_crawl_concurrency }}"
+              value="{{ selected_queue.max_concurrent_jobs or 1 }}"
+            >
+          </label>
+          <button class="button small primary" type="submit">Save</button>
+        </form>
+        <span class="muted">
+          Running {{ selected_queue.running_jobs }} / {{ selected_queue.active_max_concurrent_jobs or 1 }} active · configured {{ selected_queue.max_concurrent_jobs or 1 }} · global cap {{ url_crawl_concurrency }}
+          {% if selected_queue.status in ["running", "stopping"] and (selected_queue.active_max_concurrent_jobs or 1) != (selected_queue.max_concurrent_jobs or 1) %}
+            · applies after Stop + Resume
+          {% endif %}
+        </span>
+      </div>
+    {% endif %}
 
     {% if selected_queue.queue_type == "keyword_search" %}
       <div class="route-note">

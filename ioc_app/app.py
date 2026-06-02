@@ -150,26 +150,23 @@ def create_app(start_worker: bool = False) -> Flask:
                     ignored_urls += cleanup["ignored_urls"]
                     removed_items += cleanup["removed_items"]
                     removed_jobs += cleanup["removed_jobs"]
+                    row = conn.execute(
+                        "SELECT id FROM whitelist_urls WHERE url_norm = ?",
+                        (whitelist_entry["url_norm"],),
+                    ).fetchone()
+                    if row:
+                        refresh_whitelist_counts(conn, int(row["id"]))
+                refresh_whitelist_counts(conn)
                 flash(
                     f"Whitelist updated. Added/updated {added} URLs, skipped {skipped}. Ignored {ignored_urls} existing URL rows, removed {removed_items} queue items and {removed_jobs} jobs.",
                     "success" if added or ignored_urls or removed_items else "error",
                 )
                 return redirect(url_for("whitelist"))
 
+            refresh_stale_whitelist_counts(conn)
             rows = conn.execute(
-                f"""
-                SELECT wu.*,
-                       (
-                         SELECT COUNT(*)
-                         FROM urls u
-                         WHERE {whitelist_match_sql('u.url_norm', 'wu')}
-                       ) AS matched_url_count,
-                       (
-                         SELECT COUNT(DISTINCT qi.id)
-                         FROM url_queue_items qi
-                         JOIN urls u ON u.id = qi.url_id
-                         WHERE {whitelist_match_sql('u.url_norm', 'wu')}
-                       ) AS queue_item_count
+                """
+                SELECT wu.*
                 FROM whitelist_urls wu
                 ORDER BY wu.enabled DESC, wu.id DESC
                 LIMIT 500
@@ -215,6 +212,36 @@ def create_app(start_worker: bool = False) -> Flask:
             flash(
                 f"Added {added} URL/domain targets and requeued {requeued} existing targets in queue '{queue['name']}'. Skipped {skipped}. Start the queue when ready.",
                 "success" if added or requeued else "error",
+            )
+            return redirect(url_for("queue_detail", queue_id=queue_id))
+
+        if action == "update_concurrency":
+            queue_id = request.form.get("queue_id", type=int) or default_queue_id
+            queue = get_queue(conn, queue_id, "url_crawl")
+            if not queue:
+                flash("URL queue is required.", "error")
+                return redirect(url_for("queues"))
+            requested = request.form.get("max_concurrent_jobs", type=int) or 1
+            max_allowed = url_crawl_concurrency()
+            max_concurrent_jobs = min(max_allowed, max(1, requested))
+            conn.execute(
+                """
+                UPDATE queues
+                SET max_concurrent_jobs = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (max_concurrent_jobs, queue_id),
+            )
+            applies_on_resume = queue["status"] in {"running", "stopping"}
+            flash(
+                (
+                    f"Saved queue '{queue['name']}' concurrency as {max_concurrent_jobs} job(s). "
+                    "Stop the queue and Resume to apply it."
+                    if applies_on_resume
+                    else f"Saved queue '{queue['name']}' concurrency as {max_concurrent_jobs} job(s). It will apply on Start/Resume."
+                ),
+                "success",
             )
             return redirect(url_for("queue_detail", queue_id=queue_id))
 
@@ -342,6 +369,7 @@ def create_app(start_worker: bool = False) -> Flask:
             selected_crawling_urls=selected_crawling_urls,
             selected_keyword_search_status=selected_keyword_search_status,
             selected_keyword_search_results=selected_keyword_search_results,
+            url_crawl_concurrency=url_crawl_concurrency(),
         )
 
     @app.get("/api/queues/<int:queue_id>/crawling-urls")
@@ -399,6 +427,19 @@ def create_app(start_worker: bool = False) -> Flask:
             if not queue:
                 flash("Queue not found.", "error")
                 return redirect(url_for("queues"))
+            if queue["status"] == "stopping":
+                running_jobs = scalar(
+                    conn,
+                    "SELECT COUNT(*) FROM jobs WHERE queue_id = ? AND status = 'running'",
+                    (queue_id,),
+                )
+                if running_jobs:
+                    flash(
+                        f"Queue '{queue['name']}' is stopping. Wait for {running_jobs} running job(s) to finish before resuming.",
+                        "error",
+                    )
+                    return redirect(url_for("queue_detail", queue_id=queue_id))
+                refresh_queue_status(conn, queue_id)
             if queue["queue_type"] == "keyword_search" and not get_output_url_queue(conn, queue_id):
                 flash("Bind this Keyword Search Queue to a specific URL Crawl Queue before starting it.", "error")
                 return redirect(url_for("queue_detail", queue_id=queue_id))
@@ -429,11 +470,16 @@ def create_app(start_worker: bool = False) -> Flask:
                 flash("Queue not found.", "error")
                 return redirect(url_for("queues"))
             jobs_paused, items_paused, running_jobs = stop_queue_work(conn, queue_id)
-        suffix = " Running job will finish its current browser session." if running_jobs else ""
-        flash(
-            f"Stopped queue '{queue['name']}'. Paused {jobs_paused} jobs and {items_paused} items.{suffix}",
-            "success",
-        )
+        if running_jobs:
+            flash(
+                f"Stopping queue '{queue['name']}'. Paused {jobs_paused} jobs and {items_paused} items. {running_jobs} running job(s) will finish before the queue becomes paused.",
+                "success",
+            )
+        else:
+            flash(
+                f"Stopped queue '{queue['name']}'. Paused {jobs_paused} jobs and {items_paused} items.",
+                "success",
+            )
         return redirect(url_for("queue_detail", queue_id=queue_id))
 
     @app.post("/queues/<int:queue_id>/resume")
@@ -766,10 +812,27 @@ def create_app(start_worker: bool = False) -> Flask:
         )
         source = request.args.get("source", "")
         q = request.args.get("q", "").strip()
+        page_size = request.args.get("page_size", type=int) or DEFAULT_REVIEW_PAGE_SIZE
         with connect() as conn:
-            urls = list(query_review_urls(conn, url_status, q))
-            if source:
-                urls = [row for row in urls if source_matches(row["sources"] or "", source)]
+            total = count_review_urls(conn, url_status, q, source)
+            pagination = build_pagination(
+                request.args.get("page", type=int),
+                total,
+                page_size,
+                DEFAULT_REVIEW_PAGE_SIZE,
+            )
+            urls = [
+                row
+                for row in query_review_urls(
+                    conn,
+                    url_status,
+                    q,
+                    source,
+                    pagination["page_size"],
+                    pagination["offset"],
+                )
+                if not is_media_asset_url(row["url_norm"])
+            ]
         return render_template(
             "review.html",
             urls=urls,
@@ -777,6 +840,7 @@ def create_app(start_worker: bool = False) -> Flask:
             review_tabs=REVIEW_TABS,
             source=source,
             q=q,
+            pagination=pagination,
         )
 
     @app.post("/urls/<int:url_id>/approve")
@@ -828,7 +892,22 @@ def create_app(start_worker: bool = False) -> Flask:
         with connect() as conn:
             rows = conn.execute(
                 """
-                SELECT * FROM urls
+                SELECT id,
+                       url_raw,
+                       url_norm,
+                       domain,
+                       first_source,
+                       review_status,
+                       crawl_status,
+                       final_url,
+                       status_code,
+                       content_type,
+                       content_length,
+                       fetch_method,
+                       crawl_error,
+                       crawled_at,
+                       created_at
+                FROM urls
                 WHERE review_status = 'approved' OR crawl_status != 'not_crawled'
                 ORDER BY crawled_at DESC, id DESC
                 LIMIT 300
@@ -890,8 +969,16 @@ def create_app(start_worker: bool = False) -> Flask:
         selected_id = request.args.get("ioc_id", type=int)
         ioc_type = request.args.get("type", "")
         q = request.args.get("q", "").strip()
+        page_size = request.args.get("page_size", type=int) or DEFAULT_IOC_PAGE_SIZE
         with connect() as conn:
-            rows = query_iocs(conn, ioc_type, q)
+            total = count_iocs(conn, ioc_type, q)
+            pagination = build_pagination(
+                request.args.get("page", type=int),
+                total,
+                page_size,
+                DEFAULT_IOC_PAGE_SIZE,
+            )
+            rows = query_iocs(conn, ioc_type, q, pagination["page_size"], pagination["offset"])
             sources = []
             selected = None
             if selected_id:
@@ -914,6 +1001,7 @@ def create_app(start_worker: bool = False) -> Flask:
             sources=sources,
             ioc_type=ioc_type,
             q=q,
+            pagination=pagination,
         )
 
     @app.post("/iocs/<int:ioc_id>/delete")
@@ -930,7 +1018,12 @@ def create_app(start_worker: bool = False) -> Flask:
             f"Deleted IOC #{ioc_id} and {source_count} evidence rows. Source URLs were kept.",
             "success",
         )
-        return redirect(url_for("iocs", type=request.form.get("type", ""), q=request.form.get("q", "")))
+        return redirect(url_for(
+            "iocs",
+            type=request.form.get("type", ""),
+            q=request.form.get("q", ""),
+            page=request.form.get("page", type=int) or 1,
+        ))
 
     @app.post("/iocs/bulk-delete")
     def bulk_delete_iocs():
@@ -958,7 +1051,12 @@ def create_app(start_worker: bool = False) -> Flask:
             f"Deleted {existing_count} selected IOCs and {source_count} evidence rows. Source URLs were kept.",
             "success",
         )
-        return redirect(url_for("iocs", type=request.form.get("type", ""), q=request.form.get("q", "")))
+        return redirect(url_for(
+            "iocs",
+            type=request.form.get("type", ""),
+            q=request.form.get("q", ""),
+            page=request.form.get("page", type=int) or 1,
+        ))
 
     if start_worker:
         start_background_worker(app)
@@ -986,6 +1084,9 @@ REVIEW_TABS = [
 ]
 
 REVIEW_STATUS_VALUES = {item["value"] for item in REVIEW_TABS}
+DEFAULT_REVIEW_PAGE_SIZE = 100
+DEFAULT_IOC_PAGE_SIZE = 100
+MAX_PAGE_SIZE = 250
 
 
 def scalar(conn, sql: str, params: tuple[object, ...] = ()) -> int:
@@ -994,6 +1095,29 @@ def scalar(conn, sql: str, params: tuple[object, ...] = ()) -> int:
 
 def normalize_review_status(value: str | None) -> str:
     return value if value in REVIEW_STATUS_VALUES else "pending_review"
+
+
+def build_pagination(
+    requested_page: int | None,
+    total_rows: int,
+    requested_page_size: int | None,
+    default_page_size: int,
+) -> dict[str, int | bool]:
+    page_size = requested_page_size or default_page_size
+    page_size = min(MAX_PAGE_SIZE, max(1, page_size))
+    total_pages = max(1, (max(0, total_rows) + page_size - 1) // page_size)
+    page = min(total_pages, max(1, requested_page or 1))
+    return {
+        "page": page,
+        "page_size": page_size,
+        "offset": (page - 1) * page_size,
+        "total": max(0, total_rows),
+        "total_pages": total_pages,
+        "has_prev": page > 1,
+        "has_next": page < total_pages,
+        "prev_page": max(1, page - 1),
+        "next_page": min(total_pages, page + 1),
+    }
 
 
 def parse_lines(value: str) -> list[str]:
@@ -1047,6 +1171,69 @@ def normalize_whitelist_entry(value: str) -> dict[str, str] | None:
         "match_type": match_type,
         "match_value": match_value,
     }
+
+
+def refresh_stale_whitelist_counts(conn) -> int:
+    stale_rows = conn.execute(
+        """
+        SELECT id
+        FROM whitelist_urls
+        WHERE counts_updated_at IS NULL
+        """
+    ).fetchall()
+    refreshed = 0
+    for row in stale_rows:
+        refresh_whitelist_counts(conn, int(row["id"]))
+        refreshed += 1
+    return refreshed
+
+
+def refresh_whitelist_counts(conn, whitelist_id: int | None = None) -> int:
+    where_sql = "WHERE id = ?" if whitelist_id else ""
+    params = (whitelist_id,) if whitelist_id else ()
+    rows = conn.execute(
+        f"""
+        SELECT id
+        FROM whitelist_urls
+        {where_sql}
+        ORDER BY id
+        """,
+        params,
+    ).fetchall()
+    for row in rows:
+        item_id = int(row["id"])
+        matched_url_count = scalar(
+            conn,
+            f"""
+            SELECT COUNT(*)
+            FROM urls u
+            JOIN whitelist_urls wu ON wu.id = ?
+            WHERE {whitelist_match_sql('u.url_norm', 'wu')}
+            """,
+            (item_id,),
+        )
+        queue_item_count = scalar(
+            conn,
+            f"""
+            SELECT COUNT(DISTINCT qi.id)
+            FROM url_queue_items qi
+            JOIN urls u ON u.id = qi.url_id
+            JOIN whitelist_urls wu ON wu.id = ?
+            WHERE {whitelist_match_sql('u.url_norm', 'wu')}
+            """,
+            (item_id,),
+        )
+        conn.execute(
+            """
+            UPDATE whitelist_urls
+            SET matched_url_count = ?,
+                queue_item_count = ?,
+                counts_updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (matched_url_count, queue_item_count, item_id),
+        )
+    return len(rows)
 
 
 def upsert_keyword(conn, text: str) -> int:
@@ -1540,44 +1727,67 @@ def query_queues(conn, queue_id: int | None = None):
     params = (queue_id,) if queue_id else ()
     return conn.execute(
         f"""
+        WITH job_stats AS (
+          SELECT queue_id,
+                 COUNT(*) AS job_count,
+                 SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_jobs,
+                 SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running_jobs,
+                 SUM(CASE WHEN status = 'paused' THEN 1 ELSE 0 END) AS paused_jobs,
+                 SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done_jobs,
+                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_jobs
+          FROM jobs
+          GROUP BY queue_id
+        ),
+        search_item_stats AS (
+          SELECT queue_id,
+                 COUNT(*) AS search_query_count
+          FROM search_queue_items
+          GROUP BY queue_id
+        ),
+        url_item_stats AS (
+          SELECT uqi.queue_id,
+                 COUNT(*) AS url_item_count,
+                 COUNT(queue_url.id) AS queue_url_total,
+                 SUM(CASE
+                   WHEN queue_url.crawl_status = 'crawling' OR uqi.status = 'running'
+                   THEN 1 ELSE 0
+                 END) AS queue_url_crawling,
+                 SUM(CASE
+                   WHEN uqi.status IN ('pending_review', 'pending', 'paused')
+                    AND queue_url.review_status != 'rejected'
+                    AND queue_url.crawl_status NOT IN ('crawled', 'metadata_only')
+                   THEN 1 ELSE 0
+                 END) AS queue_url_pending,
+                 SUM(CASE
+                   WHEN queue_url.review_status = 'rejected'
+                   THEN 1 ELSE 0
+                 END) AS queue_url_rejected
+          FROM url_queue_items uqi
+          JOIN urls queue_url ON queue_url.id = uqi.url_id
+          GROUP BY uqi.queue_id
+        )
         SELECT q.*,
-               COUNT(DISTINCT j.id) AS job_count,
-               COUNT(DISTINCT CASE WHEN j.status = 'pending' THEN j.id END) AS pending_jobs,
-               COUNT(DISTINCT CASE WHEN j.status = 'running' THEN j.id END) AS running_jobs,
-               COUNT(DISTINCT CASE WHEN j.status = 'paused' THEN j.id END) AS paused_jobs,
-               COUNT(DISTINCT CASE WHEN j.status = 'done' THEN j.id END) AS done_jobs,
-               COUNT(DISTINCT CASE WHEN j.status = 'failed' THEN j.id END) AS failed_jobs,
-               COUNT(DISTINCT sqi.id) AS search_query_count,
-               COUNT(DISTINCT uqi.id) AS url_item_count,
-               COUNT(DISTINCT CASE WHEN q.queue_type = 'url_crawl' THEN queue_url.id END) AS queue_url_total,
-               COUNT(DISTINCT CASE
-                 WHEN q.queue_type = 'url_crawl'
-                  AND (queue_url.crawl_status = 'crawling' OR uqi.status = 'running')
-                 THEN queue_url.id
-               END) AS queue_url_crawling,
-               COUNT(DISTINCT CASE
-                 WHEN q.queue_type = 'url_crawl'
-                  AND uqi.status IN ('pending_review', 'pending', 'paused')
-                  AND queue_url.review_status != 'rejected'
-                  AND queue_url.crawl_status NOT IN ('crawled', 'metadata_only')
-                 THEN queue_url.id
-               END) AS queue_url_pending,
-               COUNT(DISTINCT CASE
-                 WHEN q.queue_type = 'url_crawl'
-                  AND queue_url.review_status = 'rejected'
-                 THEN queue_url.id
-               END) AS queue_url_rejected,
+               COALESCE(js.job_count, 0) AS job_count,
+               COALESCE(js.pending_jobs, 0) AS pending_jobs,
+               COALESCE(js.running_jobs, 0) AS running_jobs,
+               COALESCE(js.paused_jobs, 0) AS paused_jobs,
+               COALESCE(js.done_jobs, 0) AS done_jobs,
+               COALESCE(js.failed_jobs, 0) AS failed_jobs,
+               COALESCE(sis.search_query_count, 0) AS search_query_count,
+               COALESCE(uis.url_item_count, 0) AS url_item_count,
+               COALESCE(uis.queue_url_total, 0) AS queue_url_total,
+               COALESCE(uis.queue_url_crawling, 0) AS queue_url_crawling,
+               COALESCE(uis.queue_url_pending, 0) AS queue_url_pending,
+               COALESCE(uis.queue_url_rejected, 0) AS queue_url_rejected,
                qr.url_queue_id AS output_url_queue_id,
                uq.name AS output_url_queue_name
         FROM queues q
-        LEFT JOIN jobs j ON j.queue_id = q.id
-        LEFT JOIN search_queue_items sqi ON sqi.queue_id = q.id
-        LEFT JOIN url_queue_items uqi ON uqi.queue_id = q.id
-        LEFT JOIN urls queue_url ON queue_url.id = uqi.url_id
+        LEFT JOIN job_stats js ON js.queue_id = q.id
+        LEFT JOIN search_item_stats sis ON sis.queue_id = q.id
+        LEFT JOIN url_item_stats uis ON uis.queue_id = q.id
         LEFT JOIN queue_routes qr ON qr.keyword_queue_id = q.id
         LEFT JOIN queues uq ON uq.id = qr.url_queue_id
         {where_sql}
-        GROUP BY q.id
         ORDER BY q.id DESC
         LIMIT 200
         """,
@@ -1729,7 +1939,7 @@ def query_keyword_search_results(conn, queue_id: int):
     ).fetchall()
 
 
-def query_iocs(conn, ioc_type: str, q: str):
+def build_ioc_filters(ioc_type: str, q: str) -> tuple[str, list[object]]:
     params: list[object] = []
     where = []
     if ioc_type:
@@ -1760,6 +1970,24 @@ def query_iocs(conn, ioc_type: str, q: str):
         )
         params.extend([like, like, like, like, like, like])
     where_sql = "WHERE " + " AND ".join(where) if where else ""
+    return where_sql, params
+
+
+def count_iocs(conn, ioc_type: str, q: str) -> int:
+    where_sql, params = build_ioc_filters(ioc_type, q)
+    return scalar(
+        conn,
+        f"""
+        SELECT COUNT(*)
+        FROM iocs i
+        {where_sql}
+        """,
+        tuple(params),
+    )
+
+
+def query_iocs(conn, ioc_type: str, q: str, limit: int = DEFAULT_IOC_PAGE_SIZE, offset: int = 0):
+    where_sql, params = build_ioc_filters(ioc_type, q)
     return conn.execute(
         f"""
         SELECT i.*,
@@ -1774,10 +2002,29 @@ def query_iocs(conn, ioc_type: str, q: str):
         {where_sql}
         GROUP BY i.id
         ORDER BY i.id DESC
-        LIMIT 500
+        LIMIT ? OFFSET ?
         """,
-        params,
+        (*params, limit, offset),
     ).fetchall()
+
+
+def activate_queue_concurrency(conn, queue_id: int) -> int:
+    queue = conn.execute(
+        "SELECT max_concurrent_jobs FROM queues WHERE id = ?",
+        (queue_id,),
+    ).fetchone()
+    configured = int(queue["max_concurrent_jobs"] or 1) if queue else 1
+    active = min(url_crawl_concurrency(), max(1, configured))
+    conn.execute(
+        """
+        UPDATE queues
+        SET active_max_concurrent_jobs = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (active, queue_id),
+    )
+    return active
 
 
 def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
@@ -1870,16 +2117,18 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
                 initial_status="pending",
             )
     else:
+        active_max_concurrent_jobs = activate_queue_concurrency(conn, queue_id)
         conn.execute(
             """
             UPDATE queues
             SET status = 'running',
+                active_max_concurrent_jobs = ?,
                 started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
                 stopped_at = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (queue_id,),
+            (active_max_concurrent_jobs, queue_id),
         )
         url_count = conn.execute(
             """
@@ -1941,6 +2190,16 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
 
 
 def stop_queue_work(conn, queue_id: int) -> tuple[int, int, int]:
+    conn.execute(
+        """
+        UPDATE queues
+        SET status = 'stopping',
+            stopped_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (queue_id,),
+    )
     running_jobs = scalar(
         conn,
         "SELECT COUNT(*) FROM jobs WHERE queue_id = ? AND status = 'running'",
@@ -1959,22 +2218,49 @@ def stop_queue_work(conn, queue_id: int) -> tuple[int, int, int]:
         (queue_id,),
     ).rowcount
     query_count = conn.execute(
-        "UPDATE search_queue_items SET status = 'paused' WHERE queue_id = ? AND status = 'pending'",
+        """
+        UPDATE search_queue_items
+        SET status = 'paused'
+        WHERE queue_id = ?
+          AND status = 'pending'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM jobs j
+            WHERE j.queue_id = search_queue_items.queue_id
+              AND j.type = 'search_query'
+              AND j.status = 'running'
+              AND j.dedupe_key = 'queue:' || search_queue_items.queue_id || ':search:' || search_queue_items.search_query_id
+          )
+        """,
         (queue_id,),
     ).rowcount
     url_count = conn.execute(
-        "UPDATE url_queue_items SET status = 'paused' WHERE queue_id = ? AND status = 'pending'",
+        """
+        UPDATE url_queue_items
+        SET status = 'paused'
+        WHERE queue_id = ?
+          AND status = 'pending'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM jobs j
+            WHERE j.queue_id = url_queue_items.queue_id
+              AND j.type = 'crawl_url'
+              AND j.status = 'running'
+              AND j.target_queue_item_id = url_queue_items.id
+          )
+        """,
         (queue_id,),
     ).rowcount
+    next_status = "stopping" if running_jobs else "paused"
     conn.execute(
         """
         UPDATE queues
-        SET status = 'paused',
-            stopped_at = CURRENT_TIMESTAMP,
+        SET status = ?,
+            stopped_at = CASE WHEN ? = 'paused' THEN CURRENT_TIMESTAMP ELSE NULL END,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        (queue_id,),
+        (next_status, next_status, queue_id),
     )
     return max(jobs_paused, 0), max(query_count, 0) + max(url_count, 0), running_jobs
 
@@ -2001,6 +2287,7 @@ def reset_url_for_manual_rerun(conn, url_id: int) -> None:
         """,
         (url_id,),
     )
+    conn.execute("DELETE FROM url_bodies WHERE url_id = ?", (url_id,))
 
 
 def requeue_url_queue_item(conn, queue_id: int, url_id: int, queue_item_id: int) -> bool:
@@ -2496,7 +2783,7 @@ def read_rule_form() -> dict[str, object]:
     }
 
 
-def query_review_urls(conn, status: str, q: str):
+def build_review_url_filters(status: str, q: str, source: str) -> tuple[str, list[object]]:
     params: list[object] = []
     where = []
     if status:
@@ -2504,23 +2791,77 @@ def query_review_urls(conn, status: str, q: str):
         params.append(status)
     where.append("u.crawl_status NOT IN ('crawled', 'metadata_only')")
     where.append("u.review_status != 'ignored_whitelist'")
-    where.append(
-        f"""
-        NOT EXISTS (
-          SELECT 1
-          FROM whitelist_urls wu
-          WHERE wu.enabled = 1
-            AND {whitelist_match_sql('u.url_norm', 'wu')}
-        )
-        """
-    )
     if q:
         where.append("(u.url_norm LIKE ? OR u.domain LIKE ?)")
         params.extend([f"%{q}%", f"%{q}%"])
+    if source == "both":
+        for source_type in ("google_search", "extracted_from_crawl"):
+            where.append(
+                """
+                EXISTS (
+                  SELECT 1
+                  FROM url_sources source_filter
+                  WHERE source_filter.url_id = u.id
+                    AND source_filter.source_type = ?
+                )
+                """
+            )
+            params.append(source_type)
+    elif source in {"google_search", "extracted_from_crawl"}:
+        where.append(
+            """
+            EXISTS (
+              SELECT 1
+              FROM url_sources source_filter
+              WHERE source_filter.url_id = u.id
+                AND source_filter.source_type = ?
+            )
+            """
+        )
+        params.append(source)
     where_sql = "WHERE " + " AND ".join(where) if where else ""
+    return where_sql, params
+
+
+def count_review_urls(conn, status: str, q: str, source: str) -> int:
+    where_sql, params = build_review_url_filters(status, q, source)
+    return scalar(
+        conn,
+        f"""
+        SELECT COUNT(*)
+        FROM urls u
+        {where_sql}
+        """,
+        tuple(params),
+    )
+
+
+def query_review_urls(
+    conn,
+    status: str,
+    q: str,
+    source: str = "",
+    limit: int = DEFAULT_REVIEW_PAGE_SIZE,
+    offset: int = 0,
+):
+    where_sql, params = build_review_url_filters(status, q, source)
     rows = conn.execute(
         f"""
-        SELECT u.*,
+        SELECT u.id,
+               u.url_raw,
+               u.url_norm,
+               u.domain,
+               u.first_source,
+               u.review_status,
+               u.crawl_status,
+               u.final_url,
+               u.status_code,
+               u.content_type,
+               u.content_length,
+               u.fetch_method,
+               u.crawl_error,
+               u.crawled_at,
+               u.created_at,
                GROUP_CONCAT(DISTINCT us.source_type) AS sources,
                GROUP_CONCAT(DISTINCT sq.query_text) AS queries,
                MIN(us.title) AS title,
@@ -2531,11 +2872,11 @@ def query_review_urls(conn, status: str, q: str):
         {where_sql}
         GROUP BY u.id
         ORDER BY u.created_at DESC
-        LIMIT 2000
+        LIMIT ? OFFSET ?
         """,
-        params,
+        (*params, limit, offset),
     ).fetchall()
-    return [row for row in rows if not is_media_asset_url(row["url_norm"])][:500]
+    return rows
 
 
 def source_matches(sources: str, wanted: str) -> bool:

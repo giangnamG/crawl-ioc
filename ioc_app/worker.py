@@ -236,6 +236,18 @@ def claim_next_job(
                       AND running.status = 'running'
                   ) < ?
                   AND (
+                    j.queue_id IS NULL
+                    OR (
+                      (
+                        SELECT COUNT(*)
+                        FROM jobs queue_running
+                        WHERE queue_running.type = 'crawl_url'
+                          AND queue_running.status = 'running'
+                          AND queue_running.queue_id = j.queue_id
+                      ) < COALESCE(q.active_max_concurrent_jobs, q.max_concurrent_jobs, 1)
+                    )
+                  )
+                  AND (
                     j.target_url_id IS NULL
                     OR NOT EXISTS (
                       SELECT 1
@@ -247,7 +259,18 @@ def claim_next_job(
                   )
                 )
               )
-            ORDER BY j.id
+            ORDER BY
+              CASE
+                WHEN j.type = 'crawl_url' AND j.queue_id IS NOT NULL THEN (
+                  SELECT COUNT(*)
+                  FROM jobs queue_running
+                  WHERE queue_running.type = 'crawl_url'
+                    AND queue_running.status = 'running'
+                    AND queue_running.queue_id = j.queue_id
+                )
+                ELSE 0
+              END,
+              j.id
             LIMIT 1
             """,
             (*params, url_crawl_concurrency()),
@@ -351,7 +374,19 @@ def validate_search_job_payload(conn: Connection, job: dict[str, object], payloa
     ).fetchone()
     if not row:
         raise ValueError("Search job payload does not match its keyword queue item.")
-    if row["queue_status"] != "running" or row["status"] not in {"pending", "running"}:
+    current_job = conn.execute(
+        "SELECT status FROM jobs WHERE id = ?",
+        (job["id"],),
+    ).fetchone()
+    queue_allows_claimed_job = (
+        row["queue_status"] == "running"
+        or (
+            row["queue_status"] == "stopping"
+            and current_job
+            and current_job["status"] == "running"
+        )
+    )
+    if not queue_allows_claimed_job or row["status"] not in {"pending", "running"}:
         raise PausedJob("Search queue item is not runnable.")
 
     output_url_queue_id = payload.get("output_url_queue_id") or row["output_url_queue_id"]
@@ -404,7 +439,19 @@ def validate_crawl_job_payload(conn: Connection, job: dict[str, object], payload
     ).fetchone()
     if not row:
         raise ValueError("Crawl job payload does not match its URL queue item.")
-    if row["queue_status"] != "running" or row["status"] not in {"pending", "running"}:
+    current_job = conn.execute(
+        "SELECT status FROM jobs WHERE id = ?",
+        (job["id"],),
+    ).fetchone()
+    queue_allows_claimed_job = (
+        row["queue_status"] == "running"
+        or (
+            row["queue_status"] == "stopping"
+            and current_job
+            and current_job["status"] == "running"
+        )
+    )
+    if not queue_allows_claimed_job or row["status"] not in {"pending", "running"}:
         raise PausedJob("URL queue item is not runnable.")
     if row["review_status"] != "approved":
         conn.execute("UPDATE url_queue_items SET status = 'pending_review' WHERE id = ?", (item_id,))
@@ -861,7 +908,7 @@ def process_search_query(
     if effective_queue_id and effective_queue_id != search_query["queue_id"]:
         queue = conn.execute("SELECT status FROM queues WHERE id = ?", (effective_queue_id,)).fetchone()
         queue_status = queue["status"] if queue else None
-    if effective_queue_id and queue_status != "running":
+    if effective_queue_id and queue_status not in {"running", "stopping"}:
         conn.execute(
             "UPDATE search_queries SET status = 'paused' WHERE id = ?",
             (search_query_id,),
@@ -1124,7 +1171,6 @@ def process_crawl_url(
             content_length = ?,
             fetch_method = ?,
             crawl_error = ?,
-            html = ?,
             crawled_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
@@ -1136,10 +1182,22 @@ def process_crawl_url(
             result.content_length,
             result.fetch_method,
             result.error,
-            result.html if result.is_text else "",
             url_id,
         ),
     )
+    if result.is_text:
+        conn.execute(
+            """
+            INSERT INTO url_bodies(url_id, html, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(url_id) DO UPDATE SET
+                html = excluded.html,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (url_id, result.html),
+        )
+    else:
+        conn.execute("DELETE FROM url_bodies WHERE url_id = ?", (url_id,))
 
     if not result.is_text:
         return
@@ -1700,20 +1758,28 @@ def refresh_queue_status(conn: Connection, queue_id: int) -> None:
         (queue_id,),
     ).fetchone()
 
-    if not counts or not counts["total"]:
+    running_count = int(counts["running_count"] or 0) if counts else 0
+    pending_count = int(counts["pending_count"] or 0) if counts else 0
+    paused_count = int(counts["paused_count"] or 0) if counts else 0
+    failed_count = int(counts["failed_count"] or 0) if counts else 0
+    done_count = int(counts["done_count"] or 0) if counts else 0
+
+    if queue["status"] == "stopping":
+        next_status = "stopping" if running_count else "paused"
+    elif not counts or not counts["total"]:
         next_status = "draft"
-    elif counts["running_count"] or counts["pending_count"]:
+    elif running_count or pending_count:
         next_status = "running"
     elif (
-        counts["paused_count"]
-        and not counts["failed_count"]
-        and not counts["done_count"]
+        paused_count
+        and not failed_count
+        and not done_count
         and not queue["started_at"]
     ):
         next_status = "draft"
-    elif counts["paused_count"]:
+    elif paused_count:
         next_status = "paused"
-    elif counts["failed_count"]:
+    elif failed_count:
         next_status = "failed"
     else:
         next_status = "done"
