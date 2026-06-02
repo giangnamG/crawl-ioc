@@ -1,9 +1,6 @@
-__pycache__/
-*.py[cod]
-
-.venv/
-venv/
-env/
+.git
+.gitignore
+.dockerignore
 
 .env
 .env.*
@@ -12,13 +9,18 @@ deploy/.env
 deploy/.env.*
 deploy/nginx/.htpasswd-*
 
-data/
+__pycache__/
+*.py[cod]
+
+.venv/
+venv/
+env/
 .vscode/
 
+data/
 *.sqlite3
 *.sqlite3-*
 *.db
 *.log
 
-*.txt
-!requirements.txt
+plan/

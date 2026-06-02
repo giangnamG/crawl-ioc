@@ -26,10 +26,19 @@ def env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def app_environment() -> str:
+    return (os.environ.get("APP_ENV") or os.environ.get("FLASK_ENV") or "development").strip().lower()
+
+
+def app_debug_enabled() -> bool:
+    return env_bool("FLASK_DEBUG", app_environment() != "production")
+
+
 load_dotenv()
 os.environ.setdefault("FLASK_SKIP_DOTENV", "1")
 app = create_app(start_worker=env_bool("AUTO_WORKER_ENABLED", True))
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    debug = app_debug_enabled()
+    app.run(host="0.0.0.0", port=5000, debug=debug, use_reloader=debug)

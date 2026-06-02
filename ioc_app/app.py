@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
 
-from .db import connect, db_path, init_db, is_url_whitelisted, whitelist_match_sql
+from .db import connect, database_label, init_db, is_url_whitelisted, whitelist_match_sql
 from .extractor import test_rule, validate_rule
 from .normalizers import get_domain, is_media_asset_url, normalize_url
 from .worker import (
@@ -28,9 +28,22 @@ from .worker import (
 )
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def app_environment() -> str:
+    return (os.environ.get("APP_ENV") or os.environ.get("FLASK_ENV") or "development").strip().lower()
+
+
 def create_app(start_worker: bool = False) -> Flask:
     app = Flask(__name__)
-    app.config["SECRET_KEY"] = "local-dev-secret"
+    production = app_environment() == "production"
+    app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "local-dev-secret")
+    app.config["DEBUG"] = env_bool("FLASK_DEBUG", not production)
     app.config["AUTO_WORKER_ENABLED"] = start_worker
     init_db()
 
@@ -38,7 +51,7 @@ def create_app(start_worker: bool = False) -> Flask:
     def inject_globals() -> dict[str, object]:
         return {
             "auto_worker_enabled": app.config.get("AUTO_WORKER_ENABLED", False),
-            "db_path": str(db_path()),
+            "database_label": database_label(),
             "nav": NAV,
         }
 
@@ -687,7 +700,7 @@ def create_app(start_worker: bool = False) -> Flask:
                 action = request.form.get("action")
                 name = request.form.get("name", "").strip()
                 template = request.form.get("template", "").strip()
-                sample = request.form.get("sample_keyword", "").strip() or "88i"
+                sample = request.form.get("sample_keyword", "").strip() or "samplebrand"
 
                 if action == "preview":
                     preview = validate_and_preview_dork(template, sample)

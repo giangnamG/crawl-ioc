@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 import json
 import os
 import re
 import sqlite3
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from typing import Any
 
 from .normalizers import (
     get_domain,
@@ -15,13 +19,62 @@ from .normalizers import (
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = ROOT_DIR / "data" / "ioc_investigator.sqlite3"
+POSTGRES_BACKENDS = {"postgres", "postgresql"}
+SQLITE_BACKENDS = {"sqlite", "sqlite3"}
+TIMESTAMP_COLUMNS = (
+    "created_at",
+    "updated_at",
+    "started_at",
+    "finished_at",
+    "stopped_at",
+    "crawled_at",
+    "heartbeat_at",
+    "counts_updated_at",
+)
 
 
 def db_path() -> Path:
     return Path(os.environ.get("IOC_DB_PATH", DEFAULT_DB_PATH))
 
 
-def connect() -> sqlite3.Connection:
+def db_backend() -> str:
+    explicit = os.environ.get("DB_BACKEND", "").strip().lower()
+    if explicit in POSTGRES_BACKENDS:
+        return "postgresql"
+    if explicit in SQLITE_BACKENDS:
+        return "sqlite"
+
+    database_url = os.environ.get("DATABASE_URL", "").strip().lower()
+    if database_url.startswith(("postgres://", "postgresql://")):
+        return "postgresql"
+    return "sqlite"
+
+
+def is_postgres_backend() -> bool:
+    return db_backend() == "postgresql"
+
+
+def database_label() -> str:
+    if not is_postgres_backend():
+        return str(db_path())
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if database_url:
+        return redact_database_url(database_url)
+    host = os.environ.get("POSTGRES_HOST", "localhost")
+    port = os.environ.get("POSTGRES_PORT", "5432")
+    database = os.environ.get("POSTGRES_DB", "ioc_investigator")
+    user = os.environ.get("POSTGRES_USER", "ioc_app")
+    return f"postgresql://{user}:***@{host}:{port}/{database}"
+
+
+def redact_database_url(database_url: str) -> str:
+    return re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", database_url)
+
+
+def connect() -> sqlite3.Connection | "PostgresConnection":
+    if is_postgres_backend():
+        return connect_postgres()
+
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=float(os.environ.get("SQLITE_BUSY_TIMEOUT", "30")))
@@ -30,6 +83,292 @@ def connect() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 30000")
     return conn
+
+
+def connect_postgres() -> "PostgresConnection":
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise RuntimeError(
+            "PostgreSQL mode requires psycopg. Install requirements.txt or run the production image."
+        ) from exc
+
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    connect_timeout = int(os.environ.get("POSTGRES_CONNECT_TIMEOUT", "30"))
+    if database_url:
+        raw_conn = psycopg.connect(database_url, connect_timeout=connect_timeout)
+    else:
+        raw_conn = psycopg.connect(
+            host=os.environ.get("POSTGRES_HOST", "localhost"),
+            port=int(os.environ.get("POSTGRES_PORT", "5432")),
+            dbname=os.environ.get("POSTGRES_DB", "ioc_investigator"),
+            user=os.environ.get("POSTGRES_USER", "ioc_app"),
+            password=os.environ.get("POSTGRES_PASSWORD", ""),
+            connect_timeout=connect_timeout,
+        )
+    return PostgresConnection(raw_conn)
+
+
+class DbRow(Mapping[str, Any]):
+    def __init__(self, columns: list[str], values: tuple[Any, ...]):
+        self._columns = tuple(columns)
+        self._values = tuple(values)
+        self._data = dict(zip(self._columns, self._values))
+
+    def __getitem__(self, key: str | int) -> Any:
+        if isinstance(key, int):
+            return self._values[key]
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._columns)
+
+    def __len__(self) -> int:
+        return len(self._columns)
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self._data[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def keys(self):
+        return self._data.keys()
+
+
+class PostgresCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.rowcount = cursor.rowcount
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        return self._wrap_row(row)
+
+    def fetchall(self):
+        return [self._wrap_row(row) for row in self._cursor.fetchall()]
+
+    def __iter__(self):
+        for row in self._cursor:
+            yield self._wrap_row(row)
+
+    def _wrap_row(self, row):
+        if self._cursor.description is None:
+            return row
+        columns = [column.name for column in self._cursor.description]
+        return DbRow(columns, tuple(row))
+
+
+class PostgresConnection:
+    driver = "postgresql"
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.total_changes = 0
+
+    def execute(self, sql: str, params: Any = None) -> PostgresCursor:
+        translated_sql, translated_params = translate_postgres_sql(sql, params)
+        cursor = self._conn.cursor()
+        cursor.execute(translated_sql, translated_params)
+        self._record_changes(cursor.rowcount)
+        return PostgresCursor(cursor)
+
+    def executemany(self, sql: str, params_seq) -> PostgresCursor:
+        translated_sql, _ = translate_postgres_sql(sql, None)
+        cursor = self._conn.cursor()
+        cursor.executemany(translated_sql, params_seq)
+        self._record_changes(cursor.rowcount)
+        return PostgresCursor(cursor)
+
+    def executescript(self, script: str) -> None:
+        for statement in split_sql_script(script):
+            if statement.strip():
+                self.execute(statement)
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self) -> "PostgresConnection":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        self.close()
+
+    def _record_changes(self, rowcount: int) -> None:
+        if rowcount and rowcount > 0:
+            self.total_changes += rowcount
+
+
+def is_postgres_connection(conn) -> bool:
+    return getattr(conn, "driver", "") == "postgresql"
+
+
+def translate_postgres_sql(sql: str, params: Any = None) -> tuple[str, Any]:
+    translated = sql
+    translated = re.sub(r"\bBEGIN\s+IMMEDIATE\b", "BEGIN", translated, flags=re.IGNORECASE)
+    translated = translate_postgres_ddl(translated)
+    translated = re.sub(
+        r"datetime\('now'\s*,\s*\?\)",
+        "(CURRENT_TIMESTAMP + ?::interval)",
+        translated,
+        flags=re.IGNORECASE,
+    )
+    translated = re.sub(
+        r"GROUP_CONCAT\(\s*DISTINCT\s+([^)]+?)\s*\)",
+        r"STRING_AGG(DISTINCT \1::text, ',')",
+        translated,
+        flags=re.IGNORECASE,
+    )
+
+    insert_or_ignore = bool(
+        re.search(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", translated, flags=re.IGNORECASE)
+    )
+    translated = re.sub(
+        r"\bINSERT\s+OR\s+IGNORE\s+INTO\b",
+        "INSERT INTO",
+        translated,
+        flags=re.IGNORECASE,
+    )
+    if insert_or_ignore and "ON CONFLICT" not in translated.upper():
+        translated = append_on_conflict_do_nothing(translated)
+
+    if isinstance(params, dict):
+        translated = replace_named_placeholders(translated)
+    else:
+        translated = replace_qmark_placeholders(translated)
+    return translated, params
+
+
+def translate_postgres_ddl(sql: str) -> str:
+    translated = re.sub(
+        r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b",
+        "BIGSERIAL PRIMARY KEY",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    translated = re.sub(
+        r"\b([a-zA-Z_]+_id)\s+INTEGER\b",
+        r"\1 BIGINT",
+        translated,
+        flags=re.IGNORECASE,
+    )
+    for column in TIMESTAMP_COLUMNS:
+        translated = re.sub(
+            rf"\b{column}\s+TEXT\b",
+            f"{column} TIMESTAMPTZ",
+            translated,
+            flags=re.IGNORECASE,
+        )
+    return translated
+
+
+def append_on_conflict_do_nothing(sql: str) -> str:
+    stripped = sql.rstrip()
+    if stripped.endswith(";"):
+        return f"{stripped[:-1]} ON CONFLICT DO NOTHING;"
+    return f"{stripped} ON CONFLICT DO NOTHING"
+
+
+def replace_qmark_placeholders(sql: str) -> str:
+    result: list[str] = []
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(sql):
+        char = sql[index]
+        if char == "'" and not in_double:
+            result.append(char)
+            if in_single and index + 1 < len(sql) and sql[index + 1] == "'":
+                index += 1
+                result.append(sql[index])
+            else:
+                in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+            result.append(char)
+        elif char == "?" and not in_single and not in_double:
+            result.append("%s")
+        else:
+            result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def replace_named_placeholders(sql: str) -> str:
+    result: list[str] = []
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(sql):
+        char = sql[index]
+        if char == "'" and not in_double:
+            result.append(char)
+            if in_single and index + 1 < len(sql) and sql[index + 1] == "'":
+                index += 1
+                result.append(sql[index])
+            else:
+                in_single = not in_single
+            index += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            result.append(char)
+            index += 1
+            continue
+        if char == ":" and not in_single and not in_double:
+            match = re.match(r":([A-Za-z_][A-Za-z0-9_]*)", sql[index:])
+            if match:
+                name = match.group(1)
+                result.append(f"%({name})s")
+                index += len(name) + 1
+                continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def split_sql_script(script: str) -> list[str]:
+    statements: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(script):
+        char = script[index]
+        if char == "'" and not in_double:
+            current.append(char)
+            if in_single and index + 1 < len(script) and script[index + 1] == "'":
+                index += 1
+                current.append(script[index])
+            else:
+                in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+            current.append(char)
+        elif char == ";" and not in_single and not in_double:
+            statement = "".join(current).strip()
+            if statement:
+                statements.append(statement)
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    statement = "".join(current).strip()
+    if statement:
+        statements.append(statement)
+    return statements
 
 
 def whitelist_match_sql(url_expr: str, alias: str = "wu") -> str:
@@ -44,7 +383,7 @@ def whitelist_match_sql(url_expr: str, alias: str = "wu") -> str:
           {url_expr} = {match_value}
           OR substr({url_expr}, 1, length({match_value})) = {match_value}
           OR (
-            substr({match_value}, -1) = '/'
+            substr({match_value}, length({match_value}), 1) = '/'
             AND (
               {url_expr} = substr({match_value}, 1, length({match_value}) - 1)
               OR substr({url_expr}, 1, length({match_value})) =
@@ -207,6 +546,18 @@ def migrate_db(conn: sqlite3.Connection) -> None:
 
 
 def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    if is_postgres_connection(conn):
+        return bool(
+            conn.execute(
+                """
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = ?
+                """,
+                (table,),
+            ).fetchone()
+        )
     return bool(
         conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -218,15 +569,32 @@ def table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     if not table_exists(conn, table):
         return
-    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    existing = table_columns(conn, table)
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if is_postgres_connection(conn):
+        return {
+            row["column_name"]
+            for row in conn.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = ?
+                """,
+                (table,),
+            )
+        }
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
 def migrate_job_targets(conn: sqlite3.Connection) -> None:
     if not table_exists(conn, "jobs"):
         return
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    columns = table_columns(conn, "jobs")
     if {"target_url_id", "target_queue_item_id", "payload", "type"} - columns:
         return
     rows = conn.execute(
@@ -268,7 +636,7 @@ def migrate_url_bodies(conn: sqlite3.Connection) -> None:
         );
         """
     )
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(urls)")}
+    columns = table_columns(conn, "urls")
     if "html" not in columns:
         return
     conn.execute(

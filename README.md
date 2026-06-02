@@ -6,8 +6,8 @@ Stack hiện tại:
 
 ```text
 Backend/UI: Python Flask server-side rendering
-Database: SQLite3
-Queue MVP: bảng jobs trong SQLite
+Database: SQLite3 khi dev local, PostgreSQL khi deploy production
+Queue MVP: bảng jobs trong database hiện tại
 Queue nghiệp vụ: bảng queues, search_queue_items, url_queue_items
 Frontend: Jinja templates + CSS thuần
 ```
@@ -26,6 +26,14 @@ python app.py
 
 `app.py` tự đọc file `.env` nằm cùng cấp với `app.py` trước khi tạo Flask app. Biến đã set sẵn trong shell sẽ được ưu tiên hơn giá trị trong `.env`.
 
+Local dev mặc định dùng SQLite ở `data/ioc_investigator.sqlite3` và chạy Flask với `debug=true`. Để ép production mode:
+
+```powershell
+$env:APP_ENV="production"
+$env:FLASK_DEBUG="0"
+python app.py
+```
+
 `python app.py` mặc định bật background worker. Nếu chỉ muốn mở UI mà không xử lý queue:
 
 ```powershell
@@ -38,6 +46,87 @@ Mở:
 ```text
 http://127.0.0.1:5000
 ```
+
+## Deploy production với Nginx Basic Auth
+
+Production dùng `deploy/docker-compose.yml` để chạy PostgreSQL, backend Flask/Gunicorn và Nginx. Backend chỉ expose nội bộ trong Docker network; Nginx là service duy nhất publish HTTP ra host và bật Basic Auth cho toàn bộ endpoint.
+
+Tạo file env production:
+
+```bash
+cat > deploy/.env <<'EOF'
+POSTGRES_DB=ioc_investigator
+POSTGRES_USER=ioc_app
+POSTGRES_PASSWORD=change-this-postgres-password
+SECRET_KEY=change-this-flask-secret
+HTTP_PORT=80
+AUTO_WORKER_ENABLED=true
+EOF
+```
+
+Tạo Basic Auth user cho Nginx:
+
+```bash
+sudo apt update
+sudo apt install -y apache2-utils
+htpasswd -cB deploy/nginx/.htpasswd-app admin
+```
+
+Build và chạy production stack:
+
+```bash
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml build backend
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d
+```
+
+Các file production chính:
+
+```text
+deploy/Dockerfile.backend
+deploy/docker-compose.yml
+deploy/nginx/app.conf
+```
+
+Trong production, backend được cấu hình:
+
+```text
+APP_ENV=production
+FLASK_DEBUG=0
+DB_BACKEND=postgresql
+POSTGRES_HOST=postgres
+```
+
+Khi không có `DB_BACKEND=postgresql` hoặc `DATABASE_URL=postgresql://...`, app tự dùng SQLite local.
+
+Nginx config ở `deploy/nginx/app.conf` bật `auth_basic` cho toàn bộ app endpoint. Các request tới `.env`, `.env.*`, `.git`, và các dotfile nhạy cảm bị trả `404` trước khi proxy vào Flask, kể cả khi người dùng nhập đúng Basic Auth.
+
+Kiểm tra nhanh sau deploy:
+
+```bash
+curl -I http://your-domain.com/
+curl -I -u admin:'your-password' http://your-domain.com/
+curl -I http://your-domain.com/.env
+curl -I -u admin:'your-password' http://your-domain.com/.env
+curl -I http://your-domain.com/.git/config
+curl -I -u admin:'your-password' http://your-domain.com/.git/config
+```
+
+Kết quả kỳ vọng:
+
+```text
+/                 không có auth: 401 Unauthorized
+/                 có auth:       200 OK hoặc 302 Found
+/.env             luôn là 404 Not Found
+/.git/config      luôn là 404 Not Found
+```
+
+Sau khi site chạy ổn, bật HTTPS trước khi dùng thật:
+
+```bash
+sudo apt install -y certbot
+```
+
+Nếu dùng Nginx trong Docker Compose, terminate TLS ở load balancer/host proxy phía trước hoặc mở rộng `deploy/nginx/app.conf` để mount certificate vào container.
 
 Database mặc định:
 
@@ -128,7 +217,7 @@ Các màn chính:
 - `Queues`: tạo queue nghiệp vụ, quản lý Start/Stop/Resume cho từng queue riêng.
 - `Queues`: thêm domain/URL vào URL Crawl Queue; item được giữ paused cho tới khi queue được start.
 - `Keywords`: thêm keyword vào Keyword Search Queue và chọn Google dork template.
-- `Keywords`: có thể chọn `Full Google Query` để đưa nguyên dòng như `site:88i.*` vào queue, không kết hợp thêm dork.
+- `Keywords`: có thể chọn `Full Google Query` để đưa nguyên dòng như `site:samplebrand.*` vào queue, không kết hợp thêm dork.
 - `Search Dorks`: tạo/preview Google dork template.
 - `Review`: approve/reject URL/domain.
 - `Rules`: tạo/test regex rule extract IOC.
@@ -205,10 +294,10 @@ User nhập danh sách keyword từ giao diện.
 Ví dụ:
 
 ```text
-88i
-88i casino
-88i betting
-site 88i
+samplebrand
+samplebrand login
+samplebrand support
+site samplebrand
 ```
 
 User cũng có thể tạo hoặc chọn Google dork template trên giao diện.
@@ -221,8 +310,8 @@ Ví dụ dork template:
 site:{keyword}
 inurl:{keyword}
 intitle:"{keyword}"
-"{keyword}" casino
-"{keyword}" betting
+"{keyword}" login
+"{keyword}" support
 "{keyword}" "contact"
 "{keyword}" "telegram"
 "{keyword}" "hotline"
@@ -233,20 +322,20 @@ Trong đó `{keyword}` là placeholder bắt buộc. Backend sẽ thay `{keyword
 Ví dụ keyword:
 
 ```text
-88i
+samplebrand
 ```
 
 Kết quả search query được tạo:
 
 ```text
-88i
-"88i"
-site:88i
-inurl:88i
-intitle:"88i"
-"88i" casino
-"88i" betting
-"88i" "contact"
+samplebrand
+"samplebrand"
+site:samplebrand
+inurl:samplebrand
+intitle:"samplebrand"
+"samplebrand" login
+"samplebrand" support
+"samplebrand" "contact"
 ```
 
 Khi user bấm `Import`, backend làm 5 việc:
@@ -269,9 +358,9 @@ Kết quả sau bước này:
 
 ```text
 keywords:
-- 88i
-- 88i casino
-- 88i betting
+- samplebrand
+- samplebrand login
+- samplebrand support
 
 search_dorks:
 - {keyword}
@@ -280,16 +369,16 @@ search_dorks:
 - "{keyword}" "contact"
 
 search_queries:
-- keyword = 88i, dork = {keyword}, query = 88i
-- keyword = 88i, dork = "{keyword}", query = "88i"
-- keyword = 88i, dork = inurl:{keyword}, query = inurl:88i
-- keyword = 88i, dork = "{keyword}" "contact", query = "88i" "contact"
+- keyword = samplebrand, dork = {keyword}, query = samplebrand
+- keyword = samplebrand, dork = "{keyword}", query = "samplebrand"
+- keyword = samplebrand, dork = inurl:{keyword}, query = inurl:samplebrand
+- keyword = samplebrand, dork = "{keyword}" "contact", query = "samplebrand" "contact"
 
 jobs:
-- search_query cho 88i
-- search_query cho "88i"
-- search_query cho inurl:88i
-- search_query cho "88i" "contact"
+- search_query cho samplebrand
+- search_query cho "samplebrand"
+- search_query cho inurl:samplebrand
+- search_query cho "samplebrand" "contact"
 ```
 
 Worker sẽ xử lý từng search query một. Nếu muốn đơn giản và ổn định, MVP chỉ chạy 1 worker search tại một thời điểm.
@@ -346,18 +435,18 @@ urls:
 - https://c.com
 
 url_sources:
-- https://a.com xuất hiện từ query "88i", page 1, rank 1
-- https://a.com xuất hiện từ query "88i casino", page 2, rank 14
-- https://b.com xuất hiện từ query "inurl:88i", page 1, rank 2
+- https://a.com xuất hiện từ query "samplebrand", page 1, rank 1
+- https://a.com xuất hiện từ query "samplebrand login", page 2, rank 14
+- https://b.com xuất hiện từ query "inurl:samplebrand", page 1, rank 2
 
 domains:
 - a.com
 - b.com
 
 domain_sources:
-- a.com được collect từ google_search, query "88i"
-- a.com được collect từ google_search, query "88i casino"
-- b.com được collect từ google_search, query "inurl:88i"
+- a.com được collect từ google_search, query "samplebrand"
+- a.com được collect từ google_search, query "samplebrand login"
+- b.com được collect từ google_search, query "inurl:samplebrand"
 ```
 
 Kết quả hiển thị ngay trên UI.
@@ -641,9 +730,9 @@ CREATE TABLE search_queries (
 Ví dụ:
 
 ```text
-keyword = 88i
+keyword = samplebrand
 template = "{keyword}" "contact"
-query_text = "88i" "contact"
+query_text = "samplebrand" "contact"
 ```
 
 ### `jobs`
@@ -1151,8 +1240,8 @@ Ví dụ:
 
 ```text
 Template: "{keyword}" "contact"
-Sample keyword: 88i
-Preview query: "88i" "contact"
+Sample keyword: samplebrand
+Preview query: "samplebrand" "contact"
 ```
 
 ### Validate dork template
@@ -1205,7 +1294,7 @@ Payload preview:
 ```json
 {
   "template": "\"{keyword}\" \"contact\"",
-  "sample_keyword": "88i"
+  "sample_keyword": "samplebrand"
 }
 ```
 
@@ -1214,7 +1303,7 @@ Response preview:
 ```json
 {
   "ok": true,
-  "query_text": "\"88i\" \"contact\"",
+  "query_text": "\"samplebrand\" \"contact\"",
   "warnings": []
 }
 ```
