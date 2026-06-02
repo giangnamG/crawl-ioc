@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import html
 import re
+import urllib.parse
 from dataclasses import dataclass
 from sqlite3 import Row
 
@@ -151,15 +153,26 @@ def build_input_by_scope(extraction_input: dict[str, object], scope: str) -> str
         for key in ("final_url", "redirects", "links", "text", "html"):
             value = extraction_input.get(key)
             if isinstance(value, list):
-                parts.append("\n".join(str(item) for item in value))
+                parts.append(expand_encoded_text("\n".join(str(item) for item in value)))
             elif value:
-                parts.append(str(value))
+                parts.append(expand_encoded_text(str(value)))
         return "\n".join(parts)
 
     value = extraction_input.get(scope)
     if isinstance(value, list):
-        return "\n".join(str(item) for item in value)
-    return str(value or "")
+        return expand_encoded_text("\n".join(str(item) for item in value))
+    return expand_encoded_text(str(value or ""))
+
+
+def expand_encoded_text(text: str) -> str:
+    variants = [text]
+    unescaped = html.unescape(text)
+    if unescaped != text:
+        variants.append(unescaped)
+    unquoted = urllib.parse.unquote(unescaped)
+    if unquoted != unescaped and unquoted != text:
+        variants.append(unquoted)
+    return "\n".join(variants)
 
 
 def get_context(text: str, start: int, end: int, size: int = 80) -> str:
