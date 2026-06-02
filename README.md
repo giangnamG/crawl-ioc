@@ -72,6 +72,12 @@ sudo apt install -y apache2-utils
 htpasswd -cB deploy/nginx/.htpasswd-app admin
 ```
 
+Tạo thư mục dữ liệu PostgreSQL trên host. Compose mount trực tiếp path này vào container PostgreSQL:
+
+```bash
+sudo mkdir -p /opt/url-hunter/postgresql/data
+```
+
 Build và chạy production stack:
 
 ```bash
@@ -94,6 +100,12 @@ APP_ENV=production
 FLASK_DEBUG=0
 DB_BACKEND=postgresql
 POSTGRES_HOST=postgres
+```
+
+PostgreSQL data directory trên host:
+
+```text
+/opt/url-hunter/postgresql/data
 ```
 
 Khi không có `DB_BACKEND=postgresql` hoặc `DATABASE_URL=postgresql://...`, app tự dùng SQLite local.
