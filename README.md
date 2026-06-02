@@ -54,39 +54,46 @@ Production dùng `deploy/docker-compose.yml` để chạy PostgreSQL, backend Fl
 Tạo file env production:
 
 ```bash
-cat > deploy/.env <<'EOF'
+cat > .env <<'EOF'
 POSTGRES_DB=ioc_investigator
 POSTGRES_USER=ioc_app
 POSTGRES_PASSWORD=change-this-postgres-password
 SECRET_KEY=change-this-flask-secret
+NGINX_BASIC_AUTH_USER=admin
+NGINX_BASIC_AUTH_PASSWORD=change-this-basic-auth-password
 HTTP_PORT=80
 AUTO_WORKER_ENABLED=true
 EOF
 ```
 
-Tạo Basic Auth user cho Nginx:
+Nginx chạy hoàn toàn trong container. Basic Auth file được tạo bên trong container từ `NGINX_BASIC_AUTH_USER` và `NGINX_BASIC_AUTH_PASSWORD`, không mount `.htpasswd` từ host.
 
-```bash
-sudo apt update
-sudo apt install -y apache2-utils
-htpasswd -cB deploy/nginx/.htpasswd-app admin
+Chỉ dữ liệu PostgreSQL được mount ra host:
+
+```text
+/opt/url-hunter/postgresql/data -> /var/lib/postgresql/data
 ```
-
-PostgreSQL dùng Docker named volume `postgres-data`, nên không cần tạo thư mục dữ liệu thủ công trên host.
 
 Build và chạy production stack:
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/docker-compose.yml build backend
-docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d
+docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
+```
+
+Nếu đang đứng trong thư mục `deploy` trên VPS:
+
+```bash
+docker compose --env-file ../.env up -d --build
 ```
 
 Các file production chính:
 
 ```text
 deploy/Dockerfile.backend
+deploy/Dockerfile.nginx
 deploy/docker-compose.yml
 deploy/nginx/app.conf
+deploy/nginx/10-basic-auth.sh
 ```
 
 Trong production, backend được cấu hình:
@@ -98,10 +105,10 @@ DB_BACKEND=postgresql
 POSTGRES_HOST=postgres
 ```
 
-PostgreSQL data volume:
+PostgreSQL data mount:
 
 ```text
-postgres-data
+/opt/url-hunter/postgresql/data
 ```
 
 Khi không có `DB_BACKEND=postgresql` hoặc `DATABASE_URL=postgresql://...`, app tự dùng SQLite local.

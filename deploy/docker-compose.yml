@@ -7,7 +7,11 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-ioc_app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - type: bind
+        source: /opt/url-hunter/postgresql/data
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: true
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
@@ -37,8 +41,6 @@ services:
       CLOAK_HEADLESS: "1"
       BROWSER_PROVIDER: cloak
       CLOAK_PROFILE_ROOT: /data/cloak_profiles
-    volumes:
-      - backend-data:/data
     expose:
       - "5000"
     healthcheck:
@@ -53,22 +55,15 @@ services:
       start_period: 30s
 
   nginx:
-    image: nginx:1.27-alpine
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.nginx
     restart: unless-stopped
     depends_on:
       backend:
         condition: service_healthy
+    environment:
+      NGINX_BASIC_AUTH_USER: ${NGINX_BASIC_AUTH_USER:-admin}
+      NGINX_BASIC_AUTH_PASSWORD: ${NGINX_BASIC_AUTH_PASSWORD:-change-this-basic-auth-password}
     ports:
       - "${HTTP_PORT:-80}:80"
-    volumes:
-      - ./nginx/app.conf:/etc/nginx/conf.d/default.conf:ro
-      - type: bind
-        source: ./nginx/.htpasswd-app
-        target: /etc/nginx/.htpasswd-app
-        read_only: true
-        bind:
-          create_host_path: false
-
-volumes:
-  backend-data:
-  postgres-data:
