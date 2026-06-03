@@ -23,6 +23,15 @@
           {% endfor %}
         </select>
       </label>
+      <label class="ioc-filter-domain">
+        <span>Source domain</span>
+        <select name="domain">
+          <option value="" {% if not source_domain %}selected{% endif %}>Any</option>
+          <option value="github.com,gitlab.com" {% if source_domain == "github.com,gitlab.com" %}selected{% endif %}>GitHub + GitLab</option>
+          <option value="github.com" {% if source_domain == "github.com" %}selected{% endif %}>github.com</option>
+          <option value="gitlab.com" {% if source_domain == "gitlab.com" %}selected{% endif %}>gitlab.com</option>
+        </select>
+      </label>
       <label class="ioc-filter-search">
         <span>Search</span>
         <span class="ioc-search-control">
@@ -34,13 +43,13 @@
             name="q"
             value="{{ q }}"
             autocomplete="off"
-            placeholder="Value, source URL/domain, rule, evidence"
+            placeholder="Full-text search value, source, rule, evidence"
           >
         </span>
       </label>
       <div class="ioc-filter-actions">
         <button class="button primary" type="submit">Apply</button>
-        {% if ioc_type or q %}
+        {% if ioc_type or q or source_domain %}
           <a class="button" href="{{ url_for('iocs') }}">Clear</a>
         {% endif %}
       </div>
@@ -61,19 +70,20 @@
     >
       <input type="hidden" name="type" value="{{ ioc_type }}">
       <input type="hidden" name="q" value="{{ q }}">
+      <input type="hidden" name="domain" value="{{ source_domain }}">
       <input type="hidden" name="page" value="{{ pagination.page }}">
       <span class="muted">Select IOC rows, then delete and suppress them in one action.</span>
       <button class="button small danger" type="submit">Delete Selected</button>
     </form>
     <div class="pagination-bar" aria-label="IOC pagination">
       {% if pagination.has_prev %}
-        <a class="button small" href="{{ url_for('iocs', type=ioc_type, q=q, page=pagination.prev_page, page_size=pagination.page_size) }}">Previous</a>
+        <a class="button small" href="{{ url_for('iocs', type=ioc_type, q=q, domain=source_domain, page=pagination.prev_page, page_size=pagination.page_size) }}">Previous</a>
       {% else %}
         <span class="button small disabled">Previous</span>
       {% endif %}
       <span class="muted">{{ pagination.total }} matches · {{ pagination.page_size }} per page</span>
       {% if pagination.has_next %}
-        <a class="button small" href="{{ url_for('iocs', type=ioc_type, q=q, page=pagination.next_page, page_size=pagination.page_size) }}">Next</a>
+        <a class="button small" href="{{ url_for('iocs', type=ioc_type, q=q, domain=source_domain, page=pagination.next_page, page_size=pagination.page_size) }}">Next</a>
       {% else %}
         <span class="button small disabled">Next</span>
       {% endif %}
@@ -180,6 +190,7 @@
                 <form method="post" action="{{ url_for('delete_ioc', ioc_id=row.id) }}" onsubmit="return confirm('Delete this IOC? It will stay suppressed if crawled again. Evidence rows and source URLs will be kept.');">
                   <input type="hidden" name="type" value="{{ ioc_type }}">
                   <input type="hidden" name="q" value="{{ q }}">
+                  <input type="hidden" name="domain" value="{{ source_domain }}">
                   <input type="hidden" name="page" value="{{ pagination.page }}">
                   <button class="button small danger" type="submit">Delete</button>
                 </form>

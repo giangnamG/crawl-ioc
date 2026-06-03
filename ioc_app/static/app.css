@@ -674,10 +674,10 @@ tbody tr:hover .review-url-actions-cell {
 
 .ioc-filter-form {
   display: grid;
-  grid-template-columns: minmax(160px, 220px) minmax(360px, 640px) auto;
+  grid-template-columns: minmax(140px, 190px) minmax(190px, 240px) minmax(360px, 1fr) auto;
   align-items: end;
   gap: 10px;
-  max-width: 980px;
+  max-width: 1180px;
 }
 
 .ioc-filter-form label {

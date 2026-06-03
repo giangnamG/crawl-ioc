@@ -982,16 +982,24 @@ def create_app(start_worker: bool = False) -> Flask:
         selected_id = request.args.get("ioc_id", type=int)
         ioc_type = request.args.get("type", "")
         q = request.args.get("q", "").strip()
+        source_domain = normalize_ioc_domain_filter(request.args.get("domain", ""))
         page_size = request.args.get("page_size", type=int) or DEFAULT_IOC_PAGE_SIZE
         with connect() as conn:
-            total = count_iocs(conn, ioc_type, q)
+            total = count_iocs(conn, ioc_type, q, source_domain)
             pagination = build_pagination(
                 request.args.get("page", type=int),
                 total,
                 page_size,
                 DEFAULT_IOC_PAGE_SIZE,
             )
-            rows = query_iocs(conn, ioc_type, q, pagination["page_size"], pagination["offset"])
+            rows = query_iocs(
+                conn,
+                ioc_type,
+                q,
+                source_domain,
+                pagination["page_size"],
+                pagination["offset"],
+            )
             sources = []
             selected = None
             if selected_id:
@@ -1023,6 +1031,7 @@ def create_app(start_worker: bool = False) -> Flask:
             sources=sources,
             ioc_type=ioc_type,
             q=q,
+            source_domain=source_domain,
             pagination=pagination,
         )
 
@@ -1092,7 +1101,12 @@ def create_app(start_worker: bool = False) -> Flask:
             ).fetchone()
             if not row:
                 flash("IOC not found.", "error")
-                return redirect(url_for("iocs", type=request.form.get("type", ""), q=request.form.get("q", "")))
+                return redirect(url_for(
+                    "iocs",
+                    type=request.form.get("type", ""),
+                    q=request.form.get("q", ""),
+                    domain=request.form.get("domain", ""),
+                ))
             source_count = scalar(conn, "SELECT COUNT(*) FROM ioc_sources WHERE ioc_id = ?", (ioc_id,))
             conn.execute(
                 """
@@ -1112,6 +1126,7 @@ def create_app(start_worker: bool = False) -> Flask:
             "iocs",
             type=request.form.get("type", ""),
             q=request.form.get("q", ""),
+            domain=request.form.get("domain", ""),
             page=request.form.get("page", type=int) or 1,
         ))
 
@@ -1120,7 +1135,12 @@ def create_app(start_worker: bool = False) -> Flask:
         ioc_ids = unique_ints(request.form.getlist("ioc_ids"))
         if not ioc_ids:
             flash("Select at least one IOC row.", "error")
-            return redirect(url_for("iocs", type=request.form.get("type", ""), q=request.form.get("q", "")))
+            return redirect(url_for(
+                "iocs",
+                type=request.form.get("type", ""),
+                q=request.form.get("q", ""),
+                domain=request.form.get("domain", ""),
+            ))
 
         placeholders = ",".join("?" for _ in ioc_ids)
         with connect() as conn:
@@ -1158,6 +1178,7 @@ def create_app(start_worker: bool = False) -> Flask:
             "iocs",
             type=request.form.get("type", ""),
             q=request.form.get("q", ""),
+            domain=request.form.get("domain", ""),
             page=request.form.get("page", type=int) or 1,
         ))
 
@@ -2042,19 +2063,73 @@ def query_keyword_search_results(conn, queue_id: int):
     ).fetchall()
 
 
-def build_ioc_filters(ioc_type: str, q: str) -> tuple[str, list[object]]:
+def normalize_ioc_domain_filter(value: str | None) -> str:
+    raw = (value or "").strip().lower()
+    if raw == "code-hosts":
+        raw = "github.com,gitlab.com"
+    domains: list[str] = []
+    for part in raw.split(","):
+        domain = part.strip()
+        if not domain:
+            continue
+        if "://" in domain:
+            domain = urlsplit(domain).hostname or ""
+        domain = domain.split("/", 1)[0].split(":", 1)[0].strip().lstrip(".")
+        domain = "".join(char for char in domain if char.isalnum() or char in ".-")
+        if domain and domain not in domains:
+            domains.append(domain)
+    return ",".join(domains)
+
+
+def split_ioc_search_tokens(q: str) -> list[str]:
+    return [token.lower() for token in q.split() if token.strip()][:12]
+
+
+def build_ioc_filters(ioc_type: str, q: str, source_domain: str = "") -> tuple[str, list[object]]:
     params: list[object] = []
     where = ["COALESCE(i.deleted, 0) = 0"]
     if ioc_type:
         where.append("i.type = ?")
         params.append(ioc_type)
-    if q:
-        like = f"%{q}%"
+
+    source_domains = [item for item in source_domain.split(",") if item]
+    if source_domains:
+        domain_clauses = []
+        for domain in source_domains:
+            domain_clauses.append(
+                """
+                (
+                  LOWER(COALESCE(u3.domain, '')) = ?
+                  OR LOWER(COALESCE(u3.domain, '')) LIKE ?
+                )
+                """
+            )
+            params.extend([domain, f"%.{domain}"])
+        where.append(
+            """
+            EXISTS (
+              SELECT 1
+              FROM ioc_sources sd
+              JOIN urls u3 ON u3.id = sd.source_url_id
+              WHERE sd.ioc_id = i.id
+                AND (
+            """
+            + " OR ".join(domain_clauses)
+            + """
+                )
+            )
+            """
+        )
+
+    for token in split_ioc_search_tokens(q):
+        like = f"%{token}%"
         where.append(
             """
             (
-              i.value_norm LIKE ?
-              OR i.value_raw LIKE ?
+              CAST(i.id AS TEXT) LIKE ?
+              OR LOWER(COALESCE(i.type, '')) LIKE ?
+              OR LOWER(COALESCE(i.value_norm, '')) LIKE ?
+              OR LOWER(COALESCE(i.value_raw, '')) LIKE ?
               OR EXISTS (
                 SELECT 1
                 FROM ioc_sources s2
@@ -2062,23 +2137,23 @@ def build_ioc_filters(ioc_type: str, q: str) -> tuple[str, list[object]]:
                 LEFT JOIN extraction_rules r2 ON r2.id = s2.extraction_rule_id
                 WHERE s2.ioc_id = i.id
                   AND (
-                    u2.domain LIKE ?
-                    OR u2.url_norm LIKE ?
-                    OR s2.source_type LIKE ?
-                    OR r2.name LIKE ?
-                    OR s2.evidence_text LIKE ?
+                    LOWER(COALESCE(u2.domain, '')) LIKE ?
+                    OR LOWER(COALESCE(u2.url_norm, '')) LIKE ?
+                    OR LOWER(COALESCE(s2.source_type, '')) LIKE ?
+                    OR LOWER(COALESCE(r2.name, '')) LIKE ?
+                    OR LOWER(COALESCE(s2.evidence_text, '')) LIKE ?
                   )
               )
             )
             """
         )
-        params.extend([like, like, like, like, like, like, like])
+        params.extend([like, like, like, like, like, like, like, like, like])
     where_sql = "WHERE " + " AND ".join(where) if where else ""
     return where_sql, params
 
 
-def count_iocs(conn, ioc_type: str, q: str) -> int:
-    where_sql, params = build_ioc_filters(ioc_type, q)
+def count_iocs(conn, ioc_type: str, q: str, source_domain: str = "") -> int:
+    where_sql, params = build_ioc_filters(ioc_type, q, source_domain)
     return scalar(
         conn,
         f"""
@@ -2090,8 +2165,15 @@ def count_iocs(conn, ioc_type: str, q: str) -> int:
     )
 
 
-def query_iocs(conn, ioc_type: str, q: str, limit: int = DEFAULT_IOC_PAGE_SIZE, offset: int = 0):
-    where_sql, params = build_ioc_filters(ioc_type, q)
+def query_iocs(
+    conn,
+    ioc_type: str,
+    q: str,
+    source_domain: str = "",
+    limit: int = DEFAULT_IOC_PAGE_SIZE,
+    offset: int = 0,
+):
+    where_sql, params = build_ioc_filters(ioc_type, q, source_domain)
     return conn.execute(
         f"""
         SELECT i.*,
