@@ -26,8 +26,14 @@ USER_AGENT = (
 GOOGLE_BLOCK_PATTERNS = (
     "unusual traffic",
     "our systems have detected",
+    "/sorry/",
     "sorry/index",
+    "google.com/sorry",
     "detected unusual traffic",
+    "to continue, please type the characters",
+    "to continue, please verify",
+    "not a robot",
+    "g-recaptcha",
 )
 
 PROXY_RETRY_PATTERNS = (
@@ -202,7 +208,10 @@ class BrowserClient:
                 return operation()
             except Exception as exc:
                 last_exc = exc
-                if index == len(attempts) - 1 or not is_retryable_proxy_error(exc):
+                retryable = is_retryable_proxy_error(exc) or (
+                    operation_name == "Google search" and is_google_antibot_error(exc)
+                )
+                if index == len(attempts) - 1 or not retryable:
                     raise
         if last_exc:
             raise last_exc
@@ -979,6 +988,10 @@ def proxy_preflight(proxy: str, timeout: float, ttl_seconds: float) -> tuple[boo
 def is_retryable_proxy_error(exc: Exception) -> bool:
     message = str(exc)
     return any(pattern in message for pattern in PROXY_RETRY_PATTERNS)
+
+
+def is_google_antibot_error(exc: Exception) -> bool:
+    return "anti-bot/CAPTCHA" in str(exc)
 
 
 def normalize_proxy_value(value: str | None) -> str | None:

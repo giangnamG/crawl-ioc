@@ -9,7 +9,7 @@ import urllib.parse
 import uuid
 from sqlite3 import Connection
 
-from .browser import BrowserClient, is_retryable_proxy_error
+from .browser import BrowserClient, is_google_antibot_error, is_retryable_proxy_error
 from .db import (
     connect,
     is_url_whitelisted,
@@ -116,6 +116,10 @@ def worker_heartbeat_seconds() -> float:
 
 def search_job_max_attempts() -> int:
     return env_int("SEARCH_JOB_MAX_ATTEMPTS", 3, minimum=1, maximum=20)
+
+
+def is_retryable_search_error(exc: Exception) -> bool:
+    return is_retryable_proxy_error(exc) or is_google_antibot_error(exc)
 
 
 def payload_int(payload: dict[str, object], key: str) -> int | None:
@@ -793,7 +797,7 @@ def run_one(
                 refresh_queue_status(conn, int(queue_id))
             return f"Job #{job['id']} paused."
         except Exception as exc:
-            if "anti-bot/CAPTCHA" in str(exc) or is_retryable_proxy_error(exc):
+            if is_retryable_search_error(exc):
                 error_text = str(exc)
             else:
                 error_text = traceback.format_exc(limit=5)
@@ -802,7 +806,7 @@ def run_one(
             )
             if (
                 job["type"] == "search_query"
-                and is_retryable_proxy_error(exc)
+                and is_retryable_search_error(exc)
                 and current_attempts < search_job_max_attempts()
             ):
                 query_id = payload.get("search_query_id")
