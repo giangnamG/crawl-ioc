@@ -30,6 +30,7 @@ TIMESTAMP_COLUMNS = (
     "crawled_at",
     "heartbeat_at",
     "counts_updated_at",
+    "deleted_at",
 )
 
 
@@ -460,6 +461,13 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "whitelist_urls", "matched_url_count", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "whitelist_urls", "queue_item_count", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "whitelist_urls", "counts_updated_at", "TEXT")
+    ensure_column(conn, "iocs", "deleted", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(
+        conn,
+        "iocs",
+        "deleted_at",
+        "TIMESTAMPTZ" if is_postgres_connection(conn) else "TEXT",
+    )
     ensure_column(conn, "ioc_sources", "source_type", "TEXT NOT NULL DEFAULT 'crawl'")
     conn.execute(
         """
@@ -599,6 +607,47 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
+def upsert_ioc_record(
+    conn: sqlite3.Connection,
+    ioc_type: str,
+    value_raw: str,
+    value_norm: str,
+) -> int | None:
+    row = conn.execute(
+        """
+        SELECT id, COALESCE(deleted, 0) AS deleted
+        FROM iocs
+        WHERE type = ?
+          AND value_norm = ?
+        """,
+        (ioc_type, value_norm),
+    ).fetchone()
+    if row:
+        if int(row["deleted"] or 0):
+            return None
+        return int(row["id"])
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO iocs(type, value_raw, value_norm)
+        VALUES (?, ?, ?)
+        """,
+        (ioc_type, value_raw, value_norm),
+    )
+    row = conn.execute(
+        """
+        SELECT id, COALESCE(deleted, 0) AS deleted
+        FROM iocs
+        WHERE type = ?
+          AND value_norm = ?
+        """,
+        (ioc_type, value_norm),
+    ).fetchone()
+    if not row or int(row["deleted"] or 0):
+        return None
+    return int(row["id"])
+
+
 def upsert_ioc_source(
     conn: sqlite3.Connection,
     ioc_id: int,
@@ -607,6 +656,13 @@ def upsert_ioc_source(
     extraction_rule_id: int | None = None,
     evidence_text: str | None = None,
 ) -> int:
+    ioc = conn.execute(
+        "SELECT COALESCE(deleted, 0) AS deleted FROM iocs WHERE id = ?",
+        (ioc_id,),
+    ).fetchone()
+    if not ioc or int(ioc["deleted"] or 0):
+        return 0
+
     source_type = source_type or "crawl"
     if extraction_rule_id is None:
         row = conn.execute(
@@ -779,24 +835,14 @@ def record_keyword_search_url_ioc(conn: sqlite3.Connection, url_id: int) -> bool
     if not url_norm or is_media_asset_url(url_norm):
         return False
 
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO iocs(type, value_raw, value_norm)
-        VALUES ('url', ?, ?)
-        """,
-        (row["url_raw"] or url_norm, url_norm),
-    )
-    ioc = conn.execute(
-        "SELECT id FROM iocs WHERE type = 'url' AND value_norm = ?",
-        (url_norm,),
-    ).fetchone()
+    ioc_id = upsert_ioc_record(conn, "url", row["url_raw"] or url_norm, url_norm)
     source_context = keyword_search_url_source_context(conn, int(row["id"]))
-    if not ioc or not source_context:
+    if not ioc_id or not source_context:
         return False
 
     upsert_ioc_source(
         conn,
-        int(ioc["id"]),
+        ioc_id,
         int(row["id"]),
         "keyword_search",
         extraction_rule_id=None,
@@ -1387,6 +1433,7 @@ def cleanup_invalid_iocs(conn: sqlite3.Connection) -> None:
         SELECT id, type, value_norm
         FROM iocs
         WHERE type IN ('domain', 'email', 'phone', 'url', 'address')
+          AND COALESCE(deleted, 0) = 0
         """
     ).fetchall()
     for row in rows:
@@ -1426,7 +1473,7 @@ def cleanup_invalid_phone_sources(conn: sqlite3.Connection, ioc_id: int, value_n
 
 def merge_or_update_ioc(conn: sqlite3.Connection, ioc_id: int, ioc_type: str, normalized: str) -> None:
     existing = conn.execute(
-        "SELECT id FROM iocs WHERE type = ? AND value_norm = ?",
+        "SELECT id, COALESCE(deleted, 0) AS deleted FROM iocs WHERE type = ? AND value_norm = ?",
         (ioc_type, normalized),
     ).fetchone()
     if not existing:
@@ -1443,6 +1490,18 @@ def merge_or_update_ioc(conn: sqlite3.Connection, ioc_id: int, ioc_type: str, no
 
     existing_id = int(existing["id"])
     if existing_id == ioc_id:
+        return
+
+    if int(existing["deleted"] or 0):
+        conn.execute(
+            """
+            UPDATE iocs
+            SET deleted = 1,
+                deleted_at = COALESCE(deleted_at, CURRENT_TIMESTAMP)
+            WHERE id = ?
+            """,
+            (ioc_id,),
+        )
         return
 
     sources = conn.execute(
@@ -1680,6 +1739,8 @@ CREATE TABLE IF NOT EXISTS iocs (
   type TEXT NOT NULL,
   value_raw TEXT NOT NULL,
   value_norm TEXT NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0,
+  deleted_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (type, value_norm)
 );

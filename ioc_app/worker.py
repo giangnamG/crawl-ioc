@@ -15,6 +15,7 @@ from .db import (
     is_url_whitelisted,
     is_url_whitelisted_latest,
     record_keyword_search_url_ioc,
+    upsert_ioc_record,
     upsert_ioc_source,
 )
 from .extractor import extract_iocs_by_rules
@@ -1225,6 +1226,8 @@ def process_crawl_url(
     for ioc in iocs:
         ensure_job_lease(conn, job_id, run_token)
         ioc_id = upsert_ioc(conn, ioc.type, ioc.raw, ioc.norm)
+        if not ioc_id:
+            continue
         upsert_ioc_source(
             conn,
             ioc_id,
@@ -1441,18 +1444,8 @@ def upsert_url_source(conn: Connection, **kwargs: object) -> None:
     )
 
 
-def upsert_ioc(conn: Connection, ioc_type: str, value_raw: str, value_norm: str) -> int:
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO iocs(type, value_raw, value_norm)
-        VALUES (?, ?, ?)
-        """,
-        (ioc_type, value_raw, value_norm),
-    )
-    row = conn.execute(
-        "SELECT id FROM iocs WHERE type = ? AND value_norm = ?", (ioc_type, value_norm)
-    ).fetchone()
-    return int(row["id"])
+def upsert_ioc(conn: Connection, ioc_type: str, value_raw: str, value_norm: str) -> int | None:
+    return upsert_ioc_record(conn, ioc_type, value_raw, value_norm)
 
 
 def remove_url_from_queue_items(conn: Connection, url_id: int) -> tuple[int, int]:

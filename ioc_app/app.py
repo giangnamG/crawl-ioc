@@ -108,13 +108,13 @@ def create_app(start_worker: bool = False) -> Flask:
                     conn,
                     "SELECT COUNT(*) FROM urls WHERE crawl_status IN ('crawled', 'metadata_only')",
                 ),
-                "iocs": scalar(conn, "SELECT COUNT(*) FROM iocs"),
+                "iocs": scalar(conn, "SELECT COUNT(*) FROM iocs WHERE COALESCE(deleted, 0) = 0"),
             }
             recent_jobs = conn.execute(
                 "SELECT * FROM jobs ORDER BY id DESC LIMIT 8"
             ).fetchall()
             recent_iocs = conn.execute(
-                "SELECT * FROM iocs ORDER BY id DESC LIMIT 8"
+                "SELECT * FROM iocs WHERE COALESCE(deleted, 0) = 0 ORDER BY id DESC LIMIT 8"
             ).fetchall()
         return render_template("dashboard.html", counts=counts, recent_jobs=recent_jobs, recent_iocs=recent_iocs)
 
@@ -995,18 +995,27 @@ def create_app(start_worker: bool = False) -> Flask:
             sources = []
             selected = None
             if selected_id:
-                selected = conn.execute("SELECT * FROM iocs WHERE id = ?", (selected_id,)).fetchone()
-                sources = conn.execute(
+                selected = conn.execute(
                     """
-                    SELECT s.*, u.url_norm, u.domain, r.name AS rule_name
-                    FROM ioc_sources s
-                    JOIN urls u ON u.id = s.source_url_id
-                    LEFT JOIN extraction_rules r ON r.id = s.extraction_rule_id
-                    WHERE s.ioc_id = ?
-                    ORDER BY s.id DESC
+                    SELECT *
+                    FROM iocs
+                    WHERE id = ?
+                      AND COALESCE(deleted, 0) = 0
                     """,
                     (selected_id,),
-                ).fetchall()
+                ).fetchone()
+                if selected:
+                    sources = conn.execute(
+                        """
+                        SELECT s.*, u.url_norm, u.domain, r.name AS rule_name
+                        FROM ioc_sources s
+                        JOIN urls u ON u.id = s.source_url_id
+                        LEFT JOIN extraction_rules r ON r.id = s.extraction_rule_id
+                        WHERE s.ioc_id = ?
+                        ORDER BY s.id DESC
+                        """,
+                        (selected_id,),
+                    ).fetchall()
         return render_template(
             "iocs.html",
             rows=rows,
@@ -1020,15 +1029,31 @@ def create_app(start_worker: bool = False) -> Flask:
     @app.post("/iocs/<int:ioc_id>/delete")
     def delete_ioc(ioc_id: int):
         with connect() as conn:
-            row = conn.execute("SELECT * FROM iocs WHERE id = ?", (ioc_id,)).fetchone()
+            row = conn.execute(
+                """
+                SELECT *
+                FROM iocs
+                WHERE id = ?
+                  AND COALESCE(deleted, 0) = 0
+                """,
+                (ioc_id,),
+            ).fetchone()
             if not row:
                 flash("IOC not found.", "error")
                 return redirect(url_for("iocs", type=request.form.get("type", ""), q=request.form.get("q", "")))
             source_count = scalar(conn, "SELECT COUNT(*) FROM ioc_sources WHERE ioc_id = ?", (ioc_id,))
-            conn.execute("DELETE FROM ioc_sources WHERE ioc_id = ?", (ioc_id,))
-            conn.execute("DELETE FROM iocs WHERE id = ?", (ioc_id,))
+            conn.execute(
+                """
+                UPDATE iocs
+                SET deleted = 1,
+                    deleted_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND COALESCE(deleted, 0) = 0
+                """,
+                (ioc_id,),
+            )
         flash(
-            f"Deleted IOC #{ioc_id} and {source_count} evidence rows. Source URLs were kept.",
+            f"Deleted IOC #{ioc_id}. {source_count} evidence rows and source URLs were kept for audit.",
             "success",
         )
         return redirect(url_for(
@@ -1049,7 +1074,12 @@ def create_app(start_worker: bool = False) -> Flask:
         with connect() as conn:
             existing_count = scalar(
                 conn,
-                f"SELECT COUNT(*) FROM iocs WHERE id IN ({placeholders})",
+                f"""
+                SELECT COUNT(*)
+                FROM iocs
+                WHERE id IN ({placeholders})
+                  AND COALESCE(deleted, 0) = 0
+                """,
                 tuple(ioc_ids),
             )
             source_count = scalar(
@@ -1057,11 +1087,19 @@ def create_app(start_worker: bool = False) -> Flask:
                 f"SELECT COUNT(*) FROM ioc_sources WHERE ioc_id IN ({placeholders})",
                 tuple(ioc_ids),
             )
-            conn.execute(f"DELETE FROM ioc_sources WHERE ioc_id IN ({placeholders})", tuple(ioc_ids))
-            conn.execute(f"DELETE FROM iocs WHERE id IN ({placeholders})", tuple(ioc_ids))
+            conn.execute(
+                f"""
+                UPDATE iocs
+                SET deleted = 1,
+                    deleted_at = CURRENT_TIMESTAMP
+                WHERE id IN ({placeholders})
+                  AND COALESCE(deleted, 0) = 0
+                """,
+                tuple(ioc_ids),
+            )
 
         flash(
-            f"Deleted {existing_count} selected IOCs and {source_count} evidence rows. Source URLs were kept.",
+            f"Deleted {existing_count} selected IOCs. {source_count} evidence rows and source URLs were kept for audit.",
             "success",
         )
         return redirect(url_for(
@@ -1954,7 +1992,7 @@ def query_keyword_search_results(conn, queue_id: int):
 
 def build_ioc_filters(ioc_type: str, q: str) -> tuple[str, list[object]]:
     params: list[object] = []
-    where = []
+    where = ["COALESCE(i.deleted, 0) = 0"]
     if ioc_type:
         where.append("i.type = ?")
         params.append(ioc_type)
