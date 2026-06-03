@@ -210,6 +210,186 @@
       .replace(/'/g, "&#39;");
   }
 
+  let lastEvidenceTrigger = null;
+
+  function evidenceModalElements() {
+    const modal = document.querySelector("[data-ioc-evidence-modal]");
+    if (!modal) {
+      return null;
+    }
+    return {
+      modal,
+      closeButton: modal.querySelector("[data-ioc-evidence-close]"),
+      title: modal.querySelector("#ioc-evidence-modal-title"),
+      type: modal.querySelector("[data-ioc-evidence-type]"),
+      value: modal.querySelector("[data-ioc-evidence-value]"),
+      count: modal.querySelector("[data-ioc-evidence-count]"),
+      status: modal.querySelector("[data-ioc-evidence-status]"),
+      list: modal.querySelector("[data-ioc-evidence-list]"),
+    };
+  }
+
+  function setEvidenceStatus(elements, message, isError) {
+    if (!elements.status) {
+      return;
+    }
+    elements.status.textContent = message || "";
+    elements.status.hidden = !message;
+    elements.status.classList.toggle("error", Boolean(isError));
+  }
+
+  function openEvidenceModal(trigger) {
+    const elements = evidenceModalElements();
+    if (!elements) {
+      return null;
+    }
+    lastEvidenceTrigger = trigger || null;
+    elements.modal.hidden = false;
+    document.body.classList.add("modal-open");
+    if (elements.title) {
+      elements.title.textContent = `Evidence For IOC #${trigger ? trigger.dataset.iocId || "" : ""}`;
+    }
+    if (elements.type) {
+      elements.type.textContent = trigger ? trigger.dataset.iocType || "" : "";
+    }
+    if (elements.value) {
+      elements.value.textContent = trigger ? trigger.dataset.iocValue || "" : "";
+    }
+    if (elements.count) {
+      elements.count.textContent = "";
+    }
+    if (elements.list) {
+      elements.list.innerHTML = "";
+      elements.list.hidden = true;
+    }
+    setEvidenceStatus(elements, "Loading evidence...", false);
+    if (elements.modal) {
+      elements.modal.focus();
+    }
+    return elements;
+  }
+
+  function closeEvidenceModal() {
+    const elements = evidenceModalElements();
+    if (!elements) {
+      return;
+    }
+    elements.modal.hidden = true;
+    document.body.classList.remove("modal-open");
+    if (lastEvidenceTrigger && typeof lastEvidenceTrigger.focus === "function") {
+      lastEvidenceTrigger.focus();
+    }
+    lastEvidenceTrigger = null;
+  }
+
+  function renderEvidenceRows(elements, sources) {
+    if (!elements.list) {
+      return;
+    }
+    if (!sources || sources.length === 0) {
+      elements.list.hidden = true;
+      setEvidenceStatus(elements, "No source rows found for this IOC.", false);
+      return;
+    }
+    elements.list.innerHTML = sources
+      .map(function (source, index) {
+        const sourceUrl = source.source_url || "";
+        const evidence = source.evidence_text || "";
+        return `
+          <article class="evidence-card">
+            <div class="evidence-card-head">
+              <div class="evidence-source-index">#${escapeHtml(index + 1)}</div>
+              <div class="evidence-source-main">
+                <a class="evidence-source-url" href="${escapeHtml(sourceUrl)}" target="_blank" rel="noreferrer">${escapeHtml(sourceUrl || "No source URL")}</a>
+                <div class="evidence-source-meta">
+                  <span>${escapeHtml(source.domain || "No domain")}</span>
+                  <span>${escapeHtml(source.source_type || "crawl")}</span>
+                  <span>${escapeHtml(source.rule_name || "No rule")}</span>
+                </div>
+              </div>
+            </div>
+            <div class="evidence-code-block">${escapeHtml(evidence || "No evidence text recorded.")}</div>
+          </article>
+        `;
+      })
+      .join("");
+    elements.list.hidden = false;
+    setEvidenceStatus(elements, "", false);
+  }
+
+  async function loadEvidence(trigger) {
+    const endpoint = trigger.getAttribute("data-evidence-url");
+    if (!endpoint) {
+      return;
+    }
+    const elements = openEvidenceModal(trigger);
+    if (!elements) {
+      return;
+    }
+    try {
+      const response = await fetch(endpoint, {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        throw new Error("Unable to load IOC evidence.");
+      }
+      const payload = await response.json();
+      const ioc = payload.ioc || {};
+      const sources = Array.isArray(payload.sources) ? payload.sources : [];
+      if (elements.title) {
+        elements.title.textContent = `Evidence For IOC #${ioc.id || trigger.dataset.iocId || ""}`;
+      }
+      if (elements.type) {
+        elements.type.textContent = ioc.type || trigger.dataset.iocType || "";
+      }
+      if (elements.value) {
+        elements.value.textContent = ioc.value_norm || trigger.dataset.iocValue || "";
+      }
+      if (elements.count) {
+        elements.count.textContent = `${sources.length} source row${sources.length === 1 ? "" : "s"}`;
+      }
+      renderEvidenceRows(elements, sources);
+    } catch (error) {
+      if (elements.list) {
+        elements.list.hidden = true;
+      }
+      setEvidenceStatus(elements, error && error.message ? error.message : "Unable to load IOC evidence.", true);
+    }
+  }
+
+  document.addEventListener("click", function (event) {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const trigger = event.target.closest("[data-ioc-evidence-trigger]");
+    if (trigger) {
+      event.preventDefault();
+      loadEvidence(trigger);
+      return;
+    }
+
+    if (event.target.closest("[data-ioc-evidence-close]")) {
+      closeEvidenceModal();
+      return;
+    }
+
+    const modal = event.target.closest("[data-ioc-evidence-modal]");
+    if (modal && event.target === modal) {
+      closeEvidenceModal();
+    }
+  });
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "Escape") {
+      return;
+    }
+    const modal = document.querySelector("[data-ioc-evidence-modal]");
+    if (modal && !modal.hidden) {
+      closeEvidenceModal();
+    }
+  });
+
   function statusClass(value) {
     return String(value || "").replace(/[^a-zA-Z0-9_-]/g, "_");
   }

@@ -47,48 +47,6 @@
     </form>
   </section>
 
-  {% if selected %}
-    <section class="panel selected-ioc-panel" id="ioc-evidence">
-      <div class="panel-head">
-        <div>
-          <h2>Evidence For IOC #{{ selected.id }}</h2>
-          <span class="muted">Selected IOC source evidence</span>
-        </div>
-        <span class="tag">{{ selected.type }}</span>
-      </div>
-      <div class="selected-ioc-value">
-        <span>Normalized Value</span>
-        <code>{{ selected.value_norm }}</code>
-      </div>
-      <div class="table-wrap compact">
-        <table class="ioc-evidence-table">
-          <thead>
-            <tr>
-              <th>Source URL</th>
-              <th>Domain</th>
-              <th>Source</th>
-              <th>Rule</th>
-              <th>Evidence</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for row in sources %}
-              <tr>
-                <td><a class="source-url-full" href="{{ row.url_norm }}" target="_blank" rel="noreferrer">{{ row.url_norm }}</a></td>
-                <td>{{ row.domain }}</td>
-                <td>{{ row.source_type or "crawl" }}</td>
-                <td>{{ row.rule_name or "" }}</td>
-                <td>{{ row.evidence_text }}</td>
-              </tr>
-            {% else %}
-              <tr><td colspan="5" class="empty">No source rows found for this IOC.</td></tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  {% endif %}
-
   <section class="panel">
     <div class="panel-head">
       <h2>IOC Table</h2>
@@ -210,7 +168,15 @@
               <td>{{ row.source_count }}</td>
               <td>{{ row.rule_names or "" }}</td>
               <td class="cell-actions">
-                <a class="button small" href="{{ url_for('iocs', ioc_id=row.id, type=ioc_type, q=q, page=pagination.page, page_size=pagination.page_size) }}#ioc-evidence" title="View Evidence">View</a>
+                <button
+                  class="button small"
+                  type="button"
+                  data-ioc-evidence-trigger
+                  data-evidence-url="{{ url_for('ioc_evidence', ioc_id=row.id) }}"
+                  data-ioc-id="{{ row.id }}"
+                  data-ioc-type="{{ row.type }}"
+                  data-ioc-value="{{ row.value_norm }}"
+                >View</button>
                 <form method="post" action="{{ url_for('delete_ioc', ioc_id=row.id) }}" onsubmit="return confirm('Delete this IOC? It will stay suppressed if crawled again. Evidence rows and source URLs will be kept.');">
                   <input type="hidden" name="type" value="{{ ioc_type }}">
                   <input type="hidden" name="q" value="{{ q }}">
@@ -226,4 +192,49 @@
       </table>
     </div>
   </section>
+
+  <div class="modal-backdrop ioc-evidence-backdrop" data-ioc-evidence-modal hidden>
+    <section
+      class="modal-panel ioc-evidence-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="ioc-evidence-modal-title"
+      tabindex="-1"
+    >
+      <div class="modal-head evidence-modal-head">
+        <div class="evidence-title-wrap">
+          <span class="evidence-modal-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M7 3h7.2L19 7.8V21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm6.5 1.8V9h4.2L13.5 4.8ZM8 12.25h8v1.5H8v-1.5Zm0 3.5h8v1.5H8v-1.5Zm0-7h3.5v1.5H8v-1.5Z" fill="currentColor"/>
+            </svg>
+          </span>
+          <div>
+            <p class="modal-kicker">IOC Evidence</p>
+            <h2 id="ioc-evidence-modal-title">Evidence</h2>
+          </div>
+        </div>
+        <button class="icon-button evidence-modal-close" type="button" data-ioc-evidence-close aria-label="Close evidence modal">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m6.4 5.3 12.3 12.3-1.1 1.1L5.3 6.4l1.1-1.1Zm12.3 1.1L6.4 18.7l-1.1-1.1L17.6 5.3l1.1 1.1Z" fill="currentColor"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-ioc-summary">
+        <div class="summary-pill">
+          <span>Type</span>
+          <strong data-ioc-evidence-type></strong>
+        </div>
+        <div class="summary-value">
+          <span>Normalized value</span>
+          <code data-ioc-evidence-value></code>
+        </div>
+        <div class="summary-pill">
+          <span>Sources</span>
+          <strong data-ioc-evidence-count></strong>
+        </div>
+      </div>
+      <div class="modal-status" data-ioc-evidence-status>Loading evidence...</div>
+      <div class="evidence-card-list" data-ioc-evidence-list hidden></div>
+    </section>
+  </div>
 {% endblock %}

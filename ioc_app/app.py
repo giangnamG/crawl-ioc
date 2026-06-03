@@ -1026,6 +1026,58 @@ def create_app(start_worker: bool = False) -> Flask:
             pagination=pagination,
         )
 
+    @app.get("/iocs/<int:ioc_id>/evidence")
+    def ioc_evidence(ioc_id: int):
+        with connect() as conn:
+            selected = conn.execute(
+                """
+                SELECT *
+                FROM iocs
+                WHERE id = ?
+                  AND COALESCE(deleted, 0) = 0
+                """,
+                (ioc_id,),
+            ).fetchone()
+            if not selected:
+                return jsonify({"error": "IOC not found."}), 404
+
+            sources = conn.execute(
+                """
+                SELECT s.*, u.url_norm, u.domain, r.name AS rule_name
+                FROM ioc_sources s
+                JOIN urls u ON u.id = s.source_url_id
+                LEFT JOIN extraction_rules r ON r.id = s.extraction_rule_id
+                WHERE s.ioc_id = ?
+                ORDER BY s.id DESC
+                """,
+                (ioc_id,),
+            ).fetchall()
+
+        return jsonify(
+            {
+                "ioc": {
+                    "id": selected["id"],
+                    "type": selected["type"],
+                    "value_raw": selected["value_raw"],
+                    "value_norm": selected["value_norm"],
+                    "source_count": len(sources),
+                },
+                "sources": [
+                    {
+                        "id": row["id"],
+                        "source_url_id": row["source_url_id"],
+                        "source_url": row["url_norm"],
+                        "domain": row["domain"],
+                        "source_type": row["source_type"] or "crawl",
+                        "rule_name": row["rule_name"] or "",
+                        "evidence_text": row["evidence_text"] or "",
+                        "created_at": str(row["created_at"] or ""),
+                    }
+                    for row in sources
+                ],
+            }
+        )
+
     @app.post("/iocs/<int:ioc_id>/delete")
     def delete_ioc(ioc_id: int):
         with connect() as conn:
