@@ -2979,8 +2979,22 @@ def build_review_url_filters(status: str, q: str, source: str) -> tuple[str, lis
     where.append("u.crawl_status NOT IN ('crawled', 'metadata_only')")
     where.append("u.review_status != 'ignored_whitelist'")
     if q:
-        where.append("(u.url_norm LIKE ? OR u.domain LIKE ?)")
-        params.extend([f"%{q}%", f"%{q}%"])
+        where.append(
+            """
+            (
+              u.url_norm LIKE ?
+              OR u.domain LIKE ?
+              OR COALESCE(u.title, '') LIKE ?
+              OR EXISTS (
+                SELECT 1
+                FROM url_sources title_filter
+                WHERE title_filter.url_id = u.id
+                  AND title_filter.title LIKE ?
+              )
+            )
+            """
+        )
+        params.extend([f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%"])
     if source == "both":
         for source_type in ("google_search", "extracted_from_crawl"):
             where.append(
@@ -3051,7 +3065,7 @@ def query_review_urls(
                u.created_at,
                GROUP_CONCAT(DISTINCT us.source_type) AS sources,
                GROUP_CONCAT(DISTINCT sq.query_text) AS queries,
-               MIN(us.title) AS title,
+               COALESCE(NULLIF(u.title, ''), MIN(NULLIF(us.title, ''))) AS title,
                MIN(us.snippet) AS snippet
         FROM urls u
         LEFT JOIN url_sources us ON us.url_id = u.id

@@ -443,6 +443,10 @@ th {
   width: auto;
 }
 
+.review-url-col-title {
+  width: 180px;
+}
+
 .review-url-col-query {
   width: 120px;
 }
@@ -1675,6 +1679,7 @@ tbody tr:hover .queue-actions-cell {
 
 .cell-domain,
 .cell-url,
+.cell-title,
 .cell-query,
 .cell-tags {
   min-width: 0;

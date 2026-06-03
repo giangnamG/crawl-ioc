@@ -982,7 +982,7 @@ def process_search_query(
             if is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm):
                 continue
 
-            url_id = upsert_url(conn, item.url, url_norm, domain, "google_search")
+            url_id = upsert_url(conn, item.url, url_norm, domain, "google_search", title=item.title)
             saved_urls += 1
             upsert_url_source(
                 conn,
@@ -1292,14 +1292,39 @@ def process_crawl_url(
                     )
 
 
-def upsert_url(conn: Connection, url_raw: str, url_norm: str, domain: str, first_source: str) -> int:
+def normalize_url_title(title: str | None, url_norm: str) -> str | None:
+    text = " ".join((title or "").split())[:300]
+    if not text or text == url_norm:
+        return None
+    return text
+
+
+def upsert_url(
+    conn: Connection,
+    url_raw: str,
+    url_norm: str,
+    domain: str,
+    first_source: str,
+    title: str | None = None,
+) -> int:
+    title_norm = normalize_url_title(title, url_norm)
     conn.execute(
         """
-        INSERT OR IGNORE INTO urls(url_raw, url_norm, domain, first_source)
-        VALUES (?, ?, ?, ?)
+        INSERT OR IGNORE INTO urls(url_raw, url_norm, domain, title, first_source)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (url_raw, url_norm, domain, first_source),
+        (url_raw, url_norm, domain, title_norm, first_source),
     )
+    if title_norm:
+        conn.execute(
+            """
+            UPDATE urls
+            SET title = ?
+            WHERE url_norm = ?
+              AND (title IS NULL OR title = '')
+            """,
+            (title_norm, url_norm),
+        )
     row = conn.execute("SELECT id FROM urls WHERE url_norm = ?", (url_norm,)).fetchone()
     return int(row["id"])
 

@@ -23,7 +23,7 @@
       </label>
       <label class="grow">
         <span>Search</span>
-        <input name="q" value="{{ q }}" placeholder="domain or URL">
+        <input name="q" value="{{ q }}" placeholder="domain, URL, or title">
       </label>
       <button class="button primary" type="submit">Apply</button>
     </form>
@@ -69,6 +69,7 @@
             <option value="all">All visible text</option>
             <option value="domain">Domain</option>
             <option value="url">URL</option>
+            <option value="title">Title</option>
             <option value="source">Source</option>
             <option value="query">Query</option>
           </select>
@@ -94,6 +95,7 @@
           <col class="review-url-col-domain">
           <col class="review-url-col-source">
           <col class="review-url-col-url">
+          <col class="review-url-col-title">
           <col class="review-url-col-query">
           <col class="review-url-col-status">
           <col class="review-url-col-status">
@@ -108,6 +110,7 @@
             <th>Domain</th>
             <th>Source</th>
             <th>URL</th>
+            <th>Title</th>
             <th>Query</th>
             <th>Review</th>
             <th>Crawl</th>
@@ -119,6 +122,7 @@
             <tr
               data-pattern-domain="{{ row.domain }}"
               data-pattern-url="{{ row.url_norm }}"
+              data-pattern-title="{{ row.title or '' }}"
               data-pattern-source="{{ row.sources or '' }}"
               data-pattern-query="{{ row.queries or '' }}"
             >
@@ -138,7 +142,13 @@
               </td>
               <td class="cell-url">
                 <a class="truncate-line" href="{{ row.url_norm }}" target="_blank" rel="noreferrer" title="{{ row.url_norm }}">{{ row.url_norm }}</a>
-                {% if row.title %}<small class="truncate-line" title="{{ row.title }}">{{ row.title }}</small>{% endif %}
+              </td>
+              <td class="cell-title">
+                {% if row.title %}
+                  <span class="truncate-line" title="{{ row.title }}">{{ row.title }}</span>
+                {% else %}
+                  <span class="muted">-</span>
+                {% endif %}
               </td>
               <td class="cell-query"><code class="truncate-line" title="{{ row.queries or '' }}">{{ row.queries or "" }}</code></td>
               <td class="cell-status"><span class="badge {{ row.review_status }}">{{ row.review_status|status_label }}</span></td>
@@ -159,7 +169,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="9" class="empty">No URLs in this tab.</td></tr>
+            <tr><td colspan="10" class="empty">No URLs in this tab.</td></tr>
           {% endfor %}
         </tbody>
       </table>

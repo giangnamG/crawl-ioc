@@ -452,6 +452,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "url_queue_items", "source_search_query_id", "INTEGER REFERENCES search_queries(id)")
     ensure_column(conn, "url_queue_items", "source_search_queue_item_id", "INTEGER REFERENCES search_queue_items(id)")
     ensure_column(conn, "url_queue_items", "source_url_queue_item_id", "INTEGER REFERENCES url_queue_items(id)")
+    ensure_column(conn, "urls", "title", "TEXT")
     ensure_column(conn, "urls", "content_type", "TEXT")
     ensure_column(conn, "urls", "content_length", "INTEGER")
     ensure_column(conn, "urls", "fetch_method", "TEXT")
@@ -587,7 +588,10 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition:
         return
     existing = table_columns(conn, table)
     if column not in existing:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        if is_postgres_connection(conn):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
+        else:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -1647,6 +1651,7 @@ CREATE TABLE IF NOT EXISTS urls (
   url_raw TEXT NOT NULL,
   url_norm TEXT NOT NULL UNIQUE,
   domain TEXT NOT NULL,
+  title TEXT,
   first_source TEXT NOT NULL,
   review_status TEXT NOT NULL DEFAULT 'pending_review',
   crawl_status TEXT NOT NULL DEFAULT 'not_crawled',
@@ -1760,6 +1765,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id);
 CREATE INDEX IF NOT EXISTS idx_urls_review ON urls(review_status);
 CREATE INDEX IF NOT EXISTS idx_urls_crawl ON urls(crawl_status);
 CREATE INDEX IF NOT EXISTS idx_urls_domain ON urls(domain);
+CREATE INDEX IF NOT EXISTS idx_url_sources_url ON url_sources(url_id);
 CREATE INDEX IF NOT EXISTS idx_whitelist_urls_norm ON whitelist_urls(url_norm);
 CREATE INDEX IF NOT EXISTS idx_iocs_type ON iocs(type);
 """
