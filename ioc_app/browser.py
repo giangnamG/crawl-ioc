@@ -163,7 +163,9 @@ class BrowserClient:
         self.profile_root = Path(os.environ.get("CLOAK_PROFILE_ROOT", ROOT_DIR / "data" / "cloak_profiles"))
         self.profile_isolation = env_bool("CLOAK_PROFILE_ISOLATION", True)
         self.profile_lock_fallback = env_bool("CLOAK_PROFILE_LOCK_FALLBACK", True)
+        self.crawl_profile_per_job = env_bool("CLOAK_CRAWL_PROFILE_PER_JOB", True)
         self.profile_scope = profile_scope_from_env()
+        self.instance_scope = uuid.uuid4().hex[:10]
 
     def search_google(self, query_text: str) -> list[SearchResult]:
         if self.provider == "http":
@@ -177,11 +179,23 @@ class BrowserClient:
     def fetch_url(self, url: str) -> FetchResult:
         if self.provider == "http":
             return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_url(url)
-        return self._run_with_proxy_retries(
-            lambda: self._fetch_url_with_cloak(url),
-            allow_direct=True,
-            operation_name="URL crawl",
-        )
+        try:
+            return self._run_with_proxy_retries(
+                lambda: self._fetch_url_with_cloak(url),
+                allow_direct=True,
+                operation_name="URL crawl",
+            )
+        except Exception as exc:
+            http_fallback = http_variant_for_https_url(url)
+            if not http_fallback or not is_ssl_protocol_error(exc):
+                raise
+            result = self._run_with_proxy_retries(
+                lambda: self._fetch_url_with_cloak(http_fallback),
+                allow_direct=True,
+                operation_name="URL crawl",
+            )
+            result.error = f"HTTPS crawl failed; HTTP fallback used: {exc}"
+            return result
 
     def fetch_text_resource(self, url: str, fetch_method: str = "http_text") -> FetchResult:
         return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_text_resource(
@@ -455,10 +469,13 @@ class BrowserClient:
             return launch_persistent_context(str(fallback_dir), **kwargs)
 
     def _profile_dir(self, profile_name: str, fallback_suffix: str | None = None) -> Path:
-        base_dir = self.profile_root / sanitize_profile_part(profile_name)
+        safe_profile = sanitize_profile_part(profile_name)
+        base_dir = self.profile_root / safe_profile
         if not self.profile_isolation and fallback_suffix is None:
             return base_dir
         scope = self.profile_scope
+        if safe_profile == "crawl" and self.crawl_profile_per_job:
+            scope = f"{scope}-{self.instance_scope}"
         if fallback_suffix:
             scope = f"{scope}-{sanitize_profile_part(fallback_suffix)}"
         return base_dir / scope
@@ -744,7 +761,15 @@ class HttpFallbackClient:
         return self.fetch_text_resource(url, fetch_method="http_text")
 
     def fetch_text_resource(self, url: str, fetch_method: str = "http_text") -> FetchResult:
-        body, final_url, status_code, content_type, content_length = self._open_bytes(url)
+        try:
+            body, final_url, status_code, content_type, content_length = self._open_bytes(url)
+            fallback_error = None
+        except Exception as exc:
+            http_fallback = http_variant_for_https_url(url)
+            if not http_fallback or not is_ssl_protocol_error(exc):
+                raise
+            body, final_url, status_code, content_type, content_length = self._open_bytes(http_fallback)
+            fallback_error = f"HTTPS fetch failed; HTTP fallback used: {exc}"
         text = decode_http_body(body, content_type)
         final = final_url or url
         html_text, extracted_text, links = parse_text_resource(text, final)
@@ -760,10 +785,22 @@ class HttpFallbackClient:
             content_length=effective_length,
             fetch_method=fetch_method,
             is_text=True,
+            error=fallback_error,
         )
 
     def fetch_binary_metadata(self, url: str) -> FetchResult:
-        body, final_url, status_code, content_type, content_length = self._open_bytes(url, read_limit=0)
+        try:
+            body, final_url, status_code, content_type, content_length = self._open_bytes(url, read_limit=0)
+            fallback_error = None
+        except Exception as exc:
+            http_fallback = http_variant_for_https_url(url)
+            if not http_fallback or not is_ssl_protocol_error(exc):
+                raise
+            body, final_url, status_code, content_type, content_length = self._open_bytes(
+                http_fallback,
+                read_limit=0,
+            )
+            fallback_error = f"HTTPS metadata fetch failed; HTTP fallback used: {exc}"
         return FetchResult(
             final_url=final_url or url,
             status_code=status_code,
@@ -775,6 +812,7 @@ class HttpFallbackClient:
             content_length=content_length if content_length is not None else len(body),
             fetch_method="http_binary_metadata",
             is_text=False,
+            error=fallback_error,
         )
 
     def _open(self, url: str) -> tuple[str, str, int | None]:
@@ -990,6 +1028,30 @@ def env_bool(name: str, default: bool) -> bool:
 def is_navigation_timeout_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "timeout" in message and ("page.goto" in message or "navigation" in message)
+
+
+def is_ssl_protocol_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        pattern in message
+        for pattern in (
+            "err_ssl_protocol_error",
+            "ssl_protocol_error",
+            "wrong version number",
+            "ssl: wrong_version_number",
+            "tlsv1 alert",
+            "sslv3 alert",
+            "ssl handshake",
+            "tls handshake",
+        )
+    )
+
+
+def http_variant_for_https_url(url: str) -> str | None:
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() != "https" or not parts.netloc:
+        return None
+    return urllib.parse.urlunsplit(("http", parts.netloc, parts.path, parts.query, ""))
 
 
 def has_usable_page_capture(url: str, html_text: str, text: str, links: list[str]) -> bool:

@@ -481,6 +481,16 @@ def validate_crawl_job_payload(conn: Connection, job: dict[str, object], payload
     if row["review_status"] != "approved":
         conn.execute("UPDATE url_queue_items SET status = 'pending_review' WHERE id = ?", (item_id,))
         raise PausedJob("URL queue item is waiting for review approval.")
+    if job.get("target_url_id") != url_id or job.get("target_queue_item_id") != item_id:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET target_url_id = ?,
+                target_queue_item_id = ?
+            WHERE id = ?
+            """,
+            (url_id, item_id, job["id"]),
+        )
     return row
 
 

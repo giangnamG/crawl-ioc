@@ -180,6 +180,7 @@ PHONE_DATE_PATTERN_RE = re.compile(
 TRAILING_ESCAPED_SLASH_RE = re.compile(r"(?:\\+/)+$")
 EMBEDDED_URL_SCHEME_RE = re.compile(r"https?:/+", re.IGNORECASE)
 HTML_TAG_START_RE = re.compile(r"<\s*/?\s*[a-zA-Z][^>]*(?:>|$)")
+URL_COLLECTION_LINEBREAK_RE = re.compile(r"(?:\\[rnt]|[\r\n\t])", re.IGNORECASE)
 QUERY_PARAM_IN_PATH_RE = re.compile(r"&[a-z][a-z0-9_-]{0,63}=", re.IGNORECASE)
 CSS_NOISE_IN_PATH_RE = re.compile(
     r"\)?(?:\.[a-z_-][a-z0-9_-]*)+\{|[{}]|"
@@ -195,6 +196,7 @@ def normalize_url(value: str) -> str | None:
     if not value:
         return None
 
+    value = strip_url_boundary_noise(value)
     value = value.strip().strip(".,;:)]}'\"")
     if value.startswith("//"):
         value = "https:" + value
@@ -292,15 +294,28 @@ def strip_css_collection_noise_from_path(path: str) -> str:
 
 def strip_url_collection_noise(value: str) -> str:
     text = decode_url_collection_value(value, max_rounds=2)
+    return strip_url_boundary_noise(text)
+
+
+def strip_url_boundary_noise(value: str) -> str:
+    text = html.unescape(str(value or "")).strip()
     while text:
         previous = text
         text = text.strip().strip(URL_COLLECTION_EDGE_NOISE).strip(".,;:)]}'\"")
+        text = cut_url_at_collection_linebreak(text)
         text = cut_url_at_decoded_html_tag(text)
         text = TRAILING_ESCAPED_SLASH_RE.sub("", text)
         text = re.sub(r"\\+$", "", text)
         if text == previous:
             break
     return text
+
+
+def cut_url_at_collection_linebreak(value: str) -> str:
+    match = URL_COLLECTION_LINEBREAK_RE.search(value)
+    if not match:
+        return value
+    return value[: match.start()].rstrip(" \t\r\n.,;:)]}'\"")
 
 
 def cut_url_at_decoded_html_tag(value: str) -> str:
