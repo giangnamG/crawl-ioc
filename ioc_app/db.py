@@ -422,6 +422,44 @@ def is_url_whitelisted_latest(url_norm: str) -> bool:
         return is_url_whitelisted(conn, url_norm)
 
 
+def soft_delete_whitelisted_iocs(conn: sqlite3.Connection, whitelist_id: int | None = None) -> int:
+    whitelist_filter = "wu.enabled = 1"
+    params: tuple[object, ...] = ()
+    if whitelist_id is not None:
+        whitelist_filter = f"{whitelist_filter} AND wu.id = ?"
+        params = (whitelist_id,)
+
+    row_count = conn.execute(
+        f"""
+        UPDATE iocs
+        SET deleted = 1,
+            deleted_at = CURRENT_TIMESTAMP
+        WHERE COALESCE(deleted, 0) = 0
+          AND type IN ('url', 'domain')
+          AND EXISTS (
+            SELECT 1
+            FROM whitelist_urls wu
+            WHERE {whitelist_filter}
+              AND (
+                (
+                  iocs.type = 'url'
+                  AND {whitelist_match_sql('iocs.value_norm', 'wu')}
+                )
+                OR (
+                  iocs.type = 'domain'
+                  AND (
+                    {whitelist_match_sql("'https://' || iocs.value_norm || '/'", 'wu')}
+                    OR {whitelist_match_sql("'http://' || iocs.value_norm || '/'", 'wu')}
+                  )
+                )
+              )
+          )
+        """,
+        params,
+    ).rowcount
+    return max(row_count, 0)
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
@@ -560,6 +598,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_worker_slots_type ON worker_slots(worker_type, enabled, status);
         """
     )
+    soft_delete_whitelisted_iocs(conn)
 
 
 def table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -836,7 +875,7 @@ def record_keyword_search_url_ioc(conn: sqlite3.Connection, url_id: int) -> bool
         return False
 
     url_norm = normalize_url(row["url_norm"] or row["url_raw"])
-    if not url_norm or is_media_asset_url(url_norm):
+    if not url_norm or is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm):
         return False
 
     ioc_id = upsert_ioc_record(conn, "url", row["url_raw"] or url_norm, url_norm)

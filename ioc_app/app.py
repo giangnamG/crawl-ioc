@@ -8,7 +8,14 @@ from urllib.parse import urlsplit
 
 from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
 
-from .db import connect, database_label, init_db, is_url_whitelisted, whitelist_match_sql
+from .db import (
+    connect,
+    database_label,
+    init_db,
+    is_url_whitelisted,
+    soft_delete_whitelisted_iocs,
+    whitelist_match_sql,
+)
 from .extractor import test_rule, validate_rule
 from .normalizers import get_domain, is_media_asset_url, normalize_url
 from .worker import (
@@ -129,6 +136,7 @@ def create_app(start_worker: bool = False) -> Flask:
                 removed_items = 0
                 removed_jobs = 0
                 ignored_urls = 0
+                removed_iocs = 0
                 for item in parse_lines(raw_urls):
                     whitelist_entry = normalize_whitelist_entry(item)
                     if not whitelist_entry:
@@ -163,6 +171,7 @@ def create_app(start_worker: bool = False) -> Flask:
                     ignored_urls += cleanup["ignored_urls"]
                     removed_items += cleanup["removed_items"]
                     removed_jobs += cleanup["removed_jobs"]
+                    removed_iocs += cleanup["removed_iocs"]
                     row = conn.execute(
                         "SELECT id FROM whitelist_urls WHERE url_norm = ?",
                         (whitelist_entry["url_norm"],),
@@ -171,8 +180,8 @@ def create_app(start_worker: bool = False) -> Flask:
                         refresh_whitelist_counts(conn, int(row["id"]))
                 refresh_whitelist_counts(conn)
                 flash(
-                    f"Whitelist updated. Added/updated {added} URLs, skipped {skipped}. Ignored {ignored_urls} existing URL rows, removed {removed_items} queue items and {removed_jobs} jobs.",
-                    "success" if added or ignored_urls or removed_items else "error",
+                    f"Whitelist updated. Added/updated {added} URLs, skipped {skipped}. Ignored {ignored_urls} existing URL rows, removed {removed_items} queue items, {removed_jobs} jobs and {removed_iocs} matching IOC rows.",
+                    "success" if added or ignored_urls or removed_items or removed_iocs else "error",
                 )
                 return redirect(url_for("whitelist"))
 
@@ -2597,7 +2606,9 @@ def apply_url_whitelist(conn, url_norm: str) -> dict[str, int]:
         (url_norm,),
     ).fetchone()
     if not whitelist:
-        return {"ignored_urls": 0, "removed_items": 0, "removed_jobs": 0}
+        return {"ignored_urls": 0, "removed_items": 0, "removed_jobs": 0, "removed_iocs": 0}
+
+    removed_iocs = soft_delete_whitelisted_iocs(conn, int(whitelist["id"]))
 
     match_value = whitelist["match_value"] or whitelist["url_norm"]
     if whitelist["match_type"] == "prefix":
@@ -2613,7 +2624,12 @@ def apply_url_whitelist(conn, url_norm: str) -> dict[str, int]:
 
     rows = conn.execute(f"SELECT id FROM urls WHERE {where}", params).fetchall()
     if not rows:
-        return {"ignored_urls": 0, "removed_items": 0, "removed_jobs": 0}
+        return {
+            "ignored_urls": 0,
+            "removed_items": 0,
+            "removed_jobs": 0,
+            "removed_iocs": removed_iocs,
+        }
     url_ids = [int(row["id"]) for row in rows]
     placeholders = ",".join("?" for _ in url_ids)
     ignored_urls = conn.execute(
@@ -2635,6 +2651,7 @@ def apply_url_whitelist(conn, url_norm: str) -> dict[str, int]:
         "ignored_urls": max(ignored_urls, 0),
         "removed_items": removed_items,
         "removed_jobs": removed_jobs,
+        "removed_iocs": removed_iocs,
     }
 
 

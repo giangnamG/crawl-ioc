@@ -1100,6 +1100,23 @@ def enqueue_discovered_url_if_new(
     )
 
 
+def ioc_matches_url_whitelist(conn: Connection, ioc_type: str, value_norm: str) -> bool:
+    if ioc_type == "url":
+        url_norm = normalize_url(value_norm)
+        return bool(url_norm and is_url_whitelisted(conn, url_norm))
+
+    if ioc_type == "domain":
+        domain = normalize_domain(value_norm)
+        if not domain:
+            return False
+        for scheme in ("https", "http"):
+            root_url = normalize_url(f"{scheme}://{domain}/")
+            if root_url and is_url_whitelisted(conn, root_url):
+                return True
+
+    return False
+
+
 def env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -1229,6 +1246,8 @@ def process_crawl_url(
 
     for ioc in iocs:
         ensure_job_lease(conn, job_id, run_token)
+        if ioc_matches_url_whitelist(conn, ioc.type, ioc.norm):
+            continue
         ioc_id = upsert_ioc(conn, ioc.type, ioc.raw, ioc.norm)
         if not ioc_id:
             continue
