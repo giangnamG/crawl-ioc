@@ -165,6 +165,7 @@ PHONE_DATE_CONTEXT_RE = re.compile(
 PHONE_DATE_PATTERN_RE = re.compile(
     r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b|\b\d{4}\s*[-–]\s*\d{4}\b|\b\d{1,2}:\d{2}\b"
 )
+TRAILING_ESCAPED_SLASH_RE = re.compile(r"(?:\\+/)+$")
 
 
 def normalize_url(value: str) -> str | None:
@@ -216,11 +217,23 @@ def normalize_url(value: str) -> str | None:
 
 
 def normalize_url_without_query(value: str) -> str | None:
-    url_norm = normalize_url(value)
+    url_norm = normalize_url(strip_url_collection_noise(value))
     if not url_norm:
         return None
     parts = urlsplit(url_norm)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def strip_url_collection_noise(value: str) -> str:
+    text = html.unescape(str(value or "")).strip()
+    while text:
+        previous = text
+        text = text.strip().strip(".,;:)]}'\"")
+        text = TRAILING_ESCAPED_SLASH_RE.sub("", text)
+        text = re.sub(r"\\+$", "", text)
+        if text == previous:
+            break
+    return text
 
 
 def is_media_asset_url(value: str) -> bool:
