@@ -38,6 +38,15 @@ GOOGLE_BLOCK_PATTERNS = (
     "g-recaptcha",
 )
 
+GOOGLE_NO_RESULT_PATTERNS = (
+    "did not match any documents",
+    "no results found",
+    "không tìm thấy kết quả",
+    "không khớp với bất kỳ tài liệu",
+)
+
+GOOGLE_EMPTY_RESULTS_ERROR = "Google search page loaded without parseable result links"
+
 PROXY_RETRY_PATTERNS = (
     "TimeoutError",
     "ERR_TIMED_OUT",
@@ -229,7 +238,8 @@ class BrowserClient:
             except Exception as exc:
                 last_exc = exc
                 retryable = is_retryable_proxy_error(exc) or (
-                    operation_name == "Google search" and is_google_antibot_error(exc)
+                    operation_name == "Google search"
+                    and (is_google_antibot_error(exc) or is_google_empty_results_error(exc))
                 )
                 if index == len(attempts) - 1 or not retryable:
                     raise
@@ -269,9 +279,12 @@ class BrowserClient:
 
             while page_no <= page_limit:
                 page_items = self._collect_google_results_page(page, page_no, rank, seen)
-                has_result_candidates = self._count_google_result_candidates(page) > 0
-                if not page_items and not has_result_candidates:
+                if not page_items and self._is_google_no_results(page):
                     break
+                if not page_items and results:
+                    break
+                if not page_items:
+                    self._raise_empty_google_results(page, query_text)
 
                 if page_items:
                     results.extend(page_items)
@@ -352,7 +365,10 @@ class BrowserClient:
 
         self._wait_for_google_results(page, extra_wait=True)
         self._scroll_results_page(page)
-        return self._extract_google_results(page, page_no, first_rank, seen)
+        page_items = self._extract_google_results(page, page_no, first_rank, seen)
+        if page_items or self._is_google_no_results(page):
+            return page_items
+        return page_items
 
     def _fetch_url_with_cloak(self, url: str) -> FetchResult:
         ctx = self._launch_context("crawl")
@@ -522,6 +538,9 @@ class BrowserClient:
             except Exception:
                 continue
         self._raise_if_google_blocked(page)
+        if self._is_google_no_results(page):
+            return
+        self._raise_empty_google_results(page, "")
 
     def _scroll_results_page(self, page) -> None:
         if self.fast_mode:
@@ -551,6 +570,15 @@ class BrowserClient:
                 "Google returned an anti-bot/CAPTCHA page. Use a stable profile, headed mode, and a residential proxy."
             )
 
+    def _is_google_no_results(self, page) -> bool:
+        haystack = safe_body_text(page).lower()
+        return any(pattern in haystack for pattern in GOOGLE_NO_RESULT_PATTERNS)
+
+    def _raise_empty_google_results(self, page, query_text: str) -> None:
+        detail = google_page_debug(page)
+        query_detail = f" for query {query_text!r}" if query_text else ""
+        raise RuntimeError(f"{GOOGLE_EMPTY_RESULTS_ERROR}{query_detail}. {detail}")
+
     def _extract_google_results(
         self, page, page_no: int, first_rank: int, seen: set[str]
     ) -> list[SearchResult]:
@@ -558,7 +586,23 @@ class BrowserClient:
             """
             () => {
               const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
-              const anchors = Array.from(document.querySelectorAll('#search a[href], #rso a[href]'));
+              const resultRoots = [
+                '#search',
+                '#rso',
+                'div[role="main"]',
+                'main'
+              ];
+              const anchors = Array.from(document.querySelectorAll('a[href]'))
+                .filter(a => {
+                  const href = a.href || a.getAttribute('href') || '';
+                  if (!href || href.startsWith('#') || href.startsWith('javascript:')) return false;
+                  const inResultRoot = resultRoots.some(selector => a.closest(selector));
+                  const hasHeading = Boolean(a.querySelector('h3, [role="heading"]'));
+                  const block = a.closest('div.MjjYud, div.g, div[data-sokoban-container], div[jscontroller], div');
+                  const blockHasHeading = Boolean(block?.querySelector('h3, [role="heading"]'));
+                  const hasGoogleTracking = Boolean(a.getAttribute('data-ved') || a.getAttribute('ping'));
+                  return inResultRoot || hasHeading || blockHasHeading || hasGoogleTracking;
+                });
               return anchors
                 .map(a => {
                   const h3 = a.querySelector('h3');
@@ -751,6 +795,17 @@ class HttpFallbackClient:
             html_text, _, _ = self._open(url)
             page_results = self._parse_google_results(html_text, page_no, rank, seen)
             if not page_results:
+                if html_looks_like_google_blocked(url, html_text):
+                    raise RuntimeError(
+                        "Google returned an anti-bot/CAPTCHA page. Use a stable profile, headed mode, and a residential proxy."
+                    )
+                if html_looks_like_google_no_results(html_text):
+                    break
+                if not results:
+                    raise RuntimeError(
+                        f"{GOOGLE_EMPTY_RESULTS_ERROR} for query {query_text!r}. url={url}; "
+                        f"text={clean_text(html_to_text_sample(html_text))[:300]}"
+                    )
                 break
             results.extend(page_results)
             rank += len(page_results)
@@ -985,12 +1040,31 @@ def is_ignored_google_host(host: str) -> bool:
     if not host:
         return True
     ignored_hosts = {
+        "google.com",
+        "www.google.com",
+        "encrypted.google.com",
+        "consent.google.com",
+        "ogs.google.com",
+        "myaccount.google.com",
+        "adservice.google.com",
         "webcache.googleusercontent.com",
         "accounts.google.com",
         "support.google.com",
         "policies.google.com",
     }
-    return host in ignored_hosts or bool(re.search(r"(^|\.)google\.", host))
+    ignored_prefixes = (
+        "www.google.",
+        "encrypted.google.",
+        "consent.google.",
+        "accounts.google.",
+        "support.google.",
+        "policies.google.",
+    )
+    return (
+        host in ignored_hosts
+        or host.startswith(ignored_prefixes)
+        or bool(re.fullmatch(r"google\.[a-z.]+", host))
+    )
 
 
 def safe_body_text(page) -> str:
@@ -1005,6 +1079,33 @@ def safe_body_text(page) -> str:
 
 def clean_text(value: str) -> str:
     return " ".join((value or "").split())
+
+
+def html_to_text_sample(html_text: str) -> str:
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html_text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return html.unescape(clean_text(text))
+
+
+def html_looks_like_google_blocked(url: str, html_text: str) -> bool:
+    haystack = f"{url}\n{html_to_text_sample(html_text)[:3000]}".lower()
+    return any(pattern in haystack for pattern in GOOGLE_BLOCK_PATTERNS)
+
+
+def html_looks_like_google_no_results(html_text: str) -> bool:
+    haystack = html_to_text_sample(html_text).lower()
+    return any(pattern in haystack for pattern in GOOGLE_NO_RESULT_PATTERNS)
+
+
+def google_page_debug(page) -> str:
+    url = getattr(page, "url", "")
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    text = clean_text(safe_body_text(page))[:300]
+    return f"url={url}; title={title}; text={text}"
 
 
 def dedupe_keep_order(items: list[str]) -> list[str]:
@@ -1131,6 +1232,10 @@ def is_retryable_proxy_error(exc: Exception) -> bool:
 
 def is_google_antibot_error(exc: Exception) -> bool:
     return "anti-bot/CAPTCHA" in str(exc)
+
+
+def is_google_empty_results_error(exc: Exception) -> bool:
+    return GOOGLE_EMPTY_RESULTS_ERROR in str(exc)
 
 
 def normalize_proxy_value(value: str | None) -> str | None:

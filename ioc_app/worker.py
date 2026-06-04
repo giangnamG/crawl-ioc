@@ -9,7 +9,12 @@ import urllib.parse
 import uuid
 from sqlite3 import Connection
 
-from .browser import BrowserClient, is_google_antibot_error, is_retryable_proxy_error
+from .browser import (
+    BrowserClient,
+    is_google_antibot_error,
+    is_google_empty_results_error,
+    is_retryable_proxy_error,
+)
 from .db import (
     connect,
     is_url_whitelisted,
@@ -129,7 +134,11 @@ def crawl_job_max_attempts() -> int:
 
 
 def is_retryable_search_error(exc: Exception) -> bool:
-    return is_retryable_proxy_error(exc) or is_google_antibot_error(exc)
+    return (
+        is_retryable_proxy_error(exc)
+        or is_google_antibot_error(exc)
+        or is_google_empty_results_error(exc)
+    )
 
 
 def is_retryable_crawl_error(exc: Exception) -> bool:
@@ -1082,7 +1091,7 @@ def process_search_query(
                     source_search_queue_item_id=search_queue_item_id,
                 )
 
-        page_count = max((item.page_no for item in results), default=0)
+        page_count = max((item.page_no for item in results), default=1)
         conn.execute(
             """
             UPDATE search_queries

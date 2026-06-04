@@ -34,6 +34,11 @@
             <button class="button small primary" type="submit">Resume</button>
           </form>
         {% elif selected_queue.queue_type != "keyword_search" or selected_queue.output_url_queue_id %}
+          {% if selected_queue.queue_type == "keyword_search" %}
+            <form method="post" action="{{ url_for('restart_keyword_queue', queue_id=selected_queue.id) }}" onsubmit="return confirm('Restart this keyword queue from the beginning? Existing URL and IOC data will be kept.');">
+              <button class="button small" type="submit">Restart</button>
+            </form>
+          {% endif %}
           <form method="post" action="{{ url_for('start_queue', queue_id=selected_queue.id) }}">
             <button class="button small primary" type="submit">Start</button>
           </form>

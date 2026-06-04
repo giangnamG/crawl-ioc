@@ -492,6 +492,50 @@ def create_app(start_worker: bool = False) -> Flask:
         )
         return redirect(url_for("queue_detail", queue_id=queue_id))
 
+    @app.post("/queues/<int:queue_id>/restart-keyword")
+    def restart_keyword_queue(queue_id: int):
+        with connect() as conn:
+            queue = get_queue(conn, queue_id, "keyword_search")
+            if not queue:
+                flash("Keyword Search Queue not found.", "error")
+                return redirect(url_for("queues"))
+            running_jobs = scalar(
+                conn,
+                "SELECT COUNT(*) FROM jobs WHERE queue_id = ? AND status = 'running'",
+                (queue_id,),
+            )
+            running_searches = scalar(
+                conn,
+                """
+                SELECT COUNT(*)
+                FROM search_queue_items sqi
+                JOIN search_queries sq ON sq.id = sqi.search_query_id
+                WHERE sqi.queue_id = ?
+                  AND (sqi.status = 'running' OR sq.status = 'running')
+                """,
+                (queue_id,),
+            )
+            if queue["status"] in {"running", "stopping"} or running_jobs or running_searches:
+                flash(
+                    f"Stop queue '{queue['name']}' and wait for running search job(s) to finish before restarting it.",
+                    "error",
+                )
+                return redirect(url_for("queue_detail", queue_id=queue_id))
+            if not get_output_url_queue(conn, queue_id):
+                flash("Bind this Keyword Search Queue to a specific URL Crawl Queue before restarting it.", "error")
+                return redirect(url_for("queue_detail", queue_id=queue_id))
+            jobs_started, items_started = restart_keyword_queue_work(conn, queue_id)
+
+        if jobs_started == 0 and items_started == 0:
+            flash(f"No keyword searches are available to restart in queue '{queue['name']}'.", "error")
+            return redirect(url_for("queue_detail", queue_id=queue_id))
+
+        flash(
+            f"Restarted queue '{queue['name']}' from the beginning. Requeued {jobs_started} jobs and {items_started} keyword searches.",
+            "success",
+        )
+        return redirect(url_for("queue_detail", queue_id=queue_id))
+
     @app.post("/queues/<int:queue_id>/stop")
     def stop_queue(queue_id: int):
         with connect() as conn:
@@ -2414,6 +2458,112 @@ def start_queue_work(conn, queue_id: int) -> tuple[int, int]:
     return max(jobs_started, 0), max(query_count, 0) + max(url_count, 0)
 
 
+def restart_keyword_queue_work(conn, queue_id: int) -> tuple[int, int]:
+    queue = get_queue(conn, queue_id, "keyword_search")
+    output_url_queue = get_output_url_queue(conn, queue_id)
+    if not queue or not output_url_queue:
+        return 0, 0
+
+    output_url_queue_id = int(output_url_queue["id"])
+    item_rows = conn.execute(
+        """
+        SELECT sqi.id,
+               sqi.search_query_id,
+               sqi.keyword_id
+        FROM search_queue_items sqi
+        WHERE sqi.queue_id = ?
+          AND sqi.status != 'running'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM jobs j
+            WHERE j.queue_id = sqi.queue_id
+              AND j.type = 'search_query'
+              AND j.status = 'running'
+              AND j.dedupe_key = 'queue:' || sqi.queue_id || ':search:' || sqi.search_query_id
+          )
+        ORDER BY sqi.id
+        """,
+        (queue_id,),
+    ).fetchall()
+    if not item_rows:
+        refresh_queue_status(conn, queue_id)
+        return 0, 0
+
+    item_ids = [int(item["id"]) for item in item_rows]
+    search_query_ids = [int(item["search_query_id"]) for item in item_rows]
+    keyword_ids = sorted({int(item["keyword_id"]) for item in item_rows})
+
+    item_placeholders = ",".join("?" for _ in item_ids)
+    conn.execute(
+        f"""
+        UPDATE search_queue_items
+        SET status = 'pending',
+            output_url_queue_id = ?,
+            result_count = 0,
+            page_count = 0,
+            error = NULL,
+            started_at = NULL,
+            finished_at = NULL
+        WHERE id IN ({item_placeholders})
+        """,
+        (output_url_queue_id, *item_ids),
+    )
+
+    query_placeholders = ",".join("?" for _ in search_query_ids)
+    conn.execute(
+        f"""
+        UPDATE search_queries
+        SET queue_id = COALESCE(queue_id, ?),
+            status = 'pending',
+            result_count = 0,
+            page_count = 0,
+            last_error = NULL,
+            started_at = NULL,
+            finished_at = NULL
+        WHERE id IN ({query_placeholders})
+          AND status != 'running'
+        """,
+        (queue_id, *search_query_ids),
+    )
+
+    if keyword_ids:
+        keyword_placeholders = ",".join("?" for _ in keyword_ids)
+        conn.execute(
+            f"""
+            UPDATE keywords
+            SET status = 'pending',
+                paused_by_user = 0
+            WHERE id IN ({keyword_placeholders})
+            """,
+            keyword_ids,
+        )
+
+    conn.execute(
+        """
+        UPDATE queues
+        SET status = 'running',
+            started_at = CURRENT_TIMESTAMP,
+            stopped_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (queue_id,),
+    )
+
+    jobs_started = 0
+    for item in item_rows:
+        jobs_started += queue_search_job(
+            conn,
+            queue_id=queue_id,
+            search_query_id=int(item["search_query_id"]),
+            queue_item_id=int(item["id"]),
+            output_url_queue_id=output_url_queue_id,
+            initial_status="pending",
+        )
+
+    return max(jobs_started, 0), len(item_rows)
+
+
 def stop_queue_work(conn, queue_id: int) -> tuple[int, int, int]:
     conn.execute(
         """
@@ -2887,14 +3037,17 @@ def queue_search_job(
                 WHEN status = 'pending' AND ? = 'paused' THEN status
                 ELSE ?
             END,
-            attempts = CASE WHEN status IN ('failed', 'done') THEN 0 ELSE attempts END,
+            attempts = CASE WHEN ? = 'pending' OR status IN ('failed', 'done') THEN 0 ELSE attempts END,
             error = NULL,
             started_at = NULL,
-            finished_at = NULL
+            finished_at = NULL,
+            worker_slot_key = NULL,
+            run_token = NULL,
+            heartbeat_at = NULL
         WHERE dedupe_key = ?
           AND status != 'running'
         """,
-        (queue_id, payload_json, initial_status, initial_status, dedupe_key),
+        (queue_id, payload_json, initial_status, initial_status, initial_status, dedupe_key),
     ).rowcount
     if updated:
         return max(updated, 0)
