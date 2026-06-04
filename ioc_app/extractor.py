@@ -89,6 +89,9 @@ def extract_iocs_by_rules(
             if not raw_value:
                 continue
 
+            if rule["ioc_type"] == "url":
+                raw_value = clean_url_match_before_html_tag(raw_value, source_text, match.end())
+
             if exclude_pattern and exclude_pattern.search(raw_value):
                 continue
 
@@ -119,6 +122,15 @@ def extract_iocs_by_rules(
             )
 
     return dedupe_iocs(found) if dedupe else found
+
+
+def clean_url_match_before_html_tag(raw_value: str, source_text: str, match_end: int) -> str:
+    if not raw_value.endswith("/"):
+        return raw_value
+    tail = source_text[match_end : match_end + 32]
+    if re.match(r"<\s*/?\s*[a-zA-Z]", tail):
+        return raw_value.rstrip("/")
+    return raw_value
 
 
 def test_rule(rule: dict[str, object], sample_text: str) -> tuple[list[ExtractedIOC], list[str]]:

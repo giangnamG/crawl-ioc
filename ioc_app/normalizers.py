@@ -178,6 +178,17 @@ PHONE_DATE_PATTERN_RE = re.compile(
     r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b|\b\d{4}\s*[-–]\s*\d{4}\b|\b\d{1,2}:\d{2}\b"
 )
 TRAILING_ESCAPED_SLASH_RE = re.compile(r"(?:\\+/)+$")
+EMBEDDED_URL_SCHEME_RE = re.compile(r"https?:/+", re.IGNORECASE)
+HTML_TAG_START_RE = re.compile(r"<\s*/?\s*[a-zA-Z][^>]*(?:>|$)")
+QUERY_PARAM_IN_PATH_RE = re.compile(r"&[a-z][a-z0-9_-]{0,63}=", re.IGNORECASE)
+CSS_NOISE_IN_PATH_RE = re.compile(
+    r"\)?(?:\.[a-z_-][a-z0-9_-]*)+\{|[{}]|"
+    r"\b(?:background-image|background|height|width|color|display|font-size|"
+    r"line-height|margin|padding|border|opacity|transform)\s*:|url\(",
+    re.IGNORECASE,
+)
+PATH_EXTENSION_RE = re.compile(r"\.[a-z0-9]{1,10}$", re.IGNORECASE)
+URL_COLLECTION_EDGE_NOISE = "\ufeff\u200b\u200c\u200d\u2060"
 
 
 def normalize_url(value: str) -> str | None:
@@ -238,18 +249,74 @@ def normalize_url_without_query(value: str) -> str | None:
 
 
 def normalize_url_collection_path(path: str) -> str:
-    return re.sub(r"/{2,}", "/", path or "")
+    text = re.sub(r"/{2,}", "/", path or "")
+    text = strip_css_collection_noise_from_path(text)
+    embedded_url = EMBEDDED_URL_SCHEME_RE.search(text)
+    if embedded_url:
+        text = text[: embedded_url.start()]
+    query_param = QUERY_PARAM_IN_PATH_RE.search(text)
+    if query_param:
+        text = text[: query_param.start()]
+    text = re.sub(r"/{2,}", "/", text)
+    without_trailing_amp = text.rstrip("&")
+    if without_trailing_amp != text:
+        text = without_trailing_amp.rstrip("/")
+    return text
+
+
+def strip_css_collection_noise_from_path(path: str) -> str:
+    match = CSS_NOISE_IN_PATH_RE.search(path)
+    if not match:
+        return path
+
+    text = path[: match.start()].rstrip("/).,;:")
+    filename = text.rsplit("/", 1)[-1]
+    if PATH_EXTENSION_RE.search(filename):
+        return text
+
+    segments = text.split("/")
+    for index in range(len(segments) - 1, 0, -1):
+        segment = segments[index]
+        if ":" not in segment:
+            continue
+        next_segment = segments[index + 1] if index + 1 < len(segments) else ""
+        if segment.count(":") < 2 and not re.search(r"[*(){}]", next_segment):
+            continue
+        base_segment = segment.split(":", 1)[0]
+        if not base_segment:
+            continue
+        return "/".join([*segments[:index], base_segment]).rstrip("/")
+
+    return text
 
 
 def strip_url_collection_noise(value: str) -> str:
-    text = html.unescape(str(value or "")).strip()
+    text = decode_url_collection_value(value, max_rounds=2)
     while text:
         previous = text
-        text = text.strip().strip(".,;:)]}'\"")
+        text = text.strip().strip(URL_COLLECTION_EDGE_NOISE).strip(".,;:)]}'\"")
+        text = cut_url_at_decoded_html_tag(text)
         text = TRAILING_ESCAPED_SLASH_RE.sub("", text)
         text = re.sub(r"\\+$", "", text)
         if text == previous:
             break
+    return text
+
+
+def cut_url_at_decoded_html_tag(value: str) -> str:
+    match = HTML_TAG_START_RE.search(value)
+    if not match:
+        return value
+    return value[: match.start()].rstrip("/")
+
+
+def decode_url_collection_value(value: str, max_rounds: int = 2) -> str:
+    text = html.unescape(str(value or "")).strip()
+    for _ in range(max_rounds):
+        decoded = html.unescape(unquote(text))
+        if decoded == text:
+            break
+        text = decoded
     return text
 
 

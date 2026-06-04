@@ -14,6 +14,7 @@ from .normalizers import (
     is_probable_phone_vn_evidence,
     normalize_by_rule,
     normalize_url,
+    normalize_url_without_query,
 )
 
 
@@ -906,7 +907,7 @@ def record_keyword_search_url_ioc(conn: sqlite3.Connection, url_id: int) -> bool
     if not row:
         return False
 
-    url_norm = normalize_url(row["url_norm"] or row["url_raw"])
+    url_norm = normalize_url_without_query(row["url_norm"] or row["url_raw"])
     if not url_norm or is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm):
         return False
 
