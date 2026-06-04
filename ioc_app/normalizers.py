@@ -215,6 +215,14 @@ def normalize_url(value: str) -> str | None:
     return urlunsplit((parts.scheme.lower(), netloc, path, query, ""))
 
 
+def normalize_url_without_query(value: str) -> str | None:
+    url_norm = normalize_url(value)
+    if not url_norm:
+        return None
+    parts = urlsplit(url_norm)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
 def is_media_asset_url(value: str) -> bool:
     if not value:
         return False

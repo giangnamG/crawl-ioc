@@ -19,7 +19,13 @@ from .db import (
     upsert_ioc_source,
 )
 from .extractor import extract_iocs_by_rules
-from .normalizers import get_domain, is_media_asset_url, normalize_domain, normalize_url
+from .normalizers import (
+    get_domain,
+    is_media_asset_url,
+    normalize_domain,
+    normalize_url,
+    normalize_url_without_query,
+)
 
 
 class PausedJob(Exception):
@@ -1117,6 +1123,12 @@ def ioc_matches_url_whitelist(conn: Connection, ioc_type: str, value_norm: str) 
     return False
 
 
+def normalize_crawl_ioc_value(ioc_type: str, value_norm: str) -> str | None:
+    if ioc_type == "url":
+        return normalize_url_without_query(value_norm)
+    return value_norm
+
+
 def env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -1246,9 +1258,12 @@ def process_crawl_url(
 
     for ioc in iocs:
         ensure_job_lease(conn, job_id, run_token)
-        if ioc_matches_url_whitelist(conn, ioc.type, ioc.norm):
+        ioc_value_norm = normalize_crawl_ioc_value(ioc.type, ioc.norm)
+        if not ioc_value_norm:
             continue
-        ioc_id = upsert_ioc(conn, ioc.type, ioc.raw, ioc.norm)
+        if ioc_matches_url_whitelist(conn, ioc.type, ioc_value_norm):
+            continue
+        ioc_id = upsert_ioc(conn, ioc.type, ioc.raw, ioc_value_norm)
         if not ioc_id:
             continue
         upsert_ioc_source(
@@ -1261,7 +1276,7 @@ def process_crawl_url(
         )
 
         if ioc.type == "url":
-            discovered_url = normalize_url(ioc.norm)
+            discovered_url = normalize_url_without_query(ioc.norm)
             if discovered_url:
                 discovered_domain = get_domain(discovered_url)
                 if discovered_domain:
