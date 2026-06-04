@@ -5,10 +5,12 @@ import ipaddress
 import os
 import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -158,6 +160,9 @@ class BrowserClient:
         self.page_delay_min = float(os.environ.get("SEARCH_PAGE_DELAY_MIN", "0" if self.fast_mode else "2.5"))
         self.page_delay_max = float(os.environ.get("SEARCH_PAGE_DELAY_MAX", "0" if self.fast_mode else "6.0"))
         self.profile_root = Path(os.environ.get("CLOAK_PROFILE_ROOT", ROOT_DIR / "data" / "cloak_profiles"))
+        self.profile_isolation = env_bool("CLOAK_PROFILE_ISOLATION", True)
+        self.profile_lock_fallback = env_bool("CLOAK_PROFILE_LOCK_FALLBACK", True)
+        self.profile_scope = profile_scope_from_env()
 
     def search_google(self, query_text: str) -> list[SearchResult]:
         if self.provider == "http":
@@ -388,9 +393,6 @@ class BrowserClient:
                 "CloakBrowser is required. Install it with: python -m pip install cloakbrowser"
             ) from exc
 
-        profile_dir = self.profile_root / profile_name
-        profile_dir.mkdir(parents=True, exist_ok=True)
-
         kwargs = {
             "headless": self.headless,
             "humanize": self.humanize,
@@ -421,7 +423,28 @@ class BrowserClient:
         if self.proxy:
             kwargs["proxy"] = self.proxy
 
-        return launch_persistent_context(str(profile_dir), **kwargs)
+        profile_dir = self._profile_dir(profile_name)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            return launch_persistent_context(str(profile_dir), **kwargs)
+        except Exception as exc:
+            if not self.profile_lock_fallback or not is_profile_lock_error(exc):
+                raise
+            fallback_dir = self._profile_dir(
+                profile_name,
+                fallback_suffix=f"retry-{uuid.uuid4().hex[:10]}",
+            )
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            return launch_persistent_context(str(fallback_dir), **kwargs)
+
+    def _profile_dir(self, profile_name: str, fallback_suffix: str | None = None) -> Path:
+        base_dir = self.profile_root / sanitize_profile_part(profile_name)
+        if not self.profile_isolation and fallback_suffix is None:
+            return base_dir
+        scope = self.profile_scope
+        if fallback_suffix:
+            scope = f"{scope}-{sanitize_profile_part(fallback_suffix)}"
+        return base_dir / scope
 
     def _dismiss_google_consent(self, page) -> None:
         selectors = [
@@ -945,6 +968,28 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def profile_scope_from_env() -> str:
+    explicit_scope = os.environ.get("CLOAK_PROFILE_SCOPE")
+    if explicit_scope:
+        return sanitize_profile_part(explicit_scope)
+    return sanitize_profile_part(f"pid-{os.getpid()}-{threading.current_thread().name}")
+
+
+def sanitize_profile_part(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "").strip())
+    text = text.strip(".-")
+    return text[:120] or "default"
+
+
+def is_profile_lock_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "processsingleton" in message
+        or "profile is already in use" in message
+        or ("profile directory" in message and "already in use" in message)
+    )
 
 
 def proxy_label(proxy: str) -> str:
