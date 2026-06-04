@@ -358,6 +358,7 @@ def create_app(start_worker: bool = False) -> Flask:
                 JOIN urls u ON u.id = qi.url_id
                 LEFT JOIN queues source_q ON source_q.id = qi.source_queue_id
                 WHERE qi.queue_id = ?
+                  AND u.review_status = 'approved'
                 ORDER BY qi.id DESC
                 LIMIT 120
                 """,
