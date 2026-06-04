@@ -130,6 +130,7 @@ class BrowserClient:
         self.headless = env_bool("CLOAK_HEADLESS", False)
         self.humanize = env_bool("CLOAK_HUMANIZE", True)
         self.human_preset = os.environ.get("CLOAK_HUMAN_PRESET", "careful")
+        self.ignore_https_errors = env_bool("CLOAK_IGNORE_HTTPS_ERRORS", True)
         self.type_delay_min = int(os.environ.get("SEARCH_TYPE_DELAY_MIN", "0" if self.fast_mode else "8"))
         self.type_delay_max = int(os.environ.get("SEARCH_TYPE_DELAY_MAX", "5" if self.fast_mode else "35"))
         self.locale = os.environ.get("CLOAK_LOCALE", "en-US")
@@ -415,6 +416,7 @@ class BrowserClient:
             "locale": self.locale,
             "timezone": self.timezone,
             "viewport": {"width": self.viewport_width, "height": self.viewport_height},
+            "ignore_https_errors": self.ignore_https_errors,
             "geoip": self.geoip,
             "stealth_args": self.stealth_args,
         }
