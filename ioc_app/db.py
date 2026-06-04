@@ -460,6 +460,37 @@ def soft_delete_whitelisted_iocs(conn: sqlite3.Connection, whitelist_id: int | N
     return max(row_count, 0)
 
 
+def soft_delete_static_url_iocs(conn: sqlite3.Connection) -> int:
+    if not table_exists(conn, "iocs"):
+        return 0
+
+    rows = conn.execute(
+        """
+        SELECT id, value_norm
+        FROM iocs
+        WHERE type = 'url'
+          AND COALESCE(deleted, 0) = 0
+        """
+    ).fetchall()
+    deleted_count = 0
+    for row in rows:
+        if not is_media_asset_url(row["value_norm"]):
+            continue
+        changed = conn.execute(
+            """
+            UPDATE iocs
+            SET deleted = 1,
+                deleted_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND COALESCE(deleted, 0) = 0
+            """,
+            (row["id"],),
+        ).rowcount
+        if changed and changed > 0:
+            deleted_count += changed
+    return deleted_count
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
@@ -599,6 +630,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         """
     )
     soft_delete_whitelisted_iocs(conn)
+    soft_delete_static_url_iocs(conn)
 
 
 def table_exists(conn: sqlite3.Connection, table: str) -> bool:

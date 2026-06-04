@@ -1261,6 +1261,8 @@ def process_crawl_url(
         ioc_value_norm = normalize_crawl_ioc_value(ioc.type, ioc.norm)
         if not ioc_value_norm:
             continue
+        if ioc.type == "url" and is_media_asset_url(ioc_value_norm):
+            continue
         if ioc_matches_url_whitelist(conn, ioc.type, ioc_value_norm):
             continue
         ioc_id = upsert_ioc(conn, ioc.type, ioc.raw, ioc_value_norm)

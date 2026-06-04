@@ -12,6 +12,7 @@ MEDIA_ASSET_EXTENSIONS = {
     ".avif",
     ".avi",
     ".bmp",
+    ".cur",
     ".flv",
     ".gif",
     ".heic",
@@ -35,9 +36,20 @@ MEDIA_ASSET_EXTENSIONS = {
     ".wmv",
     # Static frontend assets should not become review/crawl targets.
     ".css",
+    ".eot",
     ".js",
+    ".less",
+    ".manifest",
     ".map",
     ".mjs",
+    ".otf",
+    ".sass",
+    ".scss",
+    ".ttf",
+    ".wasm",
+    ".webmanifest",
+    ".woff",
+    ".woff2",
 }
 
 TRACKING_PARAMS = {
@@ -239,7 +251,8 @@ def strip_url_collection_noise(value: str) -> str:
 def is_media_asset_url(value: str) -> bool:
     if not value:
         return False
-    path = (urlsplit(value if "://" in value else f"https://{value}").path or "").lower()
+    cleaned = strip_url_collection_noise(value)
+    path = (urlsplit(cleaned if "://" in cleaned else f"https://{cleaned}").path or "").lower()
     filename = path.rsplit("/", 1)[-1]
     if "." not in filename:
         return False
