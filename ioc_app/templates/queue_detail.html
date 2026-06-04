@@ -132,9 +132,13 @@
         </table>
       </div>
 
-      <div class="subsection-head">
+      <div
+        class="subsection-head"
+        data-keyword-items-panel
+        data-endpoint="{{ url_for('queue_keyword_items_api', queue_id=selected_queue.id) }}"
+      >
         <h2>Keyword Queue Items</h2>
-        <span class="muted">All keyword queries generated for this queue.</span>
+        <span class="muted"><span data-keyword-items-count>{{ selected_queries|length }}</span> keyword queries generated for this queue.</span>
       </div>
       <div class="table-wrap queue-detail-wrap">
         <table class="queue-keyword-items-table">
@@ -150,7 +154,7 @@
               <th>Error</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody data-keyword-items-body>
             {% for item in selected_queries %}
               <tr>
                 <td>#{{ item.id }}</td>

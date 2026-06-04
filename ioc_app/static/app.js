@@ -505,6 +505,37 @@
       .join("");
   }
 
+  function renderKeywordItemRows(body, rows) {
+    if (!rows || rows.length === 0) {
+      body.innerHTML = '<tr><td colspan="8" class="empty">No keyword search items in this queue.</td></tr>';
+      return;
+    }
+
+    body.innerHTML = rows
+      .map(function (item) {
+        const status = item.status || "";
+        const outputQueue = item.output_url_queue_id
+          ? `#${escapeHtml(item.output_url_queue_id)} · ${escapeHtml(item.output_url_queue_name || "queue_url")}`
+          : '<span class="badge failed">Not Bound</span>';
+        const error = item.error || "";
+        const resultCount = item.result_count == null ? 0 : item.result_count;
+        const pageCount = item.page_count == null ? 0 : item.page_count;
+        return `
+          <tr>
+            <td>#${escapeHtml(item.id || "")}</td>
+            <td><strong>${escapeHtml(item.keyword_text || "")}</strong></td>
+            <td><code class="truncate-line" title="${escapeHtml(item.query_text || "")}">${escapeHtml(item.query_text || "")}</code></td>
+            <td>${outputQueue}</td>
+            <td><span class="badge ${statusClass(status)}">${escapeHtml(statusLabel(status))}</span></td>
+            <td>${escapeHtml(resultCount)}</td>
+            <td>${escapeHtml(pageCount)}</td>
+            <td><code class="truncate-line" title="${escapeHtml(error)}">${escapeHtml(error)}</code></td>
+          </tr>
+        `;
+      })
+      .join("");
+  }
+
   function updateQueueStatus(queue) {
     if (!queue || !queue.status) {
       return;
@@ -524,6 +555,14 @@
     badge.classList.add(statusClass(status));
     badge.setAttribute("data-status", status);
     badge.textContent = statusLabel(status);
+    const wasActive = previous === "running" || previous === "stopping";
+    const isActive = status === "running" || status === "stopping";
+    if (wasActive && !isActive && !document.documentElement.dataset.queueReloading) {
+      document.documentElement.dataset.queueReloading = "1";
+      window.setTimeout(function () {
+        window.location.reload();
+      }, 300);
+    }
   }
 
   function startPolling(panelSelector, bodySelector, countSelector, renderRows) {
@@ -593,6 +632,15 @@
     );
   }
 
+  function startKeywordItemsPolling() {
+    startPolling(
+      "[data-keyword-items-panel]",
+      "[data-keyword-items-body]",
+      "[data-keyword-items-count]",
+      renderKeywordItemRows
+    );
+  }
+
   function restoreScroll() {
     let payload;
     const key = keyForPath(window.location.pathname);
@@ -633,11 +681,13 @@
     document.addEventListener("DOMContentLoaded", startCrawlingUrlPolling, { once: true });
     document.addEventListener("DOMContentLoaded", startQueueUrlItemsPolling, { once: true });
     document.addEventListener("DOMContentLoaded", startKeywordSearchPolling, { once: true });
+    document.addEventListener("DOMContentLoaded", startKeywordItemsPolling, { once: true });
   } else {
     restoreScroll();
     startCrawlingUrlPolling();
     startQueueUrlItemsPolling();
     startKeywordSearchPolling();
+    startKeywordItemsPolling();
   }
   window.addEventListener("pageshow", restoreScroll);
 })();

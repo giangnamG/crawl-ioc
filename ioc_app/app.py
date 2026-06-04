@@ -347,22 +347,7 @@ def create_app(start_worker: bool = False) -> Flask:
                 (queue_id,),
             ).fetchall()
             selected_url_items = query_url_queue_items(conn, queue_id)
-            selected_queries = conn.execute(
-                """
-                SELECT sqi.*,
-                       sq.query_text,
-                       k.text AS keyword_text,
-                       output_q.name AS output_url_queue_name
-                FROM search_queue_items sqi
-                JOIN search_queries sq ON sq.id = sqi.search_query_id
-                JOIN keywords k ON k.id = sqi.keyword_id
-                LEFT JOIN queues output_q ON output_q.id = sqi.output_url_queue_id
-                WHERE sqi.queue_id = ?
-                ORDER BY sqi.id DESC
-                LIMIT 120
-                """,
-                (queue_id,),
-            ).fetchall()
+            selected_queries = query_keyword_queue_items(conn, queue_id)
             selected_crawling_urls = query_crawling_urls(conn, queue_id)
             selected_keyword_search_status = query_keyword_search_status(conn, queue_id)
             selected_keyword_search_results = query_keyword_search_results(conn, queue_id)
@@ -412,6 +397,30 @@ def create_app(start_worker: bool = False) -> Flask:
             if not queue:
                 return jsonify({"ok": False, "error": "Queue not found."}), 404
             rows = query_url_queue_items(conn, queue_id)
+        return jsonify(
+            {
+                "ok": True,
+                "queue": {
+                    "id": queue["id"],
+                    "name": queue["name"],
+                    "queue_type": queue["queue_type"],
+                    "status": queue["status"],
+                },
+                "count": len(rows),
+                "items": [dict(row) for row in rows],
+            }
+        )
+
+    @app.get("/api/queues/<int:queue_id>/keyword-items")
+    def queue_keyword_items_api(queue_id: int):
+        with connect() as conn:
+            queue = conn.execute(
+                "SELECT id, name, queue_type, status FROM queues WHERE id = ?",
+                (queue_id,),
+            ).fetchone()
+            if not queue:
+                return jsonify({"ok": False, "error": "Queue not found."}), 404
+            rows = query_keyword_queue_items(conn, queue_id)
         return jsonify(
             {
                 "ok": True,
@@ -2059,6 +2068,25 @@ def query_crawling_urls(conn, queue_id: int):
     ).fetchall()
 
 
+def query_keyword_queue_items(conn, queue_id: int):
+    return conn.execute(
+        """
+        SELECT sqi.*,
+               sq.query_text,
+               k.text AS keyword_text,
+               output_q.name AS output_url_queue_name
+        FROM search_queue_items sqi
+        JOIN search_queries sq ON sq.id = sqi.search_query_id
+        JOIN keywords k ON k.id = sqi.keyword_id
+        LEFT JOIN queues output_q ON output_q.id = sqi.output_url_queue_id
+        WHERE sqi.queue_id = ?
+        ORDER BY sqi.id DESC
+        LIMIT 120
+        """,
+        (queue_id,),
+    ).fetchall()
+
+
 def query_keyword_search_status(conn, queue_id: int):
     return conn.execute(
         """
@@ -2088,11 +2116,11 @@ def query_keyword_search_status(conn, queue_id: int):
         LEFT JOIN jobs j ON j.type = 'search_query'
           AND j.queue_id = sqi.queue_id
           AND j.dedupe_key = 'queue:' || sqi.queue_id || ':search:' || sqi.search_query_id
-          AND j.status IN ('pending', 'running')
+          AND j.status IN ('pending', 'running', 'failed')
         WHERE sqi.queue_id = ?
           AND (
-            sqi.status IN ('pending', 'running')
-            OR sq.status IN ('pending', 'running')
+            sqi.status IN ('pending', 'running', 'failed')
+            OR sq.status IN ('pending', 'running', 'failed')
             OR j.id IS NOT NULL
           )
         ORDER BY COALESCE(sqi.started_at, sq.started_at, j.started_at, sqi.created_at) DESC, sqi.id DESC
