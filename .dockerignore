@@ -8,6 +8,10 @@
 deploy/.env
 deploy/.env.*
 deploy/nginx/.htpasswd-*
+deploy2/*.env
+deploy2/*.env.*
+!deploy2/*.env.example
+deploy2/nginx/.htpasswd-*
 
 __pycache__/
 *.py[cod]

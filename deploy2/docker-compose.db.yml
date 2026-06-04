@@ -1,0 +1,30 @@
+name: 88i-db
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:?POSTGRES_ADMIN_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD is required}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:?POSTGRES_APP_USER is required}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    ports:
+      - "${POSTGRES_BIND_ADDRESS:-0.0.0.0}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - type: bind
+        source: ${POSTGRES_DATA_DIR:-/opt/88i/postgresql/data}
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./postgres/init
+        target: /docker-entrypoint-initdb.d
+        read_only: true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_APP_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
