@@ -351,7 +351,14 @@ class BrowserClient:
                     redirects.append(response.url)
 
             page.on("response", on_response)
-            response = page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            navigation_error: Exception | None = None
+            response = None
+            try:
+                response = page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            except Exception as exc:
+                if not is_navigation_timeout_error(exc):
+                    raise
+                navigation_error = exc
             self._wait_for_settle(page)
 
             html_text = page.content()
@@ -371,6 +378,9 @@ class BrowserClient:
                 if norm and norm not in normalized_links:
                     normalized_links.append(norm)
 
+            if navigation_error and not has_usable_page_capture(page.url, html_text, text, normalized_links):
+                raise navigation_error
+
             return FetchResult(
                 final_url=page.url,
                 status_code=response.status if response else None,
@@ -381,6 +391,11 @@ class BrowserClient:
                 content_type=(response.headers.get("content-type") if response else None),
                 content_length=parse_int(response.headers.get("content-length")) if response else len(html_text),
                 fetch_method="cloak_browser",
+                error=(
+                    f"CloakBrowser navigation timed out; partial page captured: {navigation_error}"
+                    if navigation_error
+                    else None
+                ),
             )
         finally:
             ctx.close()
@@ -968,6 +983,21 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_navigation_timeout_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "timeout" in message and ("page.goto" in message or "navigation" in message)
+
+
+def has_usable_page_capture(url: str, html_text: str, text: str, links: list[str]) -> bool:
+    if (url or "").strip().lower() == "about:blank":
+        return False
+    if (text or "").strip():
+        return True
+    if links:
+        return True
+    return len((html_text or "").strip()) > 200
 
 
 def profile_scope_from_env() -> str:

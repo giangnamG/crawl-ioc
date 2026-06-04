@@ -124,8 +124,16 @@ def search_job_max_attempts() -> int:
     return env_int("SEARCH_JOB_MAX_ATTEMPTS", 3, minimum=1, maximum=20)
 
 
+def crawl_job_max_attempts() -> int:
+    return env_int("CRAWL_JOB_MAX_ATTEMPTS", 2, minimum=1, maximum=10)
+
+
 def is_retryable_search_error(exc: Exception) -> bool:
     return is_retryable_proxy_error(exc) or is_google_antibot_error(exc)
+
+
+def is_retryable_crawl_error(exc: Exception) -> bool:
+    return is_retryable_proxy_error(exc)
 
 
 def payload_int(payload: dict[str, object], key: str) -> int | None:
@@ -803,7 +811,7 @@ def run_one(
                 refresh_queue_status(conn, int(queue_id))
             return f"Job #{job['id']} paused."
         except Exception as exc:
-            if is_retryable_search_error(exc):
+            if is_retryable_search_error(exc) or is_retryable_crawl_error(exc):
                 error_text = str(exc)
             else:
                 error_text = traceback.format_exc(limit=5)
@@ -858,6 +866,57 @@ def run_one(
                 return (
                     f"Job #{job['id']} retrying transient search error "
                     f"({current_attempts}/{search_job_max_attempts()}): {exc}"
+                )
+            if (
+                job["type"] == "crawl_url"
+                and is_retryable_crawl_error(exc)
+                and current_attempts < crawl_job_max_attempts()
+            ):
+                url_id = payload.get("url_id")
+                url_queue_item_id = payload.get("url_queue_item_id")
+                if url_id:
+                    conn.execute(
+                        """
+                        UPDATE urls
+                        SET crawl_status = 'not_crawled',
+                            crawl_error = ?
+                        WHERE id = ?
+                          AND crawl_status != 'crawled'
+                          AND crawl_status != 'metadata_only'
+                        """,
+                        (error_text, url_id),
+                    )
+                if url_queue_item_id:
+                    conn.execute(
+                        """
+                        UPDATE url_queue_items
+                        SET status = 'pending',
+                            error = ?,
+                            started_at = NULL,
+                            finished_at = NULL
+                        WHERE id = ?
+                        """,
+                        (error_text, url_queue_item_id),
+                    )
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'pending',
+                        started_at = NULL,
+                        finished_at = NULL,
+                        error = ?,
+                        run_token = NULL,
+                        heartbeat_at = NULL
+                    WHERE id = ?
+                      AND run_token = ?
+                    """,
+                    (error_text, job["id"], run_token),
+                )
+                if queue_id:
+                    refresh_queue_status(conn, int(queue_id))
+                return (
+                    f"Job #{job['id']} retrying transient crawl error "
+                    f"({current_attempts}/{crawl_job_max_attempts()}): {exc}"
                 )
             final_slot_status = "error"
             final_slot_error = error_text
