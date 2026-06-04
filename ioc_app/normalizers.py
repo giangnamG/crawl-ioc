@@ -233,7 +233,12 @@ def normalize_url_without_query(value: str) -> str | None:
     if not url_norm:
         return None
     parts = urlsplit(url_norm)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    path = normalize_url_collection_path(parts.path)
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def normalize_url_collection_path(path: str) -> str:
+    return re.sub(r"/{2,}", "/", path or "")
 
 
 def strip_url_collection_noise(value: str) -> str:

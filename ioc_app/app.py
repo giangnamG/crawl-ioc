@@ -346,24 +346,7 @@ def create_app(start_worker: bool = False) -> Flask:
                 """,
                 (queue_id,),
             ).fetchall()
-            selected_url_items = conn.execute(
-                """
-                SELECT qi.*,
-                       u.url_norm,
-                       u.domain,
-                       u.crawl_status,
-                       source_q.name AS source_queue_name,
-                       source_q.queue_type AS source_queue_type
-                FROM url_queue_items qi
-                JOIN urls u ON u.id = qi.url_id
-                LEFT JOIN queues source_q ON source_q.id = qi.source_queue_id
-                WHERE qi.queue_id = ?
-                  AND u.review_status = 'approved'
-                ORDER BY qi.id DESC
-                LIMIT 120
-                """,
-                (queue_id,),
-            ).fetchall()
+            selected_url_items = query_url_queue_items(conn, queue_id)
             selected_queries = conn.execute(
                 """
                 SELECT sqi.*,
@@ -405,6 +388,30 @@ def create_app(start_worker: bool = False) -> Flask:
             if not queue:
                 return jsonify({"ok": False, "error": "Queue not found."}), 404
             rows = query_crawling_urls(conn, queue_id)
+        return jsonify(
+            {
+                "ok": True,
+                "queue": {
+                    "id": queue["id"],
+                    "name": queue["name"],
+                    "queue_type": queue["queue_type"],
+                    "status": queue["status"],
+                },
+                "count": len(rows),
+                "items": [dict(row) for row in rows],
+            }
+        )
+
+    @app.get("/api/queues/<int:queue_id>/url-items")
+    def queue_url_items_api(queue_id: int):
+        with connect() as conn:
+            queue = conn.execute(
+                "SELECT id, name, queue_type, status FROM queues WHERE id = ?",
+                (queue_id,),
+            ).fetchone()
+            if not queue:
+                return jsonify({"ok": False, "error": "Queue not found."}), 404
+            rows = query_url_queue_items(conn, queue_id)
         return jsonify(
             {
                 "ok": True,
@@ -1946,6 +1953,27 @@ def query_url_overview(conn):
         FROM urls
         """
     ).fetchone()
+
+
+def query_url_queue_items(conn, queue_id: int):
+    return conn.execute(
+        """
+        SELECT qi.*,
+               u.url_norm,
+               u.domain,
+               u.crawl_status,
+               source_q.name AS source_queue_name,
+               source_q.queue_type AS source_queue_type
+        FROM url_queue_items qi
+        JOIN urls u ON u.id = qi.url_id
+        LEFT JOIN queues source_q ON source_q.id = qi.source_queue_id
+        WHERE qi.queue_id = ?
+          AND u.review_status = 'approved'
+        ORDER BY qi.id DESC
+        LIMIT 120
+        """,
+        (queue_id,),
+    ).fetchall()
 
 
 def query_crawling_urls(conn, queue_id: int):

@@ -434,6 +434,45 @@
       .join("");
   }
 
+  function renderQueueUrlItemRows(body, rows) {
+    if (!rows || rows.length === 0) {
+      body.innerHTML = '<tr><td colspan="8" class="empty">No approved URL/domain items in this queue.</td></tr>';
+      return;
+    }
+
+    body.innerHTML = rows
+      .map(function (item) {
+        const itemId = item.id || "";
+        const url = item.url_norm || "";
+        const queueStatus = item.status || "";
+        const crawlStatus = item.crawl_status || "";
+        const error = item.error || "";
+        const source = item.source_queue_id
+          ? `#${escapeHtml(item.source_queue_id)}${item.source_queue_name ? ` · ${escapeHtml(item.source_queue_name)}` : ""}`
+          : "-";
+        const action = queueStatus === "running"
+          ? '<span class="muted">Running</span>'
+          : `
+            <form method="post" action="/url-queue-items/${escapeHtml(itemId)}/delete">
+              <button class="button small danger" type="submit">Remove</button>
+            </form>
+          `;
+        return `
+          <tr>
+            <td>#${escapeHtml(itemId)}</td>
+            <td><strong>${escapeHtml(item.domain || "")}</strong></td>
+            <td><code class="truncate-line" title="${escapeHtml(url)}">${escapeHtml(url)}</code></td>
+            <td><span class="badge ${statusClass(queueStatus)}">${escapeHtml(statusLabel(queueStatus))}</span></td>
+            <td>${source}</td>
+            <td><span class="badge ${statusClass(crawlStatus)}">${escapeHtml(statusLabel(crawlStatus))}</span></td>
+            <td><code class="truncate-line" title="${escapeHtml(error)}">${escapeHtml(error)}</code></td>
+            <td class="cell-actions">${action}</td>
+          </tr>
+        `;
+      })
+      .join("");
+  }
+
   function renderKeywordSearchRows(body, rows) {
     if (!rows || rows.length === 0) {
       body.innerHTML = '<tr><td colspan="9" class="empty">No CloakBrowser keyword searches are running or waiting.</td></tr>';
@@ -536,6 +575,15 @@
     );
   }
 
+  function startQueueUrlItemsPolling() {
+    startPolling(
+      "[data-queue-url-items-panel]",
+      "[data-queue-url-items-body]",
+      "[data-queue-url-items-count]",
+      renderQueueUrlItemRows
+    );
+  }
+
   function startKeywordSearchPolling() {
     startPolling(
       "[data-keyword-search-panel]",
@@ -583,10 +631,12 @@
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", restoreScroll, { once: true });
     document.addEventListener("DOMContentLoaded", startCrawlingUrlPolling, { once: true });
+    document.addEventListener("DOMContentLoaded", startQueueUrlItemsPolling, { once: true });
     document.addEventListener("DOMContentLoaded", startKeywordSearchPolling, { once: true });
   } else {
     restoreScroll();
     startCrawlingUrlPolling();
+    startQueueUrlItemsPolling();
     startKeywordSearchPolling();
   }
   window.addEventListener("pageshow", restoreScroll);

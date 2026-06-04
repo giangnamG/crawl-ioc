@@ -289,6 +289,14 @@
         </table>
       </div>
 
+      <div
+        class="subsection-head"
+        data-queue-url-items-panel
+        data-endpoint="{{ url_for('queue_url_items_api', queue_id=selected_queue.id) }}"
+      >
+        <h2>Queued Approved URLs</h2>
+        <span class="muted"><span data-queue-url-items-count>{{ selected_url_items|length }}</span> rows · updates every 1.5s</span>
+      </div>
       <div class="table-wrap queue-detail-wrap">
         <table class="queue-url-items-table">
           <thead>
@@ -303,7 +311,7 @@
               <th>Actions</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody data-queue-url-items-body>
             {% for item in selected_url_items %}
               <tr>
                 <td>#{{ item.id }}</td>
