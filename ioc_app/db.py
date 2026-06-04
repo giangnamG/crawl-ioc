@@ -497,6 +497,7 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         migrate_db(conn)
         recover_interrupted_jobs(conn)
+        cleanup_malformed_review_queue_urls(conn)
         seed_defaults(conn)
 
 
@@ -1186,6 +1187,493 @@ def remove_ignored_asset_urls_from_queue_items(conn: sqlite3.Connection) -> None
         """,
         asset_ids,
     )
+
+
+def cleanup_malformed_review_queue_urls(conn: sqlite3.Connection) -> dict[str, int]:
+    stats = {
+        "updated": 0,
+        "merged": 0,
+        "ignored_asset": 0,
+        "ignored_invalid": 0,
+        "removed_queue_items": 0,
+        "removed_jobs": 0,
+    }
+    if not table_exists(conn, "urls"):
+        return stats
+
+    if table_exists(conn, "url_queue_items"):
+        rows = conn.execute(
+            """
+            SELECT DISTINCT u.id,
+                   u.url_raw,
+                   u.url_norm,
+                   u.domain,
+                   u.review_status,
+                   u.crawl_status
+            FROM urls u
+            WHERE u.crawl_status NOT IN ('crawling', 'crawled', 'metadata_only')
+              AND (
+                u.review_status = 'pending_review'
+                OR EXISTS (
+                  SELECT 1
+                  FROM url_queue_items qi
+                  WHERE qi.url_id = u.id
+                )
+              )
+            ORDER BY u.id
+            """
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT u.id,
+                   u.url_raw,
+                   u.url_norm,
+                   u.domain,
+                   u.review_status,
+                   u.crawl_status
+            FROM urls u
+            WHERE u.crawl_status NOT IN ('crawling', 'crawled', 'metadata_only')
+              AND u.review_status = 'pending_review'
+            ORDER BY u.id
+            """
+        ).fetchall()
+
+    for row in rows:
+        url_id = int(row["id"])
+        if url_has_running_work(conn, url_id):
+            continue
+
+        current_norm = row["url_norm"] or row["url_raw"]
+        cleaned_norm = normalize_url_without_query(current_norm)
+        if not cleaned_norm:
+            cleanup_stats = ignore_pending_url_record(conn, url_id, "ignored_malformed")
+            stats["ignored_invalid"] += 1 if cleanup_stats["changed_status"] else 0
+            stats["removed_queue_items"] += cleanup_stats["removed_queue_items"]
+            stats["removed_jobs"] += cleanup_stats["removed_jobs"]
+            continue
+
+        if is_media_asset_url(cleaned_norm):
+            cleanup_stats = ignore_pending_url_record(conn, url_id, "ignored_asset")
+            stats["ignored_asset"] += 1 if cleanup_stats["changed_status"] else 0
+            stats["removed_queue_items"] += cleanup_stats["removed_queue_items"]
+            stats["removed_jobs"] += cleanup_stats["removed_jobs"]
+            continue
+
+        if table_exists(conn, "whitelist_urls") and is_url_whitelisted(conn, cleaned_norm):
+            cleanup_stats = ignore_pending_url_record(conn, url_id, "ignored_whitelist")
+            stats["removed_queue_items"] += cleanup_stats["removed_queue_items"]
+            stats["removed_jobs"] += cleanup_stats["removed_jobs"]
+            continue
+
+        cleaned_domain = get_domain(cleaned_norm)
+        if not cleaned_domain:
+            cleanup_stats = ignore_pending_url_record(conn, url_id, "ignored_malformed")
+            stats["ignored_invalid"] += 1 if cleanup_stats["changed_status"] else 0
+            stats["removed_queue_items"] += cleanup_stats["removed_queue_items"]
+            stats["removed_jobs"] += cleanup_stats["removed_jobs"]
+            continue
+
+        if cleaned_norm == row["url_norm"] and cleaned_domain == row["domain"]:
+            continue
+
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM urls
+            WHERE url_norm = ?
+              AND id != ?
+            """,
+            (cleaned_norm, url_id),
+        ).fetchone()
+        if existing:
+            merge_stats = merge_url_record(conn, url_id, int(existing["id"]))
+            stats["merged"] += 1
+            stats["removed_queue_items"] += merge_stats["removed_queue_items"]
+            stats["removed_jobs"] += merge_stats["removed_jobs"]
+            continue
+
+        conn.execute(
+            """
+            UPDATE urls
+            SET url_norm = ?,
+                domain = ?
+            WHERE id = ?
+            """,
+            (cleaned_norm, cleaned_domain, url_id),
+        )
+        stats["updated"] += 1
+
+    return stats
+
+
+def url_has_running_work(conn: sqlite3.Connection, url_id: int) -> bool:
+    if table_exists(conn, "url_queue_items") and conn.execute(
+        """
+        SELECT 1
+        FROM url_queue_items
+        WHERE url_id = ?
+          AND status = 'running'
+        LIMIT 1
+        """,
+        (url_id,),
+    ).fetchone():
+        return True
+
+    if table_exists(conn, "jobs"):
+        columns = table_columns(conn, "jobs")
+        if "target_url_id" in columns and conn.execute(
+            """
+            SELECT 1
+            FROM jobs
+            WHERE target_url_id = ?
+              AND status = 'running'
+            LIMIT 1
+            """,
+            (url_id,),
+        ).fetchone():
+            return True
+    return False
+
+
+def ignore_pending_url_record(conn: sqlite3.Connection, url_id: int, review_status: str) -> dict[str, int]:
+    stats = remove_url_queue_refs(conn, url_id)
+    changed = conn.execute(
+        """
+        UPDATE urls
+        SET review_status = ?
+        WHERE id = ?
+          AND review_status = 'pending_review'
+        """,
+        (review_status, url_id),
+    ).rowcount
+    stats["changed_status"] = max(changed, 0)
+    return stats
+
+
+def remove_url_queue_refs(conn: sqlite3.Connection, url_id: int) -> dict[str, int]:
+    stats = {"removed_queue_items": 0, "removed_jobs": 0}
+    if not table_exists(conn, "url_queue_items"):
+        return stats
+
+    rows = conn.execute(
+        """
+        SELECT id, queue_id
+        FROM url_queue_items
+        WHERE url_id = ?
+          AND status != 'running'
+        """,
+        (url_id,),
+    ).fetchall()
+    for row in rows:
+        stats["removed_jobs"] += delete_crawl_jobs_for_queue_url(
+            conn,
+            int(row["queue_id"]),
+            url_id,
+            int(row["id"]),
+        )
+        conn.execute(
+            """
+            UPDATE url_queue_items
+            SET source_url_queue_item_id = NULL
+            WHERE source_url_queue_item_id = ?
+            """,
+            (row["id"],),
+        )
+        deleted = conn.execute("DELETE FROM url_queue_items WHERE id = ?", (row["id"],)).rowcount
+        stats["removed_queue_items"] += max(deleted, 0)
+    return stats
+
+
+def merge_url_record(conn: sqlite3.Connection, old_url_id: int, new_url_id: int) -> dict[str, int]:
+    stats = {"removed_queue_items": 0, "removed_jobs": 0}
+    if old_url_id == new_url_id:
+        return stats
+
+    stats.update(merge_url_queue_items(conn, old_url_id, new_url_id))
+    rewrite_jobs_for_url(conn, old_url_id, new_url_id)
+    merge_url_sources(conn, old_url_id, new_url_id)
+    merge_ioc_source_urls(conn, old_url_id, new_url_id)
+    merge_url_body(conn, old_url_id, new_url_id)
+    if table_exists(conn, "worker_slots") and "target_url_id" in table_columns(conn, "worker_slots"):
+        conn.execute(
+            "UPDATE worker_slots SET target_url_id = ? WHERE target_url_id = ?",
+            (new_url_id, old_url_id),
+        )
+    conn.execute("DELETE FROM urls WHERE id = ?", (old_url_id,))
+    return stats
+
+
+def merge_url_queue_items(conn: sqlite3.Connection, old_url_id: int, new_url_id: int) -> dict[str, int]:
+    stats = {"removed_queue_items": 0, "removed_jobs": 0}
+    if not table_exists(conn, "url_queue_items"):
+        return stats
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM url_queue_items
+        WHERE url_id = ?
+          AND status != 'running'
+        ORDER BY id
+        """,
+        (old_url_id,),
+    ).fetchall()
+    for row in rows:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM url_queue_items
+            WHERE queue_id = ?
+              AND url_id = ?
+            """,
+            (row["queue_id"], new_url_id),
+        ).fetchone()
+        if existing:
+            existing_item_id = int(existing["id"])
+            conn.execute(
+                """
+                UPDATE url_queue_items
+                SET source_queue_id = COALESCE(source_queue_id, ?),
+                    source_search_query_id = COALESCE(source_search_query_id, ?),
+                    source_search_queue_item_id = COALESCE(source_search_queue_item_id, ?),
+                    source_url_queue_item_id = COALESCE(source_url_queue_item_id, ?)
+                WHERE id = ?
+                """,
+                (
+                    row["source_queue_id"],
+                    row["source_search_query_id"],
+                    row["source_search_queue_item_id"],
+                    row["source_url_queue_item_id"],
+                    existing_item_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE url_queue_items
+                SET source_url_queue_item_id = ?
+                WHERE source_url_queue_item_id = ?
+                """,
+                (existing_item_id, row["id"]),
+            )
+            stats["removed_jobs"] += delete_crawl_jobs_for_queue_url(
+                conn,
+                int(row["queue_id"]),
+                old_url_id,
+                int(row["id"]),
+            )
+            deleted = conn.execute("DELETE FROM url_queue_items WHERE id = ?", (row["id"],)).rowcount
+            stats["removed_queue_items"] += max(deleted, 0)
+            continue
+
+        conn.execute(
+            """
+            UPDATE url_queue_items
+            SET url_id = ?
+            WHERE id = ?
+            """,
+            (new_url_id, row["id"]),
+        )
+        rewrite_queue_crawl_jobs(
+            conn,
+            int(row["queue_id"]),
+            old_url_id,
+            new_url_id,
+            int(row["id"]),
+        )
+    return stats
+
+
+def delete_crawl_jobs_for_queue_url(
+    conn: sqlite3.Connection,
+    queue_id: int,
+    url_id: int,
+    queue_item_id: int | None = None,
+) -> int:
+    if not table_exists(conn, "jobs"):
+        return 0
+    columns = table_columns(conn, "jobs")
+    filters = ["dedupe_key = ?"]
+    params: list[object] = [f"queue:{queue_id}:crawl:{url_id}"]
+    if queue_item_id is not None and "target_queue_item_id" in columns:
+        filters.append("target_queue_item_id = ?")
+        params.append(queue_item_id)
+    if "target_url_id" in columns:
+        filters.append("(queue_id = ? AND target_url_id = ? AND type = 'crawl_url')")
+        params.extend([queue_id, url_id])
+    row_count = conn.execute(
+        f"""
+        DELETE FROM jobs
+        WHERE type = 'crawl_url'
+          AND status != 'running'
+          AND ({" OR ".join(filters)})
+        """,
+        tuple(params),
+    ).rowcount
+    return max(row_count, 0)
+
+
+def rewrite_queue_crawl_jobs(
+    conn: sqlite3.Connection,
+    queue_id: int,
+    old_url_id: int,
+    new_url_id: int,
+    queue_item_id: int,
+) -> None:
+    old_dedupe = f"queue:{queue_id}:crawl:{old_url_id}"
+    new_dedupe = f"queue:{queue_id}:crawl:{new_url_id}"
+    rewrite_crawl_jobs(
+        conn,
+        old_url_id,
+        new_url_id,
+        old_dedupe,
+        new_dedupe,
+        queue_item_id=queue_item_id,
+    )
+
+
+def rewrite_jobs_for_url(conn: sqlite3.Connection, old_url_id: int, new_url_id: int) -> None:
+    rewrite_crawl_jobs(
+        conn,
+        old_url_id,
+        new_url_id,
+        f"crawl:{old_url_id}",
+        f"crawl:{new_url_id}",
+        queue_item_id=None,
+        include_target_url_filter=False,
+    )
+
+
+def rewrite_crawl_jobs(
+    conn: sqlite3.Connection,
+    old_url_id: int,
+    new_url_id: int,
+    old_dedupe: str,
+    new_dedupe: str,
+    queue_item_id: int | None,
+    include_target_url_filter: bool = True,
+) -> None:
+    if not table_exists(conn, "jobs"):
+        return
+
+    columns = table_columns(conn, "jobs")
+    filters = ["dedupe_key = ?"]
+    params: list[object] = [old_dedupe]
+    if include_target_url_filter and "target_url_id" in columns:
+        filters.append("target_url_id = ?")
+        params.append(old_url_id)
+    if queue_item_id is not None and "target_queue_item_id" in columns:
+        filters.append("target_queue_item_id = ?")
+        params.append(queue_item_id)
+
+    jobs = conn.execute(
+        f"""
+        SELECT id, payload
+        FROM jobs
+        WHERE type = 'crawl_url'
+          AND status != 'running'
+          AND ({" OR ".join(filters)})
+        ORDER BY id
+        """,
+        tuple(params),
+    ).fetchall()
+    for job in jobs:
+        duplicate = conn.execute(
+            """
+            SELECT id
+            FROM jobs
+            WHERE dedupe_key = ?
+              AND id != ?
+            LIMIT 1
+            """,
+            (new_dedupe, job["id"]),
+        ).fetchone()
+        if duplicate:
+            conn.execute("DELETE FROM jobs WHERE id = ? AND status != 'running'", (job["id"],))
+            continue
+
+        payload = rewrite_crawl_job_payload(job["payload"], new_url_id, queue_item_id)
+        assignments = ["payload = ?", "dedupe_key = ?"]
+        values: list[object] = [payload, new_dedupe]
+        if "target_url_id" in columns:
+            assignments.append("target_url_id = ?")
+            values.append(new_url_id)
+        if queue_item_id is not None and "target_queue_item_id" in columns:
+            assignments.append("target_queue_item_id = ?")
+            values.append(queue_item_id)
+        values.append(job["id"])
+        conn.execute(
+            f"""
+            UPDATE jobs
+            SET {", ".join(assignments)}
+            WHERE id = ?
+            """,
+            tuple(values),
+        )
+
+
+def rewrite_crawl_job_payload(payload_text: str, url_id: int, queue_item_id: int | None) -> str:
+    try:
+        payload = json.loads(payload_text or "{}")
+    except Exception:
+        payload = {}
+    payload["url_id"] = url_id
+    if queue_item_id is not None:
+        payload["url_queue_item_id"] = queue_item_id
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def merge_url_sources(conn: sqlite3.Connection, old_url_id: int, new_url_id: int) -> None:
+    if not table_exists(conn, "url_sources"):
+        return
+    conn.execute("UPDATE url_sources SET source_url_id = ? WHERE source_url_id = ?", (new_url_id, old_url_id))
+    conn.execute("UPDATE url_sources SET url_id = ? WHERE url_id = ?", (new_url_id, old_url_id))
+
+
+def merge_ioc_source_urls(conn: sqlite3.Connection, old_url_id: int, new_url_id: int) -> None:
+    if not table_exists(conn, "ioc_sources"):
+        return
+    rows = conn.execute(
+        """
+        SELECT ioc_id, source_type, extraction_rule_id, evidence_text
+        FROM ioc_sources
+        WHERE source_url_id = ?
+        """,
+        (old_url_id,),
+    ).fetchall()
+    for row in rows:
+        upsert_ioc_source(
+            conn,
+            int(row["ioc_id"]),
+            new_url_id,
+            row["source_type"] or "crawl",
+            extraction_rule_id=row["extraction_rule_id"],
+            evidence_text=row["evidence_text"],
+        )
+    conn.execute("DELETE FROM ioc_sources WHERE source_url_id = ?", (old_url_id,))
+
+
+def merge_url_body(conn: sqlite3.Connection, old_url_id: int, new_url_id: int) -> None:
+    if not table_exists(conn, "url_bodies"):
+        return
+    old_body = conn.execute(
+        "SELECT html, updated_at FROM url_bodies WHERE url_id = ?",
+        (old_url_id,),
+    ).fetchone()
+    if not old_body:
+        return
+    new_body = conn.execute("SELECT 1 FROM url_bodies WHERE url_id = ?", (new_url_id,)).fetchone()
+    if not new_body:
+        conn.execute(
+            """
+            UPDATE url_bodies
+            SET url_id = ?
+            WHERE url_id = ?
+            """,
+            (new_url_id, old_url_id),
+        )
+        return
+    conn.execute("DELETE FROM url_bodies WHERE url_id = ?", (old_url_id,))
 
 
 def recover_interrupted_jobs(conn: sqlite3.Connection) -> None:
