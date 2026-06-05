@@ -14,6 +14,18 @@
       <input type="hidden" name="url_status" value="{{ url_status }}">
       <input type="hidden" name="page_size" value="{{ pagination.page_size }}">
       <label>
+        <span>URL Queue</span>
+        <select name="queue_id" data-review-queue-select>
+          {% for queue in url_queues %}
+            <option value="{{ queue.id }}" {% if selected_queue_id == queue.id %}selected{% endif %}>
+              #{{ queue.id }} · {{ queue.name }}
+            </option>
+          {% else %}
+            <option value="">No URL queues</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
         <span>Source</span>
         <select name="source">
           <option value="" {% if not source %}selected{% endif %}>Any</option>
@@ -36,6 +48,7 @@
     data-review-endpoint="{{ url_for('review_urls_api') }}"
     data-review-page-url="{{ url_for('review') }}"
     data-url-status="{{ url_status }}"
+    data-queue-id="{{ selected_queue_id or '' }}"
     data-source="{{ source }}"
     data-q="{{ q }}"
     data-page-size="{{ pagination.page_size }}"
@@ -51,12 +64,13 @@
             aria-describedby="url-review-queue-help"
           >?</button>
           <span class="helper-popover helper-popover-wide" id="url-review-queue-help" role="tooltip">
-            Bảng này duyệt từng URL cụ thể trước khi crawl. Domain được phát hiện cũng được chuẩn hóa thành URL root như https://example.com/ và đi qua cùng cơ chế review, queue, approve, reject như mọi URL khác. Các URL đã Approved hoặc Rejected chỉ còn read-only.
+            Bảng này duyệt URL theo từng URL Crawl Queue đang chọn. Chỉ URL thuộc queue_url đó mới xuất hiện trong bảng; các URL đã Approved hoặc Rejected chỉ còn read-only.
           </span>
         </span>
       </div>
       <div class="review-panel-actions">
         <span class="muted review-feedback" data-review-feedback></span>
+        <span class="muted" data-review-selected-queue>{% if selected_queue %}#{{ selected_queue.id }} · {{ selected_queue.name }}{% endif %}</span>
         <span class="muted" data-review-summary>{{ pagination.total }} matches · page {{ pagination.page }}/{{ pagination.total_pages }}</span>
         <button class="button small" type="button" data-review-fetch-new>Fetch New</button>
       </div>
@@ -65,7 +79,7 @@
       {% for tab in review_tabs %}
         <a
           class="tab-pill {% if url_status == tab.value %}active{% endif %}"
-          href="{{ url_for('review', url_status=tab.value, source=source, q=q, page_size=pagination.page_size) }}"
+          href="{{ url_for('review', queue_id=selected_queue_id or '', url_status=tab.value, source=source, q=q, page_size=pagination.page_size) }}"
           data-review-tab
           data-review-status="{{ tab.value }}"
           aria-current="{{ 'page' if url_status == tab.value else 'false' }}"
@@ -74,13 +88,13 @@
     </nav>
     <div class="pagination-bar" aria-label="URL review pagination" data-review-pagination>
       {% if pagination.has_prev %}
-        <a class="button small" href="{{ url_for('review', url_status=url_status, source=source, q=q, page=pagination.prev_page, page_size=pagination.page_size) }}" data-review-page="{{ pagination.prev_page }}">Previous</a>
+        <a class="button small" href="{{ url_for('review', queue_id=selected_queue_id or '', url_status=url_status, source=source, q=q, page=pagination.prev_page, page_size=pagination.page_size) }}" data-review-page="{{ pagination.prev_page }}">Previous</a>
       {% else %}
         <span class="button small disabled">Previous</span>
       {% endif %}
       <span class="muted" data-review-showing>Showing {{ urls|length }} rows on this page</span>
       {% if pagination.has_next %}
-        <a class="button small" href="{{ url_for('review', url_status=url_status, source=source, q=q, page=pagination.next_page, page_size=pagination.page_size) }}" data-review-page="{{ pagination.next_page }}">Next</a>
+        <a class="button small" href="{{ url_for('review', queue_id=selected_queue_id or '', url_status=url_status, source=source, q=q, page=pagination.next_page, page_size=pagination.page_size) }}" data-review-page="{{ pagination.next_page }}">Next</a>
       {% else %}
         <span class="button small disabled">Next</span>
       {% endif %}
@@ -94,6 +108,7 @@
         data-review-bulk-form
         data-api-action="{{ url_for('bulk_review_urls_api') }}"
       >
+        <input type="hidden" name="queue_id" value="{{ selected_queue_id or '' }}">
         <span class="muted">Select URL rows, then apply one action.</span>
         <button class="button small primary" type="submit" name="bulk_action" value="approve">Approve Selected</button>
         <button class="button small" type="submit" name="bulk_action" value="reject">Reject Selected</button>
@@ -140,7 +155,7 @@
         <thead>
           <tr>
             <th class="select-col">
-              <input class="bulk-toggle" type="checkbox" data-bulk-target="url_ids" aria-label="Select all visible URL rows" {% if url_status != "pending_review" %}disabled{% endif %}>
+              <input class="bulk-toggle" type="checkbox" data-bulk-target="url_ids" aria-label="Select all visible URL rows" {% if url_status != "pending_review" or not selected_queue_id %}disabled{% endif %}>
             </th>
             <th>ID</th>
             <th>Domain</th>
@@ -194,10 +209,10 @@
               <td class="cell-actions review-url-actions-cell">
                 {% if row.review_status == "pending_review" %}
                   <div class="row-actions">
-                    <form method="post" action="{{ url_for('approve_url', url_id=row.id) }}" data-review-action-form data-review-action="approve" data-api-action="{{ url_for('approve_url_api', url_id=row.id) }}">
+                    <form method="post" action="{{ url_for('approve_url', url_id=row.id, queue_id=selected_queue_id or '') }}" data-review-action-form data-review-action="approve" data-api-action="{{ url_for('approve_url_api', url_id=row.id, queue_id=selected_queue_id or '') }}">
                       <button class="button small primary" type="submit">Approve</button>
                     </form>
-                    <form method="post" action="{{ url_for('reject_url_route', url_id=row.id) }}" data-review-action-form data-review-action="reject" data-api-action="{{ url_for('reject_url_api', url_id=row.id) }}">
+                    <form method="post" action="{{ url_for('reject_url_route', url_id=row.id, queue_id=selected_queue_id or '') }}" data-review-action-form data-review-action="reject" data-api-action="{{ url_for('reject_url_api', url_id=row.id, queue_id=selected_queue_id or '') }}">
                       <button class="button small" type="submit">Reject</button>
                     </form>
                   </div>
@@ -207,7 +222,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="10" class="empty">No URLs in this tab.</td></tr>
+            <tr><td colspan="10" class="empty">{% if selected_queue_id %}No URLs in this tab for the selected URL queue.{% else %}No URL queues exist yet.{% endif %}</td></tr>
           {% endfor %}
         </tbody>
       </table>

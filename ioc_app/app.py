@@ -897,7 +897,13 @@ def create_app(start_worker: bool = False) -> Flask:
         q = request.args.get("q", "").strip()
         page_size = request.args.get("page_size", type=int) or DEFAULT_REVIEW_PAGE_SIZE
         with connect() as conn:
-            total = count_review_urls(conn, url_status, q, source)
+            url_queues = query_review_url_queues(conn)
+            selected_queue_id = resolve_review_url_queue_id(
+                url_queues,
+                request.args.get("queue_id", type=int),
+            )
+            selected_queue = review_url_queue_by_id(url_queues, selected_queue_id)
+            total = count_review_urls(conn, selected_queue_id, url_status, q, source)
             pagination = build_pagination(
                 request.args.get("page", type=int),
                 total,
@@ -906,6 +912,7 @@ def create_app(start_worker: bool = False) -> Flask:
             )
             urls = query_review_urls(
                 conn,
+                selected_queue_id,
                 url_status,
                 q,
                 source,
@@ -917,6 +924,9 @@ def create_app(start_worker: bool = False) -> Flask:
             urls=urls,
             url_status=url_status,
             review_tabs=REVIEW_TABS,
+            url_queues=url_queues,
+            selected_queue=selected_queue,
+            selected_queue_id=selected_queue_id,
             source=source,
             q=q,
             pagination=pagination,
@@ -932,20 +942,30 @@ def create_app(start_worker: bool = False) -> Flask:
         q = request.args.get("q", "").strip()
         page_size = request.args.get("page_size", type=int) or DEFAULT_REVIEW_PAGE_SIZE
         with connect() as conn:
+            url_queues = query_review_url_queues(conn)
+            selected_queue_id = resolve_review_url_queue_id(
+                url_queues,
+                request.args.get("queue_id", type=int),
+            )
             payload = build_review_urls_payload(
                 conn,
+                selected_queue_id,
                 url_status,
                 q,
                 source,
                 request.args.get("page", type=int),
                 page_size,
             )
+            payload["url_queues"] = [serialize_review_url_queue(row) for row in url_queues]
         return jsonify({"ok": True, **payload})
 
     @app.post("/api/review/urls/<int:url_id>/approve")
     def approve_url_api(url_id: int):
         with connect() as conn:
-            changed = approve_url_and_enqueue(conn, url_id)
+            queue_id = read_review_queue_id(request.args)
+            if queue_id and not get_queue(conn, queue_id, "url_crawl"):
+                return jsonify({"ok": False, "error": "URL queue is invalid."}), 400
+            changed = approve_url_and_enqueue(conn, url_id, queue_id=queue_id)
         return jsonify(
             {
                 "ok": True,
@@ -977,6 +997,7 @@ def create_app(start_worker: bool = False) -> Flask:
         payload = request.get_json(silent=True) if request.is_json else None
         payload = payload or request.form
         action = (payload.get("bulk_action") or payload.get("action") or "").strip()
+        queue_id = read_review_queue_id(payload) or request.args.get("queue_id", type=int)
         raw_ids = payload.get("url_ids", [])
         if isinstance(raw_ids, str):
             raw_ids = [raw_ids]
@@ -987,9 +1008,11 @@ def create_app(start_worker: bool = False) -> Flask:
             return jsonify({"ok": False, "error": "Select at least one URL row."}), 400
         changed = 0
         with connect() as conn:
+            if queue_id and not get_queue(conn, queue_id, "url_crawl"):
+                return jsonify({"ok": False, "error": "URL queue is invalid."}), 400
             if action == "approve":
                 for url_id in url_ids:
-                    if approve_url_and_enqueue(conn, url_id):
+                    if approve_url_and_enqueue(conn, url_id, queue_id=queue_id):
                         changed += 1
             elif action == "reject":
                 for url_id in url_ids:
@@ -1010,7 +1033,8 @@ def create_app(start_worker: bool = False) -> Flask:
     @app.post("/urls/<int:url_id>/approve")
     def approve_url(url_id: int):
         with connect() as conn:
-            changed = approve_url_and_enqueue(conn, url_id)
+            queue_id = request.args.get("queue_id", type=int)
+            changed = approve_url_and_enqueue(conn, url_id, queue_id=queue_id)
         flash(
             "URL approved and crawl job queued if needed." if changed else "URL is already reviewed and is read-only.",
             "success" if changed else "error",
@@ -1030,6 +1054,7 @@ def create_app(start_worker: bool = False) -> Flask:
     @app.post("/urls/bulk")
     def bulk_review_urls():
         action = request.form.get("bulk_action", "")
+        queue_id = request.form.get("queue_id", type=int)
         url_ids = unique_ints(request.form.getlist("url_ids"))
         if not url_ids:
             flash("Select at least one URL row.", "error")
@@ -1038,7 +1063,7 @@ def create_app(start_worker: bool = False) -> Flask:
         with connect() as conn:
             if action == "approve":
                 for url_id in url_ids:
-                    if approve_url_and_enqueue(conn, url_id):
+                    if approve_url_and_enqueue(conn, url_id, queue_id=queue_id):
                         changed += 1
             elif action == "reject":
                 for url_id in url_ids:
@@ -3280,9 +3305,91 @@ def read_rule_form() -> dict[str, object]:
     }
 
 
-def build_review_url_filters(status: str, q: str, source: str) -> tuple[str, list[object]]:
+def query_review_url_queues(conn):
+    return conn.execute(
+        """
+        SELECT q.id,
+               q.name,
+               q.status,
+               q.queue_type,
+               q.created_at,
+               COUNT(DISTINCT uqi.url_id) AS url_count,
+               SUM(
+                 CASE
+                   WHEN u.review_status = 'pending_review'
+                    AND u.crawl_status NOT IN ('crawled', 'metadata_only')
+                   THEN 1
+                   ELSE 0
+                 END
+               ) AS pending_review_count
+        FROM queues q
+        LEFT JOIN url_queue_items uqi ON uqi.queue_id = q.id
+        LEFT JOIN urls u ON u.id = uqi.url_id
+        WHERE q.queue_type = 'url_crawl'
+        GROUP BY q.id, q.name, q.status, q.queue_type, q.created_at
+        ORDER BY q.id DESC
+        """
+    ).fetchall()
+
+
+def resolve_review_url_queue_id(url_queues, requested_queue_id: int | None) -> int | None:
+    queue_ids = {int(row["id"]) for row in url_queues}
+    if requested_queue_id in queue_ids:
+        return requested_queue_id
+    if url_queues:
+        return int(url_queues[0]["id"])
+    return None
+
+
+def review_url_queue_by_id(url_queues, queue_id: int | None):
+    if not queue_id:
+        return None
+    for row in url_queues:
+        if int(row["id"]) == int(queue_id):
+            return row
+    return None
+
+
+def serialize_review_url_queue(row) -> dict[str, object]:
+    return {
+        "id": row["id"],
+        "name": row["name"] or "",
+        "status": row["status"] or "",
+        "url_count": row["url_count"] or 0,
+        "pending_review_count": row["pending_review_count"] or 0,
+    }
+
+
+def read_review_queue_id(values) -> int | None:
+    raw = values.get("queue_id") if hasattr(values, "get") else None
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    try:
+        queue_id = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return queue_id if queue_id > 0 else None
+
+
+def build_review_url_filters(queue_id: int | None, status: str, q: str, source: str) -> tuple[str, list[object]]:
     params: list[object] = []
     where = []
+    if queue_id:
+        where.append(
+            """
+            EXISTS (
+              SELECT 1
+              FROM url_queue_items review_item
+              JOIN queues review_queue ON review_queue.id = review_item.queue_id
+              WHERE review_item.url_id = u.id
+                AND review_item.queue_id = ?
+                AND review_queue.queue_type = 'url_crawl'
+            )
+            """
+        )
+        params.append(queue_id)
+    else:
+        where.append("0 = 1")
     if status:
         where.append("u.review_status = ?")
         params.append(status)
@@ -3350,8 +3457,8 @@ def media_asset_url_sql(column: str) -> tuple[str, list[object]]:
     return " OR ".join(checks) if checks else "0 = 1", params
 
 
-def count_review_urls(conn, status: str, q: str, source: str) -> int:
-    where_sql, params = build_review_url_filters(status, q, source)
+def count_review_urls(conn, queue_id: int | None, status: str, q: str, source: str) -> int:
+    where_sql, params = build_review_url_filters(queue_id, status, q, source)
     return scalar(
         conn,
         f"""
@@ -3365,13 +3472,14 @@ def count_review_urls(conn, status: str, q: str, source: str) -> int:
 
 def query_review_urls(
     conn,
+    queue_id: int | None,
     status: str,
     q: str,
     source: str = "",
     limit: int = DEFAULT_REVIEW_PAGE_SIZE,
     offset: int = 0,
 ):
-    where_sql, params = build_review_url_filters(status, q, source)
+    where_sql, params = build_review_url_filters(queue_id, status, q, source)
     rows = conn.execute(
         f"""
         SELECT u.id,
@@ -3389,11 +3497,16 @@ def query_review_urls(
                u.crawl_error,
                u.crawled_at,
                u.created_at,
+               MAX(selected_queue_item.status) AS queue_item_status,
+               MAX(selected_queue_item.error) AS queue_item_error,
                GROUP_CONCAT(DISTINCT us.source_type) AS sources,
                GROUP_CONCAT(DISTINCT sq.query_text) AS queries,
                COALESCE(NULLIF(u.title, ''), MIN(NULLIF(us.title, ''))) AS title,
                MIN(us.snippet) AS snippet
         FROM urls u
+        JOIN url_queue_items selected_queue_item
+          ON selected_queue_item.url_id = u.id
+         AND selected_queue_item.queue_id = ?
         LEFT JOIN url_sources us ON us.url_id = u.id
         LEFT JOIN search_queries sq ON sq.id = us.search_query_id
         {where_sql}
@@ -3401,20 +3514,21 @@ def query_review_urls(
         ORDER BY u.created_at DESC
         LIMIT ? OFFSET ?
         """,
-        (*params, limit, offset),
+        (queue_id, *params, limit, offset),
     ).fetchall()
     return rows
 
 
 def build_review_urls_payload(
     conn,
+    queue_id: int | None,
     status: str,
     q: str,
     source: str,
     requested_page: int | None,
     requested_page_size: int | None,
 ) -> dict[str, object]:
-    total = count_review_urls(conn, status, q, source)
+    total = count_review_urls(conn, queue_id, status, q, source)
     pagination = build_pagination(
         requested_page,
         total,
@@ -3423,6 +3537,7 @@ def build_review_urls_payload(
     )
     rows = query_review_urls(
         conn,
+        queue_id,
         status,
         q,
         source,
@@ -3430,6 +3545,7 @@ def build_review_urls_payload(
         int(pagination["offset"]),
     )
     return {
+        "queue_id": queue_id,
         "url_status": status,
         "source": source,
         "q": q,
@@ -3448,6 +3564,8 @@ def serialize_review_url(row) -> dict[str, object]:
         "first_source": row["first_source"] or "",
         "review_status": row["review_status"] or "",
         "crawl_status": row["crawl_status"] or "",
+        "queue_item_status": row["queue_item_status"] or "",
+        "queue_item_error": row["queue_item_error"] or "",
         "title": row["title"] or "",
         "queries": row["queries"] or "",
         "sources": row["sources"] or "",

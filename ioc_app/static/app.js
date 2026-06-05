@@ -432,6 +432,11 @@
   function currentReviewParams() {
     const panel = reviewPanel();
     const params = new URLSearchParams(window.location.search);
+    if (!params.get("queue_id")) {
+      const queueSelect = document.querySelector("[data-review-queue-select]");
+      const selectedQueue = queueSelect && queueSelect.value ? queueSelect.value : "";
+      params.set("queue_id", panel ? panel.dataset.queueId || selectedQueue : selectedQueue);
+    }
     if (!params.get("url_status")) {
       params.set("url_status", panel ? panel.dataset.urlStatus || "pending_review" : "pending_review");
     }
@@ -493,6 +498,8 @@
 
     const panel = reviewPanel();
     const apiBase = panel ? (panel.getAttribute("data-review-endpoint") || "/api/review/urls").replace(/\/$/, "") : "/api/review/urls";
+    const queueId = panel ? panel.dataset.queueId || "" : "";
+    const queueQuery = queueId ? `?queue_id=${encodeURIComponent(queueId)}` : "";
     body.innerHTML = rows
       .map(function (row) {
         const id = row.id || "";
@@ -508,10 +515,10 @@
         const actions = pending
           ? `
             <div class="row-actions">
-              <form method="post" action="/urls/${escapeHtml(id)}/approve" data-review-action-form data-review-action="approve" data-api-action="${escapeHtml(apiBase)}/${escapeHtml(id)}/approve">
+              <form method="post" action="/urls/${escapeHtml(id)}/approve${escapeHtml(queueQuery)}" data-review-action-form data-review-action="approve" data-api-action="${escapeHtml(apiBase)}/${escapeHtml(id)}/approve${escapeHtml(queueQuery)}">
                 <button class="button small primary" type="submit">Approve</button>
               </form>
-              <form method="post" action="/urls/${escapeHtml(id)}/reject" data-review-action-form data-review-action="reject" data-api-action="${escapeHtml(apiBase)}/${escapeHtml(id)}/reject">
+              <form method="post" action="/urls/${escapeHtml(id)}/reject${escapeHtml(queueQuery)}" data-review-action-form data-review-action="reject" data-api-action="${escapeHtml(apiBase)}/${escapeHtml(id)}/reject${escapeHtml(queueQuery)}">
                 <button class="button small" type="submit">Reject</button>
               </form>
             </div>
@@ -557,6 +564,7 @@
       return;
     }
     const pagination = payload.pagination || {};
+    panel.dataset.queueId = String(payload.queue_id || params.get("queue_id") || "");
     panel.dataset.urlStatus = payload.url_status || params.get("url_status") || "pending_review";
     panel.dataset.source = payload.source || "";
     panel.dataset.q = payload.q || "";
@@ -570,13 +578,27 @@
     if (showing) {
       showing.textContent = `Showing ${payload.count || 0} rows on this page`;
     }
+    const selectedQueueLabel = panel.querySelector("[data-review-selected-queue]");
+    if (selectedQueueLabel) {
+      const queues = Array.isArray(payload.url_queues) ? payload.url_queues : [];
+      const selectedQueue = queues.find(function (queue) {
+        return String(queue.id || "") === panel.dataset.queueId;
+      });
+      selectedQueueLabel.textContent = selectedQueue
+        ? `#${selectedQueue.id} · ${selectedQueue.name || "URL Queue"}`
+        : "";
+    }
 
     const filterForm = document.querySelector("[data-review-filter-form]");
     if (filterForm) {
+      const filterQueue = filterForm.querySelector("[data-review-queue-select]");
       const filterStatus = filterForm.querySelector("input[name='url_status']");
       const filterSource = filterForm.querySelector("select[name='source']");
       const filterQuery = filterForm.querySelector("input[name='q']");
       const filterPageSize = filterForm.querySelector("input[name='page_size']");
+      if (filterQueue) {
+        filterQueue.value = panel.dataset.queueId;
+      }
       if (filterStatus) {
         filterStatus.value = panel.dataset.urlStatus;
       }
@@ -589,6 +611,10 @@
       if (filterPageSize) {
         filterPageSize.value = panel.dataset.pageSize;
       }
+    }
+    const bulkQueueInput = document.querySelector("[data-review-bulk-form] input[name='queue_id']");
+    if (bulkQueueInput) {
+      bulkQueueInput.value = panel.dataset.queueId;
     }
 
     const paginationBar = panel.querySelector("[data-review-pagination]");
@@ -635,6 +661,7 @@
         throw new Error(payload.error || "Unable to fetch review rows.");
       }
       const rows = Array.isArray(payload.items) ? payload.items : [];
+      panel.dataset.queueId = String(payload.queue_id || params.get("queue_id") || "");
       renderReviewUrlRows(body, rows);
       syncReviewChrome(payload, params);
       const page = payload.pagination && payload.pagination.page ? payload.pagination.page : params.get("page") || "1";
@@ -705,6 +732,7 @@
       const result = await postReviewJson(endpoint, {
         action,
         bulk_action: action,
+        queue_id: currentReviewParams().get("queue_id") || "",
         url_ids: ids,
       });
       const params = currentReviewParams();
