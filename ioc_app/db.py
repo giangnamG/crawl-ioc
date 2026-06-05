@@ -32,6 +32,7 @@ TIMESTAMP_COLUMNS = (
     "heartbeat_at",
     "counts_updated_at",
     "deleted_at",
+    "collected_at",
 )
 
 
@@ -537,6 +538,12 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ensure_column(
         conn,
         "iocs",
+        "collected_at",
+        "TIMESTAMPTZ" if is_postgres_connection(conn) else "TEXT",
+    )
+    ensure_column(
+        conn,
+        "iocs",
         "deleted_at",
         "TIMESTAMPTZ" if is_postgres_connection(conn) else "TEXT",
     )
@@ -706,8 +713,8 @@ def upsert_ioc_record(
 
     conn.execute(
         """
-        INSERT OR IGNORE INTO iocs(type, value_raw, value_norm)
-        VALUES (?, ?, ?)
+        INSERT OR IGNORE INTO iocs(type, value_raw, value_norm, collected_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (ioc_type, value_raw, value_norm),
     )
@@ -2306,6 +2313,7 @@ CREATE TABLE IF NOT EXISTS iocs (
   value_norm TEXT NOT NULL,
   deleted INTEGER NOT NULL DEFAULT 0,
   deleted_at TEXT,
+  collected_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (type, value_norm)
 );

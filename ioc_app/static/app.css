@@ -595,11 +595,15 @@ tbody tr:hover .review-url-actions-cell {
 }
 
 .ioc-col-value {
-  width: 22%;
+  width: 19%;
+}
+
+.ioc-col-collected {
+  width: 124px;
 }
 
 .ioc-col-sources {
-  width: 28%;
+  width: 25%;
 }
 
 .ioc-col-source-type {

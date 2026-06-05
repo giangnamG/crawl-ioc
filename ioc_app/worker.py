@@ -1346,11 +1346,14 @@ def process_crawl_url(
         ioc_id = upsert_ioc(conn, ioc.type, ioc.raw, ioc_value_norm)
         if not ioc_id:
             continue
+        source_type = "crawl"
+        if result.fetch_method == "google_drive_folder":
+            source_type = "google_drive_owner_menu" if ioc.type == "email" else "google_drive_folder"
         upsert_ioc_source(
             conn,
             ioc_id,
             url_id,
-            "crawl",
+            source_type,
             extraction_rule_id=ioc.rule_id,
             evidence_text=ioc.evidence,
         )

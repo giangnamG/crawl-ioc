@@ -224,6 +224,7 @@
       type: modal.querySelector("[data-ioc-evidence-type]"),
       value: modal.querySelector("[data-ioc-evidence-value]"),
       count: modal.querySelector("[data-ioc-evidence-count]"),
+      collected: modal.querySelector("[data-ioc-evidence-collected]"),
       status: modal.querySelector("[data-ioc-evidence-status]"),
       list: modal.querySelector("[data-ioc-evidence-list]"),
     };
@@ -348,6 +349,9 @@
       }
       if (elements.count) {
         elements.count.textContent = `${sources.length} source row${sources.length === 1 ? "" : "s"}`;
+      }
+      if (elements.collected) {
+        elements.collected.textContent = ioc.collected_at || "";
       }
       renderEvidenceRows(elements, sources);
     } catch (error) {

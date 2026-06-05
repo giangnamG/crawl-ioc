@@ -95,6 +95,7 @@
           <option value="all">All visible text</option>
           <option value="type">Type</option>
           <option value="value">Value</option>
+          <option value="collected">Collected</option>
           <option value="domain">Source domain</option>
           <option value="url">Source URL</option>
           <option value="source">Source type</option>
@@ -116,6 +117,7 @@
           <col class="ioc-col-id">
           <col class="ioc-col-type">
           <col class="ioc-col-value">
+          <col class="ioc-col-collected">
           <col class="ioc-col-sources">
           <col class="ioc-col-source-type">
           <col class="ioc-col-count">
@@ -130,6 +132,7 @@
             <th>ID</th>
             <th>Type</th>
             <th>Normalized Value</th>
+            <th>Collected</th>
             <th>Source Domain / URL</th>
             <th>Source</th>
             <th>Count</th>
@@ -143,6 +146,7 @@
               class="{{ 'selected-row' if selected and selected.id == row.id else '' }}"
               data-pattern-type="{{ row.type }}"
               data-pattern-value="{{ row.value_norm }}"
+              data-pattern-collected="{{ row.collected_at or '' }}"
               data-pattern-domain="{{ row.source_domains or '' }}"
               data-pattern-url="{{ row.source_urls or '' }}"
               data-pattern-source="{{ row.source_types or '' }}"
@@ -154,6 +158,7 @@
               <td>#{{ row.id }}</td>
               <td><span class="tag">{{ row.type }}</span></td>
               <td><code>{{ row.value_norm|truncate_middle(96) }}</code></td>
+              <td>{{ row.collected_at or "" }}</td>
               <td>
                 <div class="source-inline-list">
                   {% for source_domain in (row.source_domains.split(",") if row.source_domains else []) %}
@@ -197,7 +202,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="9" class="empty">No IOCs extracted yet.</td></tr>
+            <tr><td colspan="10" class="empty">No IOCs extracted yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -242,6 +247,10 @@
         <div class="summary-pill">
           <span>Sources</span>
           <strong data-ioc-evidence-count></strong>
+        </div>
+        <div class="summary-pill">
+          <span>Collected</span>
+          <strong data-ioc-evidence-collected></strong>
         </div>
       </div>
       <div class="modal-status" data-ioc-evidence-status>Loading evidence...</div>

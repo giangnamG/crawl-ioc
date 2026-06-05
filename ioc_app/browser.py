@@ -16,7 +16,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from .db import ROOT_DIR
-from .normalizers import normalize_url
+from .normalizers import normalize_email, normalize_url
 
 
 USER_AGENT = (
@@ -46,6 +46,17 @@ GOOGLE_NO_RESULT_PATTERNS = (
 )
 
 GOOGLE_EMPTY_RESULTS_ERROR = "Google search page loaded without parseable result links"
+
+GOOGLE_DRIVE_PERMISSION_DENIED_PATTERNS = (
+    "you need access",
+    "request access",
+    "access denied",
+    "permission denied",
+    "bạn cần có quyền truy cập",
+    "yêu cầu quyền truy cập",
+    "truy cập bị từ chối",
+    "không có quyền truy cập",
+)
 
 PROXY_RETRY_PATTERNS = (
     "TimeoutError",
@@ -173,6 +184,7 @@ class BrowserClient:
         self.profile_isolation = env_bool("CLOAK_PROFILE_ISOLATION", True)
         self.profile_lock_fallback = env_bool("CLOAK_PROFILE_LOCK_FALLBACK", True)
         self.crawl_profile_per_job = env_bool("CLOAK_CRAWL_PROFILE_PER_JOB", True)
+        self.drive_folder_max_items = int(os.environ.get("GOOGLE_DRIVE_FOLDER_MAX_ITEMS", "250"))
         self.profile_scope = profile_scope_from_env()
         self.instance_scope = uuid.uuid4().hex[:10]
 
@@ -188,6 +200,12 @@ class BrowserClient:
     def fetch_url(self, url: str) -> FetchResult:
         if self.provider == "http":
             return HttpFallbackClient(self.max_pages, self.timeout_ms).fetch_url(url)
+        if is_google_drive_folder_url(url):
+            return self._run_with_proxy_retries(
+                lambda: self._fetch_google_drive_folder_with_cloak(url),
+                allow_direct=True,
+                operation_name="Google Drive folder crawl",
+            )
         try:
             return self._run_with_proxy_retries(
                 lambda: self._fetch_url_with_cloak(url),
@@ -430,6 +448,248 @@ class BrowserClient:
             )
         finally:
             ctx.close()
+
+    def _fetch_google_drive_folder_with_cloak(self, url: str) -> FetchResult:
+        ctx = self._launch_context("crawl")
+        redirects: list[str] = []
+        try:
+            page = ctx.new_page()
+            page.set_default_timeout(self.timeout_ms)
+
+            def on_response(response):
+                if response.request.is_navigation_request():
+                    redirects.append(response.url)
+
+            page.on("response", on_response)
+            response = page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            self._wait_for_settle(page)
+
+            if google_drive_permission_denied(page):
+                html_text = page.content()
+                text = safe_body_text(page)
+                return FetchResult(
+                    final_url=page.url,
+                    status_code=403,
+                    html=html_text,
+                    text=text,
+                    links=[],
+                    redirects=dedupe_keep_order(redirects),
+                    content_type=(response.headers.get("content-type") if response else None),
+                    content_length=len(html_text),
+                    fetch_method="google_drive_folder",
+                    is_text=False,
+                    error="Google Drive folder is not public or requires login; permission denied.",
+                )
+
+            self._wait_for_google_drive_folder(page)
+            if google_drive_permission_denied(page):
+                html_text = page.content()
+                text = safe_body_text(page)
+                return FetchResult(
+                    final_url=page.url,
+                    status_code=403,
+                    html=html_text,
+                    text=text,
+                    links=[],
+                    redirects=dedupe_keep_order(redirects),
+                    content_type=(response.headers.get("content-type") if response else None),
+                    content_length=len(html_text),
+                    fetch_method="google_drive_folder",
+                    is_text=False,
+                    error="Google Drive folder is not public or requires login; permission denied.",
+                )
+            owner_emails = self._collect_google_drive_owner_emails(page)
+            html_text = page.content()
+            text = safe_body_text(page)
+            links = collect_page_links(page)
+            normalized_links = normalize_page_links(page.url, links)
+            owner_text = "\n".join(f"Google Drive owner email: {email}" for email in owner_emails)
+            combined_text = "\n".join(part for part in (text, owner_text) if part)
+            combined_html = html_text
+            if owner_emails:
+                combined_html += "\n<!-- google_drive_owner_emails: " + ", ".join(owner_emails) + " -->"
+
+            return FetchResult(
+                final_url=page.url,
+                status_code=response.status if response else 200,
+                html=combined_html,
+                text=combined_text,
+                links=normalized_links,
+                redirects=dedupe_keep_order(redirects),
+                content_type=(response.headers.get("content-type") if response else "text/html"),
+                content_length=len(combined_html),
+                fetch_method="google_drive_folder",
+                error=None,
+            )
+        finally:
+            ctx.close()
+
+    def _wait_for_google_drive_folder(self, page) -> None:
+        selectors = [
+            "div[role='main']",
+            "div[role='grid']",
+            "div[role='row']",
+            "[aria-label*='More actions']",
+            "[aria-label*='Thao tác khác']",
+        ]
+        timeout = min(self.timeout_ms, 20000)
+        for selector in selectors:
+            try:
+                page.wait_for_selector(selector, state="attached", timeout=timeout)
+                return
+            except Exception:
+                continue
+        if google_drive_permission_denied(page):
+            return
+
+    def _collect_google_drive_owner_emails(self, page) -> list[str]:
+        emails: set[str] = set()
+        processed: set[str] = set()
+        stable_rounds = 0
+        max_rounds = max(5, min(50, self.drive_folder_max_items // 5))
+
+        for _round in range(max_rounds):
+            rows = self._google_drive_item_rows(page)
+            visible_count = min(rows.count(), 80)
+            before_count = len(processed)
+            for index in range(visible_count):
+                if len(processed) >= self.drive_folder_max_items:
+                    break
+                row = rows.nth(index)
+                try:
+                    if not row.is_visible(timeout=500):
+                        continue
+                    row_text = clean_text(row.inner_text(timeout=1200))
+                except Exception:
+                    continue
+                if not self._looks_like_drive_item_row(row_text):
+                    continue
+                signature = row_text[:240]
+                if signature in processed:
+                    continue
+                processed.add(signature)
+                emails.update(self._collect_google_drive_owner_emails_for_row(page, row))
+
+            if len(processed) >= self.drive_folder_max_items:
+                break
+
+            scrolled = self._scroll_google_drive_folder(page)
+            if len(processed) == before_count and not scrolled:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+            if stable_rounds >= 2:
+                break
+
+        return sorted(emails)
+
+    def _google_drive_item_rows(self, page):
+        selectors = [
+            "div[role='grid'] div[role='row']",
+            "div[role='main'] div[role='row']",
+            "div[role='row']",
+        ]
+        best = page.locator("div[role='row']")
+        best_count = 0
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                count = locator.count()
+            except Exception:
+                continue
+            if count > best_count:
+                best = locator
+                best_count = count
+        return best
+
+    def _looks_like_drive_item_row(self, row_text: str) -> bool:
+        if not row_text:
+            return False
+        lowered = row_text.lower()
+        header_terms = ("tên chủ sở hữu", "name owner", "ngày sửa đổi", "modified")
+        return not any(term in lowered for term in header_terms)
+
+    def _collect_google_drive_owner_emails_for_row(self, page, row) -> set[str]:
+        emails: set[str] = set()
+        try:
+            row.scroll_into_view_if_needed(timeout=1500)
+        except Exception:
+            pass
+        try:
+            row.click(timeout=3000)
+            time.sleep(0.2)
+        except Exception:
+            return emails
+
+        more_button = self._first_available_locator(
+            page,
+            [
+                "[aria-label*='Thao tác khác']",
+                "[aria-label*='More actions']",
+                "[data-tooltip*='Thao tác']",
+                "[data-tooltip*='More actions']",
+                "div[role='button'][aria-label*='More']",
+                "div[role='button'][aria-label*='Khác']",
+            ],
+        )
+        if more_button is None:
+            return emails
+
+        try:
+            more_button.click(timeout=3000)
+            time.sleep(0.25)
+            report_item = self._first_available_locator(
+                page,
+                [
+                    "div[role='menuitem']:has-text('Báo cáo hoặc chặn')",
+                    "div[role='menuitem']:has-text('Report or block')",
+                    "div[role='menuitem']:has-text('Report')",
+                ],
+            )
+            if report_item is None:
+                return emails
+            report_item.hover(timeout=3000)
+            time.sleep(0.45)
+            emails.update(extract_email_addresses(safe_body_text(page)))
+        finally:
+            try:
+                page.keyboard.press("Escape")
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+        return emails
+
+    def _scroll_google_drive_folder(self, page) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    """
+                    () => {
+                      const candidates = [
+                        document.querySelector('div[role="grid"]'),
+                        document.querySelector('div[role="main"]'),
+                        document.scrollingElement,
+                        document.documentElement,
+                        document.body
+                      ].filter(Boolean);
+                      let changed = false;
+                      for (const el of candidates) {
+                        const before = el.scrollTop || 0;
+                        el.scrollTop = before + Math.max(650, Math.floor(window.innerHeight * 0.75));
+                        if ((el.scrollTop || 0) !== before) changed = true;
+                      }
+                      return changed;
+                    }
+                    """
+                )
+            )
+        except Exception:
+            try:
+                page.mouse.wheel(0, 900)
+                time.sleep(0.4)
+                return True
+            except Exception:
+                return False
 
     def _launch_context(self, profile_name: str):
         try:
@@ -1075,6 +1335,67 @@ def safe_body_text(page) -> str:
             return page.evaluate("() => document.body ? document.body.innerText : ''")
         except Exception:
             return ""
+
+
+def collect_page_links(page) -> list[str]:
+    try:
+        return list(
+            page.evaluate(
+                """
+                () => Array.from(document.querySelectorAll('[href],[src],[action]'))
+                  .map(el => el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('action'))
+                  .filter(Boolean)
+                """
+            )
+        )
+    except Exception:
+        return []
+
+
+def normalize_page_links(base_url: str, links: list[str]) -> list[str]:
+    normalized_links: list[str] = []
+    for link in links:
+        absolute = urllib.parse.urljoin(base_url, str(link))
+        norm = normalize_url(absolute)
+        if norm and norm not in normalized_links:
+            normalized_links.append(norm)
+    return normalized_links
+
+
+def is_google_drive_folder_url(value: str) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(value)
+    except Exception:
+        return False
+    host = (parts.hostname or "").lower()
+    path = parts.path or ""
+    return host == "drive.google.com" and path.startswith("/drive/folders/")
+
+
+def google_drive_permission_denied(page) -> bool:
+    try:
+        current_url = str(getattr(page, "url", "") or "")
+    except Exception:
+        current_url = ""
+    parsed = urllib.parse.urlsplit(current_url)
+    host = (parsed.hostname or "").lower()
+    if host == "accounts.google.com" or "servicelogin" in current_url.lower():
+        return True
+    haystack = safe_body_text(page).lower()
+    return any(pattern in haystack for pattern in GOOGLE_DRIVE_PERMISSION_DENIED_PATTERNS)
+
+
+def extract_email_addresses(text: str) -> set[str]:
+    emails: set[str] = set()
+    for match in re.finditer(
+        r"\b[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,253}\.[A-Z]{2,24}\b",
+        text or "",
+        flags=re.IGNORECASE,
+    ):
+        normalized = normalize_email(match.group(0))
+        if normalized:
+            emails.add(normalized)
+    return emails
 
 
 def clean_text(value: str) -> str:

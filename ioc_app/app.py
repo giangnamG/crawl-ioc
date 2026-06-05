@@ -1139,6 +1139,7 @@ def create_app(start_worker: bool = False) -> Flask:
                     "type": selected["type"],
                     "value_raw": selected["value_raw"],
                     "value_norm": selected["value_norm"],
+                    "collected_at": str(selected["collected_at"] or ""),
                     "source_count": len(sources),
                 },
                 "sources": [
@@ -2240,6 +2241,7 @@ def build_ioc_filters(ioc_type: str, q: str, source_domain: str = "") -> tuple[s
               OR LOWER(COALESCE(i.type, '')) LIKE ?
               OR LOWER(COALESCE(i.value_norm, '')) LIKE ?
               OR LOWER(COALESCE(i.value_raw, '')) LIKE ?
+              OR LOWER(COALESCE(CAST(i.collected_at AS TEXT), '')) LIKE ?
               OR EXISTS (
                 SELECT 1
                 FROM ioc_sources s2
@@ -2257,7 +2259,7 @@ def build_ioc_filters(ioc_type: str, q: str, source_domain: str = "") -> tuple[s
             )
             """
         )
-        params.extend([like, like, like, like, like, like, like, like, like])
+        params.extend([like, like, like, like, like, like, like, like, like, like])
     where_sql = "WHERE " + " AND ".join(where) if where else ""
     return where_sql, params
 
