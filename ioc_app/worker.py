@@ -1661,10 +1661,15 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
         return False
     if target["review_status"] != "pending_review":
         return False
-    conn.execute(
-        "UPDATE urls SET review_status = 'approved' WHERE id = ? AND review_status = 'pending_review'",
-        (url_id,),
+    changed = (
+        conn.execute(
+            "UPDATE urls SET review_status = 'approved' WHERE id = ? AND review_status = 'pending_review'",
+            (url_id,),
+        ).rowcount
+        > 0
     )
+    if not changed:
+        return False
     record_keyword_search_url_ioc(conn, url_id)
     queue_rows = []
     if queue_id:

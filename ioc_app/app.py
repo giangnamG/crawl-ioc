@@ -17,7 +17,7 @@ from .db import (
     whitelist_match_sql,
 )
 from .extractor import test_rule, validate_rule
-from .normalizers import get_domain, is_media_asset_url, normalize_url
+from .normalizers import MEDIA_ASSET_EXTENSIONS, get_domain, is_media_asset_url, normalize_url
 from .worker import (
     TERMINAL_CRAWL_STATUSES,
     approve_url_and_enqueue,
@@ -904,18 +904,14 @@ def create_app(start_worker: bool = False) -> Flask:
                 page_size,
                 DEFAULT_REVIEW_PAGE_SIZE,
             )
-            urls = [
-                row
-                for row in query_review_urls(
-                    conn,
-                    url_status,
-                    q,
-                    source,
-                    pagination["page_size"],
-                    pagination["offset"],
-                )
-                if not is_media_asset_url(row["url_norm"])
-            ]
+            urls = query_review_urls(
+                conn,
+                url_status,
+                q,
+                source,
+                pagination["page_size"],
+                pagination["offset"],
+            )
         return render_template(
             "review.html",
             urls=urls,
@@ -924,6 +920,91 @@ def create_app(start_worker: bool = False) -> Flask:
             source=source,
             q=q,
             pagination=pagination,
+        )
+
+    @app.get("/api/review/urls")
+    def review_urls_api():
+        legacy_status = request.args.get("status")
+        url_status = normalize_review_status(
+            request.args.get("url_status") or legacy_status or "pending_review"
+        )
+        source = request.args.get("source", "")
+        q = request.args.get("q", "").strip()
+        page_size = request.args.get("page_size", type=int) or DEFAULT_REVIEW_PAGE_SIZE
+        with connect() as conn:
+            payload = build_review_urls_payload(
+                conn,
+                url_status,
+                q,
+                source,
+                request.args.get("page", type=int),
+                page_size,
+            )
+        return jsonify({"ok": True, **payload})
+
+    @app.post("/api/review/urls/<int:url_id>/approve")
+    def approve_url_api(url_id: int):
+        with connect() as conn:
+            changed = approve_url_and_enqueue(conn, url_id)
+        return jsonify(
+            {
+                "ok": True,
+                "changed": changed,
+                "url_id": url_id,
+                "message": (
+                    "URL approved and crawl job queued if needed."
+                    if changed
+                    else "URL is already reviewed and is read-only."
+                ),
+            }
+        )
+
+    @app.post("/api/review/urls/<int:url_id>/reject")
+    def reject_url_api(url_id: int):
+        with connect() as conn:
+            changed = reject_url(conn, url_id)
+        return jsonify(
+            {
+                "ok": True,
+                "changed": changed,
+                "url_id": url_id,
+                "message": "URL rejected." if changed else "URL is already reviewed and is read-only.",
+            }
+        )
+
+    @app.post("/api/review/urls/bulk")
+    def bulk_review_urls_api():
+        payload = request.get_json(silent=True) if request.is_json else None
+        payload = payload or request.form
+        action = (payload.get("bulk_action") or payload.get("action") or "").strip()
+        raw_ids = payload.get("url_ids", [])
+        if isinstance(raw_ids, str):
+            raw_ids = [raw_ids]
+        elif not isinstance(raw_ids, list):
+            raw_ids = request.form.getlist("url_ids")
+        url_ids = unique_ints(raw_ids)
+        if not url_ids:
+            return jsonify({"ok": False, "error": "Select at least one URL row."}), 400
+        changed = 0
+        with connect() as conn:
+            if action == "approve":
+                for url_id in url_ids:
+                    if approve_url_and_enqueue(conn, url_id):
+                        changed += 1
+            elif action == "reject":
+                for url_id in url_ids:
+                    if reject_url(conn, url_id):
+                        changed += 1
+            else:
+                return jsonify({"ok": False, "error": "Bulk URL action is invalid."}), 400
+        label = "approved" if action == "approve" else "rejected"
+        return jsonify(
+            {
+                "ok": True,
+                "changed": changed,
+                "selected": len(url_ids),
+                "message": f"Bulk URL action completed: {changed} of {len(url_ids)} selected URLs {label}.",
+            }
         )
 
     @app.post("/urls/<int:url_id>/approve")
@@ -3207,6 +3288,9 @@ def build_review_url_filters(status: str, q: str, source: str) -> tuple[str, lis
         params.append(status)
     where.append("u.crawl_status NOT IN ('crawled', 'metadata_only')")
     where.append("u.review_status != 'ignored_whitelist'")
+    media_sql, media_params = media_asset_url_sql("u.url_norm")
+    where.append(f"NOT ({media_sql})")
+    params.extend(media_params)
     if q:
         where.append(
             """
@@ -3251,6 +3335,19 @@ def build_review_url_filters(status: str, q: str, source: str) -> tuple[str, lis
         params.append(source)
     where_sql = "WHERE " + " AND ".join(where) if where else ""
     return where_sql, params
+
+
+def media_asset_url_sql(column: str) -> tuple[str, list[object]]:
+    checks = []
+    params: list[object] = []
+    for extension in sorted(MEDIA_ASSET_EXTENSIONS):
+        checks.append(f"LOWER({column}) LIKE ?")
+        params.append(f"%{extension}")
+        checks.append(f"LOWER({column}) LIKE ?")
+        params.append(f"%{extension}?%")
+        checks.append(f"LOWER({column}) LIKE ?")
+        params.append(f"%{extension}#%")
+    return " OR ".join(checks) if checks else "0 = 1", params
 
 
 def count_review_urls(conn, status: str, q: str, source: str) -> int:
@@ -3307,6 +3404,54 @@ def query_review_urls(
         (*params, limit, offset),
     ).fetchall()
     return rows
+
+
+def build_review_urls_payload(
+    conn,
+    status: str,
+    q: str,
+    source: str,
+    requested_page: int | None,
+    requested_page_size: int | None,
+) -> dict[str, object]:
+    total = count_review_urls(conn, status, q, source)
+    pagination = build_pagination(
+        requested_page,
+        total,
+        requested_page_size,
+        DEFAULT_REVIEW_PAGE_SIZE,
+    )
+    rows = query_review_urls(
+        conn,
+        status,
+        q,
+        source,
+        int(pagination["page_size"]),
+        int(pagination["offset"]),
+    )
+    return {
+        "url_status": status,
+        "source": source,
+        "q": q,
+        "pagination": pagination,
+        "count": len(rows),
+        "items": [serialize_review_url(row) for row in rows],
+    }
+
+
+def serialize_review_url(row) -> dict[str, object]:
+    return {
+        "id": row["id"],
+        "url_raw": row["url_raw"] or "",
+        "url_norm": row["url_norm"] or "",
+        "domain": row["domain"] or "",
+        "first_source": row["first_source"] or "",
+        "review_status": row["review_status"] or "",
+        "crawl_status": row["crawl_status"] or "",
+        "title": row["title"] or "",
+        "queries": row["queries"] or "",
+        "sources": row["sources"] or "",
+    }
 
 
 def source_matches(sources: str, wanted: str) -> bool:

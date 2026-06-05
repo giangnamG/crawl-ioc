@@ -10,8 +10,9 @@
       <h2>Filters</h2>
       <span class="muted">Use table tabs to switch review status.</span>
     </div>
-    <form method="get" class="filter-bar review-filter-bar">
+    <form method="get" class="filter-bar review-filter-bar" data-review-filter-form>
       <input type="hidden" name="url_status" value="{{ url_status }}">
+      <input type="hidden" name="page_size" value="{{ pagination.page_size }}">
       <label>
         <span>Source</span>
         <select name="source">
@@ -29,7 +30,16 @@
     </form>
   </section>
 
-  <section class="panel">
+  <section
+    class="panel"
+    data-review-panel
+    data-review-endpoint="{{ url_for('review_urls_api') }}"
+    data-review-page-url="{{ url_for('review') }}"
+    data-url-status="{{ url_status }}"
+    data-source="{{ source }}"
+    data-q="{{ q }}"
+    data-page-size="{{ pagination.page_size }}"
+  >
     <div class="panel-head">
       <div class="helper-title">
         <h2>URL Review Queue</h2>
@@ -45,19 +55,45 @@
           </span>
         </span>
       </div>
-      <span class="muted">{{ urls|length }} rows</span>
+      <div class="review-panel-actions">
+        <span class="muted review-feedback" data-review-feedback></span>
+        <span class="muted" data-review-summary>{{ pagination.total }} matches · page {{ pagination.page }}/{{ pagination.total_pages }}</span>
+        <button class="button small" type="button" data-review-fetch-new>Fetch New</button>
+      </div>
     </div>
     <nav class="table-tabs" aria-label="URL review status tabs">
       {% for tab in review_tabs %}
         <a
           class="tab-pill {% if url_status == tab.value %}active{% endif %}"
-          href="{{ url_for('review', url_status=tab.value, source=source, q=q) }}"
+          href="{{ url_for('review', url_status=tab.value, source=source, q=q, page_size=pagination.page_size) }}"
+          data-review-tab
+          data-review-status="{{ tab.value }}"
           aria-current="{{ 'page' if url_status == tab.value else 'false' }}"
         >{{ tab.label }}</a>
       {% endfor %}
     </nav>
+    <div class="pagination-bar" aria-label="URL review pagination" data-review-pagination>
+      {% if pagination.has_prev %}
+        <a class="button small" href="{{ url_for('review', url_status=url_status, source=source, q=q, page=pagination.prev_page, page_size=pagination.page_size) }}" data-review-page="{{ pagination.prev_page }}">Previous</a>
+      {% else %}
+        <span class="button small disabled">Previous</span>
+      {% endif %}
+      <span class="muted" data-review-showing>Showing {{ urls|length }} rows on this page</span>
+      {% if pagination.has_next %}
+        <a class="button small" href="{{ url_for('review', url_status=url_status, source=source, q=q, page=pagination.next_page, page_size=pagination.page_size) }}" data-review-page="{{ pagination.next_page }}">Next</a>
+      {% else %}
+        <span class="button small disabled">Next</span>
+      {% endif %}
+    </div>
     {% if url_status == "pending_review" %}
-      <form id="bulk-url-review-form" method="post" action="{{ url_for('bulk_review_urls') }}" class="bulk-action-bar">
+      <form
+        id="bulk-url-review-form"
+        method="post"
+        action="{{ url_for('bulk_review_urls') }}"
+        class="bulk-action-bar"
+        data-review-bulk-form
+        data-api-action="{{ url_for('bulk_review_urls_api') }}"
+      >
         <span class="muted">Select URL rows, then apply one action.</span>
         <button class="button small primary" type="submit" name="bulk_action" value="approve">Approve Selected</button>
         <button class="button small" type="submit" name="bulk_action" value="reject">Reject Selected</button>
@@ -117,9 +153,11 @@
             <th class="review-url-actions-head">Actions</th>
           </tr>
         </thead>
-        <tbody>
+        <tbody data-review-url-body>
           {% for row in urls %}
             <tr
+              data-review-url-row
+              data-review-url-id="{{ row.id }}"
               data-pattern-domain="{{ row.domain }}"
               data-pattern-url="{{ row.url_norm }}"
               data-pattern-title="{{ row.title or '' }}"
@@ -156,10 +194,10 @@
               <td class="cell-actions review-url-actions-cell">
                 {% if row.review_status == "pending_review" %}
                   <div class="row-actions">
-                    <form method="post" action="{{ url_for('approve_url', url_id=row.id) }}">
+                    <form method="post" action="{{ url_for('approve_url', url_id=row.id) }}" data-review-action-form data-review-action="approve" data-api-action="{{ url_for('approve_url_api', url_id=row.id) }}">
                       <button class="button small primary" type="submit">Approve</button>
                     </form>
-                    <form method="post" action="{{ url_for('reject_url_route', url_id=row.id) }}">
+                    <form method="post" action="{{ url_for('reject_url_route', url_id=row.id) }}" data-review-action-form data-review-action="reject" data-api-action="{{ url_for('reject_url_api', url_id=row.id) }}">
                       <button class="button small" type="submit">Reject</button>
                     </form>
                   </div>

@@ -209,6 +209,24 @@ h2 {
   margin-bottom: 12px;
 }
 
+.review-panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.review-feedback {
+  max-width: 360px;
+}
+
+.review-feedback.error {
+  color: #b91c1c;
+  font-weight: 600;
+}
+
 .helper-title {
   display: inline-flex;
   align-items: center;

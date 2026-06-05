@@ -408,6 +408,389 @@
       .join(" ");
   }
 
+  function reviewPanel() {
+    return document.querySelector("[data-review-panel]");
+  }
+
+  function sourceLabel(value) {
+    const labels = {
+      google_search: "Google",
+      extracted_from_crawl: "From Crawl",
+      keyword_search: "Keyword Search",
+      keyword_search_result: "Keyword Search",
+    };
+    return labels[value] || statusLabel(value);
+  }
+
+  function reviewPageUrl(params) {
+    const panel = reviewPanel();
+    const base = panel ? panel.getAttribute("data-review-page-url") || window.location.pathname : window.location.pathname;
+    const query = params.toString();
+    return `${base}${query ? `?${query}` : ""}`;
+  }
+
+  function currentReviewParams() {
+    const panel = reviewPanel();
+    const params = new URLSearchParams(window.location.search);
+    if (!params.get("url_status")) {
+      params.set("url_status", panel ? panel.dataset.urlStatus || "pending_review" : "pending_review");
+    }
+    if (!params.has("source")) {
+      params.set("source", panel ? panel.dataset.source || "" : "");
+    }
+    if (!params.has("q")) {
+      params.set("q", panel ? panel.dataset.q || "" : "");
+    }
+    if (!params.get("page_size")) {
+      params.set("page_size", panel ? panel.dataset.pageSize || "100" : "100");
+    }
+    if (!params.get("page")) {
+      params.set("page", "1");
+    }
+    return params;
+  }
+
+  function setReviewFeedback(message, isError) {
+    const panel = reviewPanel();
+    const feedback = panel ? panel.querySelector("[data-review-feedback]") : null;
+    if (!feedback) {
+      return;
+    }
+    feedback.textContent = message || "";
+    feedback.classList.toggle("error", Boolean(isError));
+  }
+
+  function setFormBusy(form, busy) {
+    if (!form) {
+      return;
+    }
+    form.querySelectorAll("button").forEach(function (button) {
+      button.disabled = busy;
+    });
+  }
+
+  function renderSourceTags(sources) {
+    return String(sources || "")
+      .split(",")
+      .map(function (item) {
+        return item.trim();
+      })
+      .filter(Boolean)
+      .map(function (item) {
+        return `<span class="tag">${escapeHtml(sourceLabel(item))}</span>`;
+      })
+      .join("");
+  }
+
+  function renderReviewUrlRows(body, rows) {
+    if (!body) {
+      return;
+    }
+    if (!rows || rows.length === 0) {
+      body.innerHTML = '<tr><td colspan="10" class="empty">No URLs in this tab.</td></tr>';
+      return;
+    }
+
+    const panel = reviewPanel();
+    const apiBase = panel ? (panel.getAttribute("data-review-endpoint") || "/api/review/urls").replace(/\/$/, "") : "/api/review/urls";
+    body.innerHTML = rows
+      .map(function (row) {
+        const id = row.id || "";
+        const url = row.url_norm || "";
+        const title = row.title || "";
+        const queries = row.queries || "";
+        const reviewStatus = row.review_status || "";
+        const crawlStatus = row.crawl_status || "";
+        const pending = reviewStatus === "pending_review";
+        const checkbox = pending
+          ? `<input type="checkbox" name="url_ids" value="${escapeHtml(id)}" form="bulk-url-review-form" aria-label="Select URL #${escapeHtml(id)}">`
+          : '<span class="readonly-note">-</span>';
+        const actions = pending
+          ? `
+            <div class="row-actions">
+              <form method="post" action="/urls/${escapeHtml(id)}/approve" data-review-action-form data-review-action="approve" data-api-action="${escapeHtml(apiBase)}/${escapeHtml(id)}/approve">
+                <button class="button small primary" type="submit">Approve</button>
+              </form>
+              <form method="post" action="/urls/${escapeHtml(id)}/reject" data-review-action-form data-review-action="reject" data-api-action="${escapeHtml(apiBase)}/${escapeHtml(id)}/reject">
+                <button class="button small" type="submit">Reject</button>
+              </form>
+            </div>
+          `
+          : '<span class="readonly-note">Read only</span>';
+        return `
+          <tr
+            data-review-url-row
+            data-review-url-id="${escapeHtml(id)}"
+            data-pattern-domain="${escapeHtml(row.domain || "")}"
+            data-pattern-url="${escapeHtml(url)}"
+            data-pattern-title="${escapeHtml(title)}"
+            data-pattern-source="${escapeHtml(row.sources || "")}"
+            data-pattern-query="${escapeHtml(queries)}"
+          >
+            <td class="cell-select">${checkbox}</td>
+            <td class="cell-id">#${escapeHtml(id)}</td>
+            <td class="cell-domain"><strong title="${escapeHtml(row.domain || "")}">${escapeHtml(row.domain || "")}</strong></td>
+            <td class="cell-tags">${renderSourceTags(row.sources)}</td>
+            <td class="cell-url">
+              <a class="truncate-line" href="${escapeHtml(url)}" target="_blank" rel="noreferrer" title="${escapeHtml(url)}">${escapeHtml(url)}</a>
+            </td>
+            <td class="cell-title">
+              ${
+                title
+                  ? `<span class="truncate-line" title="${escapeHtml(title)}">${escapeHtml(title)}</span>`
+                  : '<span class="muted">-</span>'
+              }
+            </td>
+            <td class="cell-query"><code class="truncate-line" title="${escapeHtml(queries)}">${escapeHtml(queries)}</code></td>
+            <td class="cell-status"><span class="badge ${statusClass(reviewStatus)}">${escapeHtml(statusLabel(reviewStatus))}</span></td>
+            <td class="cell-status"><span class="badge ${statusClass(crawlStatus)}">${escapeHtml(statusLabel(crawlStatus))}</span></td>
+            <td class="cell-actions review-url-actions-cell">${actions}</td>
+          </tr>
+        `;
+      })
+      .join("");
+  }
+
+  function syncReviewChrome(payload, params) {
+    const panel = reviewPanel();
+    if (!panel) {
+      return;
+    }
+    const pagination = payload.pagination || {};
+    panel.dataset.urlStatus = payload.url_status || params.get("url_status") || "pending_review";
+    panel.dataset.source = payload.source || "";
+    panel.dataset.q = payload.q || "";
+    panel.dataset.pageSize = String(pagination.page_size || params.get("page_size") || "100");
+
+    const summary = panel.querySelector("[data-review-summary]");
+    if (summary) {
+      summary.textContent = `${pagination.total || 0} matches · page ${pagination.page || 1}/${pagination.total_pages || 1}`;
+    }
+    const showing = panel.querySelector("[data-review-showing]");
+    if (showing) {
+      showing.textContent = `Showing ${payload.count || 0} rows on this page`;
+    }
+
+    const filterForm = document.querySelector("[data-review-filter-form]");
+    if (filterForm) {
+      const filterStatus = filterForm.querySelector("input[name='url_status']");
+      const filterSource = filterForm.querySelector("select[name='source']");
+      const filterQuery = filterForm.querySelector("input[name='q']");
+      const filterPageSize = filterForm.querySelector("input[name='page_size']");
+      if (filterStatus) {
+        filterStatus.value = panel.dataset.urlStatus;
+      }
+      if (filterSource) {
+        filterSource.value = panel.dataset.source;
+      }
+      if (filterQuery) {
+        filterQuery.value = panel.dataset.q;
+      }
+      if (filterPageSize) {
+        filterPageSize.value = panel.dataset.pageSize;
+      }
+    }
+
+    const paginationBar = panel.querySelector("[data-review-pagination]");
+    if (paginationBar) {
+      const previousParams = new URLSearchParams(params);
+      previousParams.set("page", String(pagination.prev_page || 1));
+      const nextParams = new URLSearchParams(params);
+      nextParams.set("page", String(pagination.next_page || 1));
+      paginationBar.innerHTML = `
+        ${
+          pagination.has_prev
+            ? `<a class="button small" href="${escapeHtml(reviewPageUrl(previousParams))}" data-review-page="${escapeHtml(pagination.prev_page || 1)}">Previous</a>`
+            : '<span class="button small disabled">Previous</span>'
+        }
+        <span class="muted" data-review-showing>Showing ${escapeHtml(payload.count || 0)} rows on this page</span>
+        ${
+          pagination.has_next
+            ? `<a class="button small" href="${escapeHtml(reviewPageUrl(nextParams))}" data-review-page="${escapeHtml(pagination.next_page || 1)}">Next</a>`
+            : '<span class="button small disabled">Next</span>'
+        }
+      `;
+    }
+  }
+
+  async function fetchReviewRows(params, options) {
+    const panel = reviewPanel();
+    const body = document.querySelector("[data-review-url-body]");
+    if (!panel || !body) {
+      return;
+    }
+    const endpoint = panel.getAttribute("data-review-endpoint");
+    if (!endpoint) {
+      return;
+    }
+    const requestUrl = `${endpoint}?${params.toString()}`;
+    setReviewFeedback(options && options.loadingMessage ? options.loadingMessage : "Fetching rows...", false);
+    try {
+      const response = await fetch(requestUrl, {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) {
+        throw new Error(payload.error || "Unable to fetch review rows.");
+      }
+      const rows = Array.isArray(payload.items) ? payload.items : [];
+      renderReviewUrlRows(body, rows);
+      syncReviewChrome(payload, params);
+      const page = payload.pagination && payload.pagination.page ? payload.pagination.page : params.get("page") || "1";
+      params.set("page", String(page));
+      if (options && options.historyMode === "push") {
+        window.history.pushState({}, "", reviewPageUrl(params));
+      } else if (options && options.historyMode === "replace") {
+        window.history.replaceState({}, "", reviewPageUrl(params));
+      }
+      setReviewFeedback(options && options.doneMessage ? options.doneMessage : "Rows updated.", false);
+    } catch (error) {
+      setReviewFeedback(error && error.message ? error.message : "Unable to fetch review rows.", true);
+    }
+  }
+
+  async function postReviewJson(endpoint, payload) {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload || {}),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || data.message || "Review action failed.");
+    }
+    return data;
+  }
+
+  async function submitReviewAction(form) {
+    const endpoint = form.getAttribute("data-api-action");
+    if (!endpoint) {
+      return;
+    }
+    setFormBusy(form, true);
+    setReviewFeedback("Applying action...", false);
+    try {
+      const result = await postReviewJson(endpoint, {});
+      const params = currentReviewParams();
+      await fetchReviewRows(params, {
+        historyMode: "replace",
+        loadingMessage: result.message || "Action applied. Refreshing rows...",
+        doneMessage: result.message || "Action applied.",
+      });
+    } catch (error) {
+      setReviewFeedback(error && error.message ? error.message : "Review action failed.", true);
+    } finally {
+      setFormBusy(form, false);
+    }
+  }
+
+  async function submitReviewBulk(form, submitter) {
+    const endpoint = form.getAttribute("data-api-action");
+    if (!endpoint) {
+      return;
+    }
+    const action = submitter && submitter.name === "bulk_action" ? submitter.value : "";
+    const ids = new FormData(form).getAll("url_ids");
+    if (ids.length === 0) {
+      setReviewFeedback("Select at least one URL row.", true);
+      return;
+    }
+    setFormBusy(form, true);
+    setReviewFeedback("Applying bulk action...", false);
+    try {
+      const result = await postReviewJson(endpoint, {
+        action,
+        bulk_action: action,
+        url_ids: ids,
+      });
+      const params = currentReviewParams();
+      await fetchReviewRows(params, {
+        historyMode: "replace",
+        loadingMessage: result.message || "Bulk action applied. Refreshing rows...",
+        doneMessage: result.message || "Bulk action applied.",
+      });
+    } catch (error) {
+      setReviewFeedback(error && error.message ? error.message : "Bulk review action failed.", true);
+    } finally {
+      setFormBusy(form, false);
+    }
+  }
+
+  function startReviewUrlActions() {
+    if (!reviewPanel()) {
+      return;
+    }
+
+    document.addEventListener("submit", function (event) {
+      const form = event.target;
+      if (!(form instanceof HTMLFormElement)) {
+        return;
+      }
+      if (form.matches("[data-review-action-form]")) {
+        event.preventDefault();
+        submitReviewAction(form);
+        return;
+      }
+      if (form.matches("[data-review-bulk-form]")) {
+        event.preventDefault();
+        submitReviewBulk(form, event.submitter);
+        return;
+      }
+      if (form.matches("[data-review-filter-form]")) {
+        event.preventDefault();
+        const params = new URLSearchParams(new FormData(form));
+        params.set("page", "1");
+        fetchReviewRows(params, {
+          historyMode: "push",
+          loadingMessage: "Applying filters...",
+          doneMessage: "Filters applied.",
+        });
+      }
+    });
+
+    document.addEventListener("click", function (event) {
+      if (!(event.target instanceof Element)) {
+        return;
+      }
+      const fetchButton = event.target.closest("[data-review-fetch-new]");
+      if (fetchButton) {
+        event.preventDefault();
+        const params = currentReviewParams();
+        params.set("page", "1");
+        fetchReviewRows(params, {
+          historyMode: "replace",
+          loadingMessage: "Fetching new rows...",
+          doneMessage: "Fetched latest rows.",
+        });
+        return;
+      }
+
+      const pageLink = event.target.closest("[data-review-page]");
+      if (pageLink) {
+        event.preventDefault();
+        const params = currentReviewParams();
+        params.set("page", pageLink.getAttribute("data-review-page") || "1");
+        fetchReviewRows(params, {
+          historyMode: "push",
+          loadingMessage: "Loading page...",
+          doneMessage: "Page loaded.",
+        });
+      }
+    });
+
+    window.addEventListener("popstate", function () {
+      fetchReviewRows(currentReviewParams(), {
+        historyMode: false,
+        loadingMessage: "Loading rows...",
+        doneMessage: "Rows updated.",
+      });
+    });
+  }
+
   function renderCrawlingUrlRows(body, rows) {
     if (!rows || rows.length === 0) {
       body.innerHTML = '<tr><td colspan="9" class="empty">No URLs are currently crawling.</td></tr>';
@@ -682,12 +1065,14 @@
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", restoreScroll, { once: true });
+    document.addEventListener("DOMContentLoaded", startReviewUrlActions, { once: true });
     document.addEventListener("DOMContentLoaded", startCrawlingUrlPolling, { once: true });
     document.addEventListener("DOMContentLoaded", startQueueUrlItemsPolling, { once: true });
     document.addEventListener("DOMContentLoaded", startKeywordSearchPolling, { once: true });
     document.addEventListener("DOMContentLoaded", startKeywordItemsPolling, { once: true });
   } else {
     restoreScroll();
+    startReviewUrlActions();
     startCrawlingUrlPolling();
     startQueueUrlItemsPolling();
     startKeywordSearchPolling();
