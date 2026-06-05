@@ -1081,13 +1081,13 @@ body.modal-open {
 }
 
 .queue-table {
-  min-width: 0;
+  min-width: 1180px;
   table-layout: fixed;
   font-size: 13px;
 }
 
 .queue-management-wrap {
-  overflow-x: hidden;
+  overflow-x: auto;
   max-width: 100%;
 }
 
@@ -1096,7 +1096,7 @@ body.modal-open {
 }
 
 .queue-col-name {
-  width: 92px;
+  width: 180px;
 }
 
 .queue-col-type {
@@ -1104,7 +1104,7 @@ body.modal-open {
 }
 
 .queue-col-output {
-  width: 108px;
+  width: 170px;
 }
 
 .queue-col-status {
@@ -1116,13 +1116,27 @@ body.modal-open {
 }
 
 .queue-col-actions {
-  width: 154px;
+  width: 164px;
 }
 
 .queue-table th,
 .queue-table td {
   padding: 8px 5px;
   vertical-align: middle;
+}
+
+.queue-table .queue-name-cell,
+.queue-table .queue-output-cell {
+  overflow: visible;
+}
+
+.queue-name-link {
+  display: block;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.25;
 }
 
 .queue-table th {

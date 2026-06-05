@@ -75,14 +75,14 @@
           {% for row in rows %}
             <tr>
               <td class="cell-id queue-cell-id">#{{ row.id }}</td>
-              <td class="cell-keyword">
-                <a href="{{ url_for('queue_detail', queue_id=row.id) }}"><strong title="{{ row.name }}">{{ row.name }}</strong></a>
+              <td class="cell-keyword queue-name-cell">
+                <a class="queue-name-link" href="{{ url_for('queue_detail', queue_id=row.id) }}"><strong title="{{ row.name }}">{{ row.name }}</strong></a>
               </td>
               <td><span class="tag">{{ row.queue_type|queue_type_label }}</span></td>
-              <td>
+              <td class="queue-output-cell">
                 {% if row.queue_type == "keyword_search" %}
                   {% if row.output_url_queue_id %}
-                    <a class="truncate-line" href="{{ url_for('queue_detail', queue_id=row.output_url_queue_id) }}" title="{{ row.output_url_queue_name }}">#{{ row.output_url_queue_id }} · {{ row.output_url_queue_name }}</a>
+                    <a class="queue-name-link" href="{{ url_for('queue_detail', queue_id=row.output_url_queue_id) }}" title="{{ row.output_url_queue_name }}">#{{ row.output_url_queue_id }} · {{ row.output_url_queue_name }}</a>
                   {% else %}
                     <span class="badge failed">Not Bound</span>
                   {% endif %}
