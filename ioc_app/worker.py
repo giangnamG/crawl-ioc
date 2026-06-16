@@ -16,6 +16,7 @@ from .browser import (
     is_retryable_proxy_error,
 )
 from .db import (
+    DEFAULT_WORKSPACE_ID,
     connect,
     is_url_whitelisted,
     is_url_whitelisted_latest,
@@ -153,12 +154,32 @@ def payload_int(payload: dict[str, object], key: str) -> int | None:
         return None
 
 
+def resolve_job_workspace_id(
+    conn: Connection,
+    queue_id: int | None = None,
+    target_url_id: int | None = None,
+    workspace_id: int | None = None,
+) -> int:
+    if workspace_id:
+        return int(workspace_id)
+    if queue_id:
+        row = conn.execute("SELECT workspace_id FROM queues WHERE id = ?", (queue_id,)).fetchone()
+        if row:
+            return int(row["workspace_id"])
+    if target_url_id:
+        row = conn.execute("SELECT workspace_id FROM urls WHERE id = ?", (target_url_id,)).fetchone()
+        if row:
+            return int(row["workspace_id"])
+    return DEFAULT_WORKSPACE_ID
+
+
 def enqueue_job(
     conn: Connection,
     job_type: str,
     payload: dict[str, object],
     dedupe_key: str,
     queue_id: int | None = None,
+    workspace_id: int | None = None,
     initial_status: str = "pending",
 ) -> None:
     payload_json = json.dumps(payload)
@@ -166,8 +187,15 @@ def enqueue_job(
     target_queue_item_id = (
         payload_int(payload, "url_queue_item_id") if job_type == "crawl_url" else None
     )
+    workspace_id = resolve_job_workspace_id(conn, queue_id, target_url_id, workspace_id)
     existing = conn.execute(
-        "SELECT id, status FROM jobs WHERE dedupe_key = ?", (dedupe_key,)
+        """
+        SELECT id, status
+        FROM jobs
+        WHERE workspace_id = ?
+          AND dedupe_key = ?
+        """,
+        (workspace_id, dedupe_key),
     ).fetchone()
     if existing:
         if existing["status"] == "running":
@@ -180,7 +208,8 @@ def enqueue_job(
         conn.execute(
             """
             UPDATE jobs
-            SET queue_id = ?,
+            SET workspace_id = ?,
+                queue_id = ?,
                 status = ?,
                 payload = ?,
                 target_url_id = ?,
@@ -195,6 +224,7 @@ def enqueue_job(
             WHERE id = ?
             """,
             (
+                workspace_id,
                 queue_id,
                 next_status,
                 payload_json,
@@ -208,11 +238,12 @@ def enqueue_job(
     conn.execute(
         """
         INSERT OR IGNORE INTO jobs(
-          queue_id, type, status, payload, dedupe_key, target_url_id, target_queue_item_id
+          workspace_id, queue_id, type, status, payload, dedupe_key, target_url_id, target_queue_item_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            workspace_id,
             queue_id,
             job_type,
             initial_status,
@@ -228,6 +259,7 @@ def claim_next_job(
     job_types: tuple[str, ...] | None = None,
     worker_slot_key: str | None = None,
     worker_type: str | None = None,
+    workspace_id: int | None = None,
 ) -> dict[str, object] | None:
     run_token = uuid.uuid4().hex
     type_filter = ""
@@ -236,20 +268,25 @@ def claim_next_job(
         placeholders = ",".join("?" for _ in job_types)
         type_filter = f"AND j.type IN ({placeholders})"
         params.extend(job_types)
+    workspace_filter = ""
+    if workspace_id:
+        workspace_filter = "AND j.workspace_id = ?"
+        params.append(workspace_id)
 
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         if worker_slot_key:
             conn.execute(
                 """
-                INSERT INTO worker_slots(slot_key, worker_type, enabled, status)
-                VALUES (?, ?, 1, 'idle')
+                INSERT INTO worker_slots(slot_key, workspace_id, worker_type, enabled, status)
+                VALUES (?, ?, ?, 1, 'idle')
                 ON CONFLICT(slot_key) DO UPDATE SET
+                    workspace_id = excluded.workspace_id,
                     worker_type = excluded.worker_type,
                     enabled = 1,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (worker_slot_key, worker_type or "worker"),
+                (worker_slot_key, workspace_id or DEFAULT_WORKSPACE_ID, worker_type or "worker"),
             )
 
         row = conn.execute(
@@ -260,6 +297,7 @@ def claim_next_job(
             WHERE j.status = 'pending'
               AND (j.queue_id IS NULL OR q.status = 'running')
               {type_filter}
+              {workspace_filter}
               AND (
                 j.type != 'crawl_url'
                 OR (
@@ -342,6 +380,7 @@ def claim_next_job(
                 UPDATE worker_slots
                 SET status = 'running',
                     job_id = ?,
+                    workspace_id = ?,
                     queue_id = ?,
                     target_url_id = ?,
                     target_queue_item_id = ?,
@@ -357,6 +396,7 @@ def claim_next_job(
                 """,
                 (
                     row["id"],
+                    row["workspace_id"],
                     row["queue_id"],
                     row["target_url_id"],
                     row["target_queue_item_id"],
@@ -396,7 +436,7 @@ def validate_search_job_payload(conn: Connection, job: dict[str, object], payloa
     item_id = int(raw_item_id)
     row = conn.execute(
         """
-        SELECT sqi.*, q.status AS queue_status
+        SELECT sqi.*, q.status AS queue_status, q.workspace_id AS queue_workspace_id
         FROM search_queue_items sqi
         JOIN queues q ON q.id = sqi.queue_id
         WHERE sqi.id = ?
@@ -408,6 +448,8 @@ def validate_search_job_payload(conn: Connection, job: dict[str, object], payloa
     ).fetchone()
     if not row:
         raise ValueError("Search job payload does not match its keyword queue item.")
+    if int(row["queue_workspace_id"]) != int(job.get("workspace_id") or DEFAULT_WORKSPACE_ID):
+        raise ValueError("Search job workspace does not match its queue item.")
     current_job = conn.execute(
         "SELECT status FROM jobs WHERE id = ?",
         (job["id"],),
@@ -432,8 +474,14 @@ def validate_search_job_payload(conn: Connection, job: dict[str, object], payloa
     output_url_queue_id = int(output_url_queue_id)
 
     output_queue = conn.execute(
-        "SELECT id FROM queues WHERE id = ? AND queue_type = 'url_crawl'",
-        (output_url_queue_id,),
+        """
+        SELECT id
+        FROM queues
+        WHERE id = ?
+          AND workspace_id = ?
+          AND queue_type = 'url_crawl'
+        """,
+        (output_url_queue_id, row["queue_workspace_id"]),
     ).fetchone()
     if not output_queue:
         raise ValueError("Search job output URL queue is invalid.")
@@ -460,7 +508,7 @@ def validate_crawl_job_payload(conn: Connection, job: dict[str, object], payload
     item_id = int(payload["url_queue_item_id"])
     row = conn.execute(
         """
-        SELECT uqi.*, q.status AS queue_status, u.review_status
+        SELECT uqi.*, q.status AS queue_status, q.workspace_id AS queue_workspace_id, u.review_status
         FROM url_queue_items uqi
         JOIN queues q ON q.id = uqi.queue_id
         JOIN urls u ON u.id = uqi.url_id
@@ -473,6 +521,8 @@ def validate_crawl_job_payload(conn: Connection, job: dict[str, object], payload
     ).fetchone()
     if not row:
         raise ValueError("Crawl job payload does not match its URL queue item.")
+    if int(row["queue_workspace_id"]) != int(job.get("workspace_id") or DEFAULT_WORKSPACE_ID):
+        raise ValueError("Crawl job workspace does not match its URL queue item.")
     current_job = conn.execute(
         "SELECT status FROM jobs WHERE id = ?",
         (job["id"],),
@@ -726,9 +776,15 @@ def run_one(
     job_types: tuple[str, ...] | None = None,
     worker_slot_key: str | None = None,
     worker_type: str | None = None,
+    workspace_id: int | None = None,
 ) -> str:
     recover_stale_worker_slots()
-    job = claim_next_job(job_types=job_types, worker_slot_key=worker_slot_key, worker_type=worker_type)
+    job = claim_next_job(
+        job_types=job_types,
+        worker_slot_key=worker_slot_key,
+        worker_type=worker_type,
+        workspace_id=workspace_id,
+    )
     if not job:
         return "No pending job."
 
@@ -742,6 +798,7 @@ def run_one(
     final_slot_error = None
     with connect() as conn:
         queue_id = job["queue_id"]
+        job_workspace_id = int(job.get("workspace_id") or DEFAULT_WORKSPACE_ID)
         conn.execute(
             """
             UPDATE jobs
@@ -771,6 +828,7 @@ def run_one(
                     queue_id=int(queue_id) if queue_id else None,
                     search_queue_item_id=search_queue_item_id,
                     output_url_queue_id=output_url_queue_id,
+                    workspace_id=job_workspace_id,
                 )
                 mark_search_queue_item(conn, search_queue_item_id, "done")
             elif job["type"] == "crawl_url":
@@ -784,6 +842,7 @@ def run_one(
                     url_queue_item_id=url_queue_item_id,
                     job_id=int(job["id"]),
                     run_token=run_token,
+                    workspace_id=job_workspace_id,
                 )
                 mark_url_queue_item(conn, url_queue_item_id, "done")
                 remove_url_from_queue_items(conn, int(payload["url_id"]))
@@ -963,10 +1022,10 @@ def run_one(
             release_worker_slot_on_conn(conn, worker_slot_key, run_token, final_slot_status, final_slot_error)
 
 
-def run_all(limit: int = 25) -> list[str]:
+def run_all(limit: int = 25, workspace_id: int | None = None) -> list[str]:
     messages = []
     for _ in range(limit):
-        message = run_one()
+        message = run_one(workspace_id=workspace_id)
         messages.append(message)
         if message == "No pending job.":
             break
@@ -979,13 +1038,15 @@ def process_search_query(
     queue_id: int | None = None,
     search_queue_item_id: int | None = None,
     output_url_queue_id: int | None = None,
+    workspace_id: int | None = None,
 ) -> None:
     search_query = conn.execute(
         """
         SELECT sq.*,
                k.text AS keyword_text,
                d.template AS dork_template,
-               q.status AS queue_status
+               q.status AS queue_status,
+               COALESCE(sq.workspace_id, q.workspace_id, k.workspace_id) AS workspace_id
         FROM search_queries sq
         JOIN keywords k ON k.id = sq.keyword_id
         JOIN search_dorks d ON d.id = sq.dork_id
@@ -996,12 +1057,16 @@ def process_search_query(
     ).fetchone()
     if not search_query:
         raise ValueError(f"Search query not found: {search_query_id}")
+    workspace_id = int(workspace_id or search_query["workspace_id"] or DEFAULT_WORKSPACE_ID)
     effective_queue_id = queue_id or search_query["queue_id"]
     queue_status = search_query["queue_status"]
     if search_query["status"] == "paused" and not effective_queue_id:
         raise PausedJob(f"Search query paused: {search_query_id}")
     if effective_queue_id and effective_queue_id != search_query["queue_id"]:
-        queue = conn.execute("SELECT status FROM queues WHERE id = ?", (effective_queue_id,)).fetchone()
+        queue = conn.execute(
+            "SELECT status FROM queues WHERE id = ? AND workspace_id = ?",
+            (effective_queue_id, workspace_id),
+        ).fetchone()
         queue_status = queue["status"] if queue else None
     if effective_queue_id and queue_status not in {"running", "stopping"}:
         conn.execute(
@@ -1012,8 +1077,14 @@ def process_search_query(
     output_url_queue = None
     if output_url_queue_id:
         output_url_queue = conn.execute(
-            "SELECT * FROM queues WHERE id = ? AND queue_type = 'url_crawl'",
-            (output_url_queue_id,),
+            """
+            SELECT *
+            FROM queues
+            WHERE id = ?
+              AND workspace_id = ?
+              AND queue_type = 'url_crawl'
+            """,
+            (output_url_queue_id, workspace_id),
         ).fetchone()
     elif effective_queue_id:
         output_url_queue = get_bound_output_url_queue(conn, int(effective_queue_id))
@@ -1063,16 +1134,25 @@ def process_search_query(
             if not domain:
                 continue
 
-            if is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm):
+            if is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm, workspace_id):
                 continue
 
-            url_id = upsert_url(conn, item.url, url_norm, domain, "google_search", title=item.title)
+            url_id = upsert_url(
+                conn,
+                item.url,
+                url_norm,
+                domain,
+                "google_search",
+                title=item.title,
+                workspace_id=workspace_id,
+            )
             saved_urls += 1
             upsert_url_source(
                 conn,
                 url_id=url_id,
                 source_type="google_search",
                 dedupe_key=f"google:{effective_queue_id or 'global'}:{search_query_id}:{item.page_no}:{item.rank}:{url_norm}",
+                workspace_id=workspace_id,
                 queue_id=effective_queue_id,
                 keyword_id=search_query["keyword_id"],
                 search_query_id=search_query_id,
@@ -1154,11 +1234,17 @@ def enqueue_discovered_url_if_new(
         return None
 
     target = conn.execute(
-        "SELECT review_status, crawl_status FROM urls WHERE id = ?",
+        "SELECT workspace_id, review_status, crawl_status FROM urls WHERE id = ?",
         (url_id,),
+    ).fetchone()
+    queue = conn.execute(
+        "SELECT workspace_id FROM queues WHERE id = ? AND queue_type = 'url_crawl'",
+        (url_queue_id,),
     ).fetchone()
     if (
         not target
+        or not queue
+        or int(target["workspace_id"]) != int(queue["workspace_id"])
         or target["review_status"] != "pending_review"
         or target["crawl_status"] in TERMINAL_CRAWL_STATUSES
     ):
@@ -1184,10 +1270,15 @@ def enqueue_discovered_url_if_new(
     )
 
 
-def ioc_matches_url_whitelist(conn: Connection, ioc_type: str, value_norm: str) -> bool:
+def ioc_matches_url_whitelist(
+    conn: Connection,
+    ioc_type: str,
+    value_norm: str,
+    workspace_id: int,
+) -> bool:
     if ioc_type == "url":
         url_norm = normalize_url(value_norm)
-        return bool(url_norm and is_url_whitelisted(conn, url_norm))
+        return bool(url_norm and is_url_whitelisted(conn, url_norm, workspace_id))
 
     if ioc_type == "domain":
         domain = normalize_domain(value_norm)
@@ -1195,7 +1286,7 @@ def ioc_matches_url_whitelist(conn: Connection, ioc_type: str, value_norm: str) 
             return False
         for scheme in ("https", "http"):
             root_url = normalize_url(f"{scheme}://{domain}/")
-            if root_url and is_url_whitelisted(conn, root_url):
+            if root_url and is_url_whitelisted(conn, root_url, workspace_id):
                 return True
 
     return False
@@ -1221,11 +1312,22 @@ def process_crawl_url(
     url_queue_item_id: int | None = None,
     job_id: int | None = None,
     run_token: str | None = None,
+    workspace_id: int | None = None,
 ) -> None:
     ensure_job_lease(conn, job_id, run_token)
     target = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
     if not target:
         raise ValueError(f"URL not found: {url_id}")
+    workspace_id = int(workspace_id or target["workspace_id"] or DEFAULT_WORKSPACE_ID)
+    if int(target["workspace_id"] or DEFAULT_WORKSPACE_ID) != workspace_id:
+        raise ValueError("Crawl URL workspace does not match the job workspace.")
+    if queue_id:
+        queue = conn.execute(
+            "SELECT workspace_id FROM queues WHERE id = ?",
+            (queue_id,),
+        ).fetchone()
+        if not queue or int(queue["workspace_id"]) != workspace_id:
+            raise ValueError("Crawl queue workspace does not match the job workspace.")
     if target["review_status"] != "approved":
         if url_queue_item_id:
             conn.execute(
@@ -1341,9 +1443,9 @@ def process_crawl_url(
             continue
         if ioc.type == "url" and is_media_asset_url(ioc_value_norm):
             continue
-        if ioc_matches_url_whitelist(conn, ioc.type, ioc_value_norm):
+        if ioc_matches_url_whitelist(conn, ioc.type, ioc_value_norm, workspace_id):
             continue
-        ioc_id = upsert_ioc(conn, ioc.type, ioc.raw, ioc_value_norm)
+        ioc_id = upsert_ioc(conn, ioc.type, ioc.raw, ioc_value_norm, workspace_id)
         if not ioc_id:
             continue
         source_type = "crawl"
@@ -1363,16 +1465,26 @@ def process_crawl_url(
             if discovered_url:
                 discovered_domain = get_domain(discovered_url)
                 if discovered_domain:
-                    if is_media_asset_url(discovered_url) or is_url_whitelisted(conn, discovered_url):
+                    if is_media_asset_url(discovered_url) or is_url_whitelisted(
+                        conn,
+                        discovered_url,
+                        workspace_id,
+                    ):
                         continue
                     discovered_url_id = upsert_url(
-                        conn, discovered_url, discovered_url, discovered_domain, "extracted_from_crawl"
+                        conn,
+                        discovered_url,
+                        discovered_url,
+                        discovered_domain,
+                        "extracted_from_crawl",
+                        workspace_id=workspace_id,
                     )
                     upsert_url_source(
                         conn,
                         url_id=discovered_url_id,
                         source_type="extracted_from_crawl",
                         dedupe_key=f"crawl:{queue_id or 'global'}:{url_id}:{discovered_url}",
+                        workspace_id=workspace_id,
                         queue_id=queue_id,
                         source_url_id=url_id,
                     )
@@ -1388,16 +1500,26 @@ def process_crawl_url(
             if discovered_domain:
                 discovered_url = normalize_url(f"https://{discovered_domain}/")
                 if discovered_url:
-                    if is_media_asset_url(discovered_url) or is_url_whitelisted(conn, discovered_url):
+                    if is_media_asset_url(discovered_url) or is_url_whitelisted(
+                        conn,
+                        discovered_url,
+                        workspace_id,
+                    ):
                         continue
                     discovered_url_id = upsert_url(
-                        conn, discovered_url, discovered_url, discovered_domain, "extracted_from_crawl"
+                        conn,
+                        discovered_url,
+                        discovered_url,
+                        discovered_domain,
+                        "extracted_from_crawl",
+                        workspace_id=workspace_id,
                     )
                     upsert_url_source(
                         conn,
                         url_id=discovered_url_id,
                         source_type="extracted_from_crawl",
                         dedupe_key=f"crawl-domain:{queue_id or 'global'}:{url_id}:{discovered_url}",
+                        workspace_id=workspace_id,
                         queue_id=queue_id,
                         source_url_id=url_id,
                     )
@@ -1423,26 +1545,32 @@ def upsert_url(
     domain: str,
     first_source: str,
     title: str | None = None,
+    workspace_id: int | None = None,
 ) -> int:
+    workspace_id = workspace_id or DEFAULT_WORKSPACE_ID
     title_norm = normalize_url_title(title, url_norm)
     conn.execute(
         """
-        INSERT OR IGNORE INTO urls(url_raw, url_norm, domain, title, first_source)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO urls(workspace_id, url_raw, url_norm, domain, title, first_source)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (url_raw, url_norm, domain, title_norm, first_source),
+        (workspace_id, url_raw, url_norm, domain, title_norm, first_source),
     )
     if title_norm:
         conn.execute(
             """
             UPDATE urls
             SET title = ?
-            WHERE url_norm = ?
+            WHERE workspace_id = ?
+              AND url_norm = ?
               AND (title IS NULL OR title = '')
             """,
-            (title_norm, url_norm),
+            (title_norm, workspace_id, url_norm),
         )
-    row = conn.execute("SELECT id FROM urls WHERE url_norm = ?", (url_norm,)).fetchone()
+    row = conn.execute(
+        "SELECT id FROM urls WHERE workspace_id = ? AND url_norm = ?",
+        (workspace_id, url_norm),
+    ).fetchone()
     return int(row["id"])
 
 
@@ -1451,8 +1579,11 @@ def get_bound_output_url_queue(conn: Connection, keyword_queue_id: int):
         """
         SELECT uq.*
         FROM queue_routes qr
+        JOIN queues kq ON kq.id = qr.keyword_queue_id
         JOIN queues uq ON uq.id = qr.url_queue_id
         WHERE qr.keyword_queue_id = ?
+          AND qr.workspace_id = kq.workspace_id
+          AND uq.workspace_id = kq.workspace_id
           AND uq.queue_type = 'url_crawl'
         """,
         (keyword_queue_id,),
@@ -1474,9 +1605,12 @@ def enqueue_url_to_queue(
     target = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
     if not queue or not target:
         return None
+    workspace_id = int(queue["workspace_id"])
+    if int(target["workspace_id"] or DEFAULT_WORKSPACE_ID) != workspace_id:
+        return None
     if is_media_asset_url(target["url_norm"]):
         return None
-    if url_matches_current_or_latest_whitelist(conn, int(target["id"]), target["url_norm"]):
+    if url_matches_current_or_latest_whitelist(conn, int(target["id"]), target["url_norm"], workspace_id):
         return None
     if target["crawl_status"] in TERMINAL_CRAWL_STATUSES:
         remove_url_from_queue_items(conn, url_id)
@@ -1487,18 +1621,19 @@ def enqueue_url_to_queue(
     initial_status = "pending_review"
     job_status = "paused"
 
-    if url_matches_current_or_latest_whitelist(conn, int(target["id"]), target["url_norm"]):
+    if url_matches_current_or_latest_whitelist(conn, int(target["id"]), target["url_norm"], workspace_id):
         return None
 
     conn.execute(
         """
         INSERT OR IGNORE INTO url_queue_items(
-          queue_id, url_id, source_queue_id, source_search_query_id,
+          workspace_id, queue_id, url_id, source_queue_id, source_search_query_id,
           source_search_queue_item_id, source_url_queue_item_id, status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            workspace_id,
             url_queue_id,
             url_id,
             source_queue_id,
@@ -1518,7 +1653,7 @@ def enqueue_url_to_queue(
     ).fetchone()
     if not row:
         return None
-    if url_matches_current_or_latest_whitelist(conn, int(target["id"]), target["url_norm"]):
+    if url_matches_current_or_latest_whitelist(conn, int(target["id"]), target["url_norm"], workspace_id):
         remove_url_from_queue_items(conn, url_id)
         return None
 
@@ -1545,13 +1680,22 @@ def enqueue_url_to_queue(
         {"url_id": url_id, "url_queue_item_id": int(row["id"])},
         f"queue:{url_queue_id}:crawl:{url_id}",
         queue_id=url_queue_id,
+        workspace_id=workspace_id,
         initial_status=job_status,
     )
     return int(row["id"])
 
 
-def url_matches_current_or_latest_whitelist(conn: Connection, url_id: int, url_norm: str) -> bool:
-    whitelisted = is_url_whitelisted(conn, url_norm) or is_url_whitelisted_latest(url_norm)
+def url_matches_current_or_latest_whitelist(
+    conn: Connection,
+    url_id: int,
+    url_norm: str,
+    workspace_id: int,
+) -> bool:
+    whitelisted = is_url_whitelisted(conn, url_norm, workspace_id) or is_url_whitelisted_latest(
+        url_norm,
+        workspace_id,
+    )
     if whitelisted:
         conn.execute(
             """
@@ -1566,15 +1710,21 @@ def url_matches_current_or_latest_whitelist(conn: Connection, url_id: int, url_n
 
 
 def upsert_url_source(conn: Connection, **kwargs: object) -> None:
+    workspace_id = kwargs.get("workspace_id")
+    if workspace_id is None and kwargs.get("url_id"):
+        row = conn.execute("SELECT workspace_id FROM urls WHERE id = ?", (kwargs.get("url_id"),)).fetchone()
+        workspace_id = int(row["workspace_id"]) if row else DEFAULT_WORKSPACE_ID
+    workspace_id = int(workspace_id or DEFAULT_WORKSPACE_ID)
     conn.execute(
         """
         INSERT OR IGNORE INTO url_sources(
-          url_id, source_type, dedupe_key, queue_id, keyword_id, search_query_id,
+          workspace_id, url_id, source_type, dedupe_key, queue_id, keyword_id, search_query_id,
           source_url_id, title, snippet, rank, page_no
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            workspace_id,
             kwargs.get("url_id"),
             kwargs.get("source_type"),
             kwargs.get("dedupe_key"),
@@ -1590,8 +1740,14 @@ def upsert_url_source(conn: Connection, **kwargs: object) -> None:
     )
 
 
-def upsert_ioc(conn: Connection, ioc_type: str, value_raw: str, value_norm: str) -> int | None:
-    return upsert_ioc_record(conn, ioc_type, value_raw, value_norm)
+def upsert_ioc(
+    conn: Connection,
+    ioc_type: str,
+    value_raw: str,
+    value_norm: str,
+    workspace_id: int,
+) -> int | None:
+    return upsert_ioc_record(conn, ioc_type, value_raw, value_norm, workspace_id)
 
 
 def remove_url_from_queue_items(conn: Connection, url_id: int) -> tuple[int, int]:
@@ -1637,14 +1793,29 @@ def remove_url_from_queue_items(conn: Connection, url_id: int) -> tuple[int, int
     return len(item_ids), job_count
 
 
-def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None = None) -> bool:
+def approve_url_and_enqueue(
+    conn: Connection,
+    url_id: int,
+    queue_id: int | None = None,
+    workspace_id: int | None = None,
+) -> bool:
     target = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
     if not target:
         return False
+    workspace_id = int(workspace_id or target["workspace_id"] or DEFAULT_WORKSPACE_ID)
+    if int(target["workspace_id"] or DEFAULT_WORKSPACE_ID) != workspace_id:
+        return False
+    if queue_id:
+        queue = conn.execute(
+            "SELECT workspace_id FROM queues WHERE id = ? AND queue_type = 'url_crawl'",
+            (queue_id,),
+        ).fetchone()
+        if not queue or int(queue["workspace_id"]) != workspace_id:
+            return False
     if target["crawl_status"] in TERMINAL_CRAWL_STATUSES:
         remove_url_from_queue_items(conn, url_id)
         return False
-    whitelisted = is_url_whitelisted(conn, target["url_norm"])
+    whitelisted = is_url_whitelisted(conn, target["url_norm"], workspace_id)
     if is_media_asset_url(target["url_norm"]) or whitelisted:
         conn.execute(
             """
@@ -1663,8 +1834,14 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
         return False
     changed = (
         conn.execute(
-            "UPDATE urls SET review_status = 'approved' WHERE id = ? AND review_status = 'pending_review'",
-            (url_id,),
+            """
+            UPDATE urls
+            SET review_status = 'approved'
+            WHERE id = ?
+              AND workspace_id = ?
+              AND review_status = 'pending_review'
+            """,
+            (url_id, workspace_id),
         ).rowcount
         > 0
     )
@@ -1674,12 +1851,19 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
     queue_rows = []
     if queue_id:
         queue_rows = conn.execute(
-            "SELECT * FROM url_queue_items WHERE queue_id = ? AND url_id = ?",
-            (queue_id, url_id),
+            """
+            SELECT *
+            FROM url_queue_items
+            WHERE workspace_id = ?
+              AND queue_id = ?
+              AND url_id = ?
+            """,
+            (workspace_id, queue_id, url_id),
         ).fetchall()
     else:
         queue_rows = conn.execute(
-            "SELECT * FROM url_queue_items WHERE url_id = ?", (url_id,)
+            "SELECT * FROM url_queue_items WHERE workspace_id = ? AND url_id = ?",
+            (workspace_id, url_id),
         ).fetchall()
 
     if queue_rows:
@@ -1701,6 +1885,7 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
                 {"url_id": url_id, "url_queue_item_id": int(item["id"])},
                 f"queue:{item['queue_id']}:crawl:{url_id}",
                 queue_id=int(item["queue_id"]),
+                workspace_id=workspace_id,
                 initial_status=next_status,
             )
         return True
@@ -1710,20 +1895,33 @@ def approve_url_and_enqueue(conn: Connection, url_id: int, queue_id: int | None 
         return True
 
     if target["crawl_status"] not in TERMINAL_CRAWL_STATUSES:
-        enqueue_job(conn, "crawl_url", {"url_id": url_id}, f"crawl:{url_id}")
+        enqueue_job(
+            conn,
+            "crawl_url",
+            {"url_id": url_id},
+            f"crawl:{url_id}",
+            workspace_id=workspace_id,
+        )
     return True
 
 
-def reject_url(conn: Connection, url_id: int) -> bool:
+def reject_url(conn: Connection, url_id: int, workspace_id: int | None = None) -> bool:
+    target = conn.execute("SELECT workspace_id FROM urls WHERE id = ?", (url_id,)).fetchone()
+    if not target:
+        return False
+    workspace_id = int(workspace_id or target["workspace_id"] or DEFAULT_WORKSPACE_ID)
+    if int(target["workspace_id"] or DEFAULT_WORKSPACE_ID) != workspace_id:
+        return False
     changed = (
         conn.execute(
             """
             UPDATE urls
             SET review_status = 'rejected'
             WHERE id = ?
+              AND workspace_id = ?
               AND review_status = 'pending_review'
             """,
-            (url_id,),
+            (url_id, workspace_id),
         ).rowcount
         > 0
     )

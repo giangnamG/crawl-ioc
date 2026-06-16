@@ -24,6 +24,17 @@
           {% endfor %}
         </nav>
         <div class="sidebar-foot">
+          <form method="post" action="{{ url_for('select_workspace') }}" class="workspace-switcher">
+            <input type="hidden" name="next" value="{{ request.full_path if request.query_string else request.path }}">
+            <label for="workspace-select">Workspace</label>
+            <select id="workspace-select" name="workspace_id" onchange="this.form.submit()">
+              {% for workspace in workspaces %}
+                <option value="{{ workspace.id }}" {% if current_workspace and current_workspace.id == workspace.id %}selected{% endif %}>
+                  {{ workspace.name }}
+                </option>
+              {% endfor %}
+            </select>
+          </form>
           <span>DB</span>
           <code title="{{ database_label }}">{{ database_label|truncate_middle(36) }}</code>
         </div>

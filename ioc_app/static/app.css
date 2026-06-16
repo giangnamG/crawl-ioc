@@ -135,9 +135,31 @@ textarea {
 .sidebar-foot {
   margin-top: auto;
   display: grid;
-  gap: 4px;
+  gap: 8px;
   color: #94a3b8;
   font-size: 12px;
+}
+
+.workspace-switcher {
+  display: grid;
+  gap: 4px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.16);
+}
+
+.workspace-switcher label {
+  color: #94a3b8;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.workspace-switcher select {
+  width: 100%;
+  min-width: 0;
+  border-color: rgba(148, 163, 184, 0.42);
+  background: #111827;
+  color: #e2e8f0;
 }
 
 .sidebar-foot code {
@@ -681,6 +703,29 @@ tbody tr:hover .review-url-actions-cell {
 .ioc-filter-panel .panel-head > div {
   display: grid;
   gap: 3px;
+}
+
+.ioc-filter-panel .panel-head > .ioc-scope-summary {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.workspace-scope-pill {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .ioc-filter-count {

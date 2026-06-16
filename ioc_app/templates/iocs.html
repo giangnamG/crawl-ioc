@@ -9,9 +9,12 @@
     <div class="panel-head">
       <div>
         <h2>Search IOCs</h2>
-        <span class="muted">Filter by type, IOC value, source, rule, or evidence.</span>
+        <span class="muted">Filter by type, IOC value, source, rule, or evidence. Results are scoped to the selected workspace.</span>
       </div>
-      <span class="ioc-filter-count">{{ pagination.total }} matches</span>
+      <div class="ioc-scope-summary">
+        <span class="workspace-scope-pill">Workspace: {{ current_workspace.name if current_workspace else "Default" }}</span>
+        <span class="ioc-filter-count">{{ pagination.total }} matches</span>
+      </div>
     </div>
     <form method="get" class="ioc-filter-form" role="search">
       <label class="ioc-filter-type">

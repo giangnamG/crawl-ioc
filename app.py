@@ -3,17 +3,28 @@ from pathlib import Path
 from ioc_app.app import create_app
 
 
-def load_dotenv(path: str | os.PathLike | None = None) -> None:
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def load_dotenv(
+    path: str | os.PathLike | None = None,
+    *,
+    override: bool = False,
+    protected_keys: set[str] | None = None,
+) -> None:
     env_path = Path(path) if path else Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
         return
+    protected_keys = protected_keys or set()
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        if not key or key in os.environ:
+        if not key:
+            continue
+        if key in os.environ and (not override or key in protected_keys):
             continue
         value = value.strip().strip("\"'")
         os.environ[key] = value
@@ -34,7 +45,9 @@ def app_debug_enabled() -> bool:
     return env_bool("FLASK_DEBUG", app_environment() != "production")
 
 
-load_dotenv()
+original_env_keys = set(os.environ)
+load_dotenv(BASE_DIR / ".env")
+load_dotenv(BASE_DIR / ".env.local", override=True, protected_keys=original_env_keys)
 os.environ.setdefault("FLASK_SKIP_DOTENV", "1")
 app = create_app(start_worker=env_bool("AUTO_WORKER_ENABLED", True))
 

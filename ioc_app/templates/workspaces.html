@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+
+{% block title %}Workspaces · IOC Investigator{% endblock %}
+{% block heading %}Workspaces{% endblock %}
+{% block eyebrow %}Data isolation{% endblock %}
+
+{% block content %}
+  <section class="queue-control-grid">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Create Workspace</h2>
+        <span class="muted">Queues, keywords, URLs, whitelist, jobs and IOCs are stored separately per workspace.</span>
+      </div>
+      <form method="post" class="grid-form">
+        <label class="wide">
+          <span>Name</span>
+          <input name="name" placeholder="Client or investigation name" required>
+        </label>
+        <label class="wide">
+          <span>Description</span>
+          <input name="description" placeholder="Optional note">
+        </label>
+        <div class="form-actions">
+          <button class="button primary" type="submit">Create Workspace</button>
+        </div>
+      </form>
+    </section>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Workspace Data</h2>
+      <span class="muted">Selecting a workspace scopes all operational pages.</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Queues</th>
+            <th>Keyword Queues</th>
+            <th>URL Queues</th>
+            <th>URLs</th>
+            <th>Jobs</th>
+            <th>IOCs</th>
+            <th>Created</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr class="{% if current_workspace and current_workspace.id == row.id %}selected-row{% endif %}">
+              <td class="cell-id">#{{ row.id }}</td>
+              <td><strong>{{ row.name }}</strong><br><span class="muted">{{ row.description or row.slug }}</span></td>
+              <td class="cell-count">{{ row.queue_count or 0 }}</td>
+              <td class="cell-count">{{ row.keyword_queue_count or 0 }}</td>
+              <td class="cell-count">{{ row.url_queue_count or 0 }}</td>
+              <td class="cell-count">{{ row.url_count or 0 }}</td>
+              <td class="cell-count">{{ row.job_count or 0 }}</td>
+              <td class="cell-count">{{ row.ioc_count or 0 }}</td>
+              <td>{{ row.created_at }}</td>
+              <td>
+                {% if current_workspace and current_workspace.id == row.id %}
+                  <span class="badge running">Selected</span>
+                {% else %}
+                  <form method="post" action="{{ url_for('select_workspace') }}">
+                    <input type="hidden" name="workspace_id" value="{{ row.id }}">
+                    <input type="hidden" name="next" value="{{ url_for('workspaces') }}">
+                    <button class="button small" type="submit">Select</button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="10" class="empty">No workspaces yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

@@ -20,8 +20,26 @@ from .normalizers import (
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = ROOT_DIR / "data" / "ioc_investigator.sqlite3"
+DEFAULT_WORKSPACE_ID = 1
+DEFAULT_WORKSPACE_NAME = "Default"
+DEFAULT_WORKSPACE_SLUG = "default"
 POSTGRES_BACKENDS = {"postgres", "postgresql"}
 SQLITE_BACKENDS = {"sqlite", "sqlite3"}
+WORKSPACE_SCOPED_TABLES = (
+    "queues",
+    "queue_routes",
+    "keywords",
+    "search_queries",
+    "jobs",
+    "worker_slots",
+    "search_queue_items",
+    "urls",
+    "whitelist_urls",
+    "url_queue_items",
+    "url_sources",
+    "iocs",
+    "ioc_sources",
+)
 TIMESTAMP_COLUMNS = (
     "created_at",
     "updated_at",
@@ -404,32 +422,57 @@ def whitelist_match_sql(url_expr: str, alias: str = "wu") -> str:
     """
 
 
-def is_url_whitelisted(conn: sqlite3.Connection, url_norm: str) -> bool:
+def is_url_whitelisted(
+    conn: sqlite3.Connection,
+    url_norm: str,
+    workspace_id: int | None = None,
+) -> bool:
+    workspace_id = workspace_id or DEFAULT_WORKSPACE_ID
     return bool(
         conn.execute(
             f"""
             SELECT 1
             FROM whitelist_urls wu
             WHERE wu.enabled = 1
+              AND wu.workspace_id = :workspace_id
               AND {whitelist_match_sql(':url_norm', 'wu')}
             LIMIT 1
             """,
-            {"url_norm": url_norm},
+            {"url_norm": url_norm, "workspace_id": workspace_id},
         ).fetchone()
     )
 
 
-def is_url_whitelisted_latest(url_norm: str) -> bool:
+def is_url_whitelisted_latest(url_norm: str, workspace_id: int | None = None) -> bool:
     with connect() as conn:
-        return is_url_whitelisted(conn, url_norm)
+        return is_url_whitelisted(conn, url_norm, workspace_id)
 
 
-def soft_delete_whitelisted_iocs(conn: sqlite3.Connection, whitelist_id: int | None = None) -> int:
+def soft_delete_whitelisted_iocs(
+    conn: sqlite3.Connection,
+    whitelist_id: int | None = None,
+    workspace_id: int | None = None,
+) -> int:
+    scope_filter = ""
+    scope_params: list[object] = []
+    scope_clauses: list[str] = []
+    if workspace_id is not None:
+        scope_clauses.append("workspace_wu.workspace_id = ?")
+        scope_params.append(workspace_id)
+    if whitelist_id is not None:
+        scope_clauses.append("workspace_wu.id = ?")
+        scope_params.append(whitelist_id)
+    if scope_clauses:
+        scope_filter = f"AND ({' OR '.join(scope_clauses)})"
+
     whitelist_filter = "wu.enabled = 1"
-    params: tuple[object, ...] = ()
+    whitelist_params: list[object] = []
+    if workspace_id is not None:
+        whitelist_filter = f"{whitelist_filter} AND wu.workspace_id = ?"
+        whitelist_params.append(workspace_id)
     if whitelist_id is not None:
         whitelist_filter = f"{whitelist_filter} AND wu.id = ?"
-        params = (whitelist_id,)
+        whitelist_params.append(whitelist_id)
 
     row_count = conn.execute(
         f"""
@@ -440,8 +483,16 @@ def soft_delete_whitelisted_iocs(conn: sqlite3.Connection, whitelist_id: int | N
           AND type IN ('url', 'domain')
           AND EXISTS (
             SELECT 1
+            FROM whitelist_urls workspace_wu
+            WHERE workspace_wu.enabled = 1
+              AND workspace_wu.workspace_id = iocs.workspace_id
+              {scope_filter}
+          )
+          AND EXISTS (
+            SELECT 1
             FROM whitelist_urls wu
             WHERE {whitelist_filter}
+              AND wu.workspace_id = iocs.workspace_id
               AND (
                 (
                   iocs.type = 'url'
@@ -457,7 +508,7 @@ def soft_delete_whitelisted_iocs(conn: sqlite3.Connection, whitelist_id: int | N
               )
           )
         """,
-        params,
+        (*scope_params, *whitelist_params),
     ).rowcount
     return max(row_count, 0)
 
@@ -503,6 +554,10 @@ def init_db() -> None:
 
 
 def migrate_db(conn: sqlite3.Connection) -> None:
+    ensure_workspace_schema(conn)
+    ensure_workspace_columns(conn)
+    backfill_workspace_ids(conn)
+    migrate_workspace_unique_constraints(conn)
     ensure_column(conn, "queues", "max_concurrent_jobs", "INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "queues", "active_max_concurrent_jobs", "INTEGER")
     ensure_column(conn, "search_queries", "queue_id", "INTEGER REFERENCES queues(id)")
@@ -593,11 +648,13 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     migrate_job_targets(conn)
     migrate_url_bodies(conn)
     backfill_keyword_search_url_iocs(conn)
+    sync_ioc_workspaces_from_sources(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS worker_slots (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           slot_key TEXT NOT NULL UNIQUE,
+          workspace_id INTEGER NOT NULL DEFAULT 1,
           worker_type TEXT NOT NULL,
           enabled INTEGER NOT NULL DEFAULT 1,
           status TEXT NOT NULL DEFAULT 'idle',
@@ -631,11 +688,19 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_ioc_sources_ioc ON ioc_sources(ioc_id);
         CREATE INDEX IF NOT EXISTS idx_ioc_sources_source_url ON ioc_sources(source_url_id);
         CREATE INDEX IF NOT EXISTS idx_ioc_sources_type ON ioc_sources(source_type);
+        CREATE INDEX IF NOT EXISTS idx_ioc_sources_workspace ON ioc_sources(workspace_id, ioc_id, source_url_id);
         CREATE INDEX IF NOT EXISTS idx_queue_routes_keyword ON queue_routes(keyword_queue_id);
         CREATE INDEX IF NOT EXISTS idx_queue_routes_url ON queue_routes(url_queue_id);
         CREATE INDEX IF NOT EXISTS idx_whitelist_urls_enabled ON whitelist_urls(enabled, url_norm);
         CREATE INDEX IF NOT EXISTS idx_whitelist_urls_match ON whitelist_urls(enabled, match_type, match_value);
         CREATE INDEX IF NOT EXISTS idx_worker_slots_type ON worker_slots(worker_type, enabled, status);
+        CREATE INDEX IF NOT EXISTS idx_queues_workspace ON queues(workspace_id, queue_type, status);
+        CREATE INDEX IF NOT EXISTS idx_keywords_workspace ON keywords(workspace_id, status, id);
+        CREATE INDEX IF NOT EXISTS idx_jobs_workspace ON jobs(workspace_id, status, id);
+        CREATE INDEX IF NOT EXISTS idx_urls_workspace_review ON urls(workspace_id, review_status, crawl_status);
+        CREATE INDEX IF NOT EXISTS idx_urls_workspace_domain ON urls(workspace_id, domain);
+        CREATE INDEX IF NOT EXISTS idx_whitelist_urls_workspace ON whitelist_urls(workspace_id, enabled, url_norm);
+        CREATE INDEX IF NOT EXISTS idx_iocs_workspace_type ON iocs(workspace_id, type, deleted);
         """
     )
     soft_delete_whitelisted_iocs(conn)
@@ -691,20 +756,691 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
+def ensure_workspace_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS workspaces (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          slug TEXT NOT NULL UNIQUE,
+          description TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO workspaces(id, name, slug, description)
+        VALUES (?, ?, ?, 'Default workspace for data collected before workspace support.')
+        ON CONFLICT(id) DO UPDATE SET
+            name = COALESCE(workspaces.name, excluded.name),
+            slug = COALESCE(workspaces.slug, excluded.slug)
+        """,
+        (DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, DEFAULT_WORKSPACE_SLUG),
+    )
+    if is_postgres_connection(conn):
+        conn.execute(
+            "SELECT setval(pg_get_serial_sequence('workspaces', 'id'), GREATEST((SELECT MAX(id) FROM workspaces), 1))"
+        )
+
+
+def ensure_workspace_columns(conn: sqlite3.Connection) -> None:
+    for table in WORKSPACE_SCOPED_TABLES:
+        ensure_column(conn, table, "workspace_id", "INTEGER NOT NULL DEFAULT 1")
+
+
+def backfill_workspace_ids(conn: sqlite3.Connection) -> None:
+    updates = [
+        "UPDATE queues SET workspace_id = ? WHERE workspace_id IS NULL",
+        "UPDATE keywords SET workspace_id = ? WHERE workspace_id IS NULL",
+        "UPDATE urls SET workspace_id = ? WHERE workspace_id IS NULL",
+        "UPDATE whitelist_urls SET workspace_id = ? WHERE workspace_id IS NULL",
+        "UPDATE iocs SET workspace_id = ? WHERE workspace_id IS NULL",
+        """
+        UPDATE queue_routes
+        SET workspace_id = COALESCE((
+            SELECT workspace_id FROM queues WHERE queues.id = queue_routes.keyword_queue_id
+        ), ?)
+        WHERE workspace_id IS NULL
+        """,
+        """
+        UPDATE search_queries
+        SET workspace_id = COALESCE(
+            (SELECT workspace_id FROM queues WHERE queues.id = search_queries.queue_id),
+            (SELECT workspace_id FROM keywords WHERE keywords.id = search_queries.keyword_id),
+            ?
+        )
+        WHERE workspace_id IS NULL
+        """,
+        """
+        UPDATE search_queue_items
+        SET workspace_id = COALESCE(
+            (SELECT workspace_id FROM queues WHERE queues.id = search_queue_items.queue_id),
+            (SELECT workspace_id FROM keywords WHERE keywords.id = search_queue_items.keyword_id),
+            ?
+        )
+        WHERE workspace_id IS NULL
+        """,
+        """
+        UPDATE url_queue_items
+        SET workspace_id = COALESCE(
+            (SELECT workspace_id FROM queues WHERE queues.id = url_queue_items.queue_id),
+            (SELECT workspace_id FROM urls WHERE urls.id = url_queue_items.url_id),
+            ?
+        )
+        WHERE workspace_id IS NULL
+        """,
+        """
+        UPDATE url_sources
+        SET workspace_id = COALESCE(
+            (SELECT workspace_id FROM queues WHERE queues.id = url_sources.queue_id),
+            (SELECT workspace_id FROM urls WHERE urls.id = url_sources.url_id),
+            ?
+        )
+        WHERE workspace_id IS NULL
+        """,
+        """
+        UPDATE jobs
+        SET workspace_id = COALESCE(
+            (SELECT workspace_id FROM queues WHERE queues.id = jobs.queue_id),
+            (SELECT workspace_id FROM urls WHERE urls.id = jobs.target_url_id),
+            ?
+        )
+        WHERE workspace_id IS NULL
+        """,
+        """
+        UPDATE worker_slots
+        SET workspace_id = COALESCE(
+            (SELECT workspace_id FROM queues WHERE queues.id = worker_slots.queue_id),
+            (SELECT workspace_id FROM urls WHERE urls.id = worker_slots.target_url_id),
+            ?
+        )
+        WHERE workspace_id IS NULL
+        """,
+        """
+        UPDATE ioc_sources
+        SET workspace_id = COALESCE(
+            (SELECT workspace_id FROM urls WHERE urls.id = ioc_sources.source_url_id),
+            (SELECT workspace_id FROM iocs WHERE iocs.id = ioc_sources.ioc_id),
+            ?
+        )
+        WHERE workspace_id IS NULL
+        """,
+    ]
+    for sql in updates:
+        table_match = re.search(r"UPDATE\s+([a-z_]+)", sql, flags=re.IGNORECASE)
+        if table_match and not table_exists(conn, table_match.group(1)):
+            continue
+        if table_match and "workspace_id" not in table_columns(conn, table_match.group(1)):
+            continue
+        conn.execute(sql, (DEFAULT_WORKSPACE_ID,))
+
+
+def sync_ioc_workspaces_from_sources(conn: sqlite3.Connection) -> int:
+    required_tables = ("iocs", "ioc_sources", "urls")
+    if not all(table_exists(conn, table) for table in required_tables):
+        return 0
+    if not all("workspace_id" in table_columns(conn, table) for table in required_tables):
+        return 0
+
+    rows = conn.execute(
+        """
+        SELECT
+          s.id AS source_id,
+          s.ioc_id,
+          s.workspace_id AS source_workspace_id,
+          s.source_url_id,
+          s.source_type,
+          s.extraction_rule_id,
+          s.evidence_text,
+          i.workspace_id AS ioc_workspace_id,
+          i.type,
+          i.value_raw,
+          i.value_norm,
+          COALESCE(i.deleted, 0) AS deleted,
+          i.deleted_at,
+          i.collected_at,
+          i.created_at,
+          u.workspace_id AS url_workspace_id
+        FROM ioc_sources s
+        JOIN iocs i ON i.id = s.ioc_id
+        JOIN urls u ON u.id = s.source_url_id
+        WHERE u.workspace_id IS NOT NULL
+          AND (
+            s.workspace_id <> u.workspace_id
+            OR i.workspace_id <> u.workspace_id
+          )
+        ORDER BY s.id
+        """
+    ).fetchall()
+
+    changed = 0
+    moved_from_ioc_ids: set[int] = set()
+    for row in rows:
+        target_workspace_id = int(row["url_workspace_id"] or DEFAULT_WORKSPACE_ID)
+        source_id = int(row["source_id"])
+        current_ioc_id = int(row["ioc_id"])
+        current_ioc_workspace_id = int(row["ioc_workspace_id"] or DEFAULT_WORKSPACE_ID)
+        if target_workspace_id == current_ioc_workspace_id:
+            target_ioc_id = current_ioc_id
+        else:
+            moved_from_ioc_ids.add(current_ioc_id)
+            target_ioc_id = ensure_ioc_in_workspace(conn, row, target_workspace_id)
+
+        if relink_ioc_source(conn, row, target_workspace_id, target_ioc_id):
+            changed += 1
+
+    for ioc_id in moved_from_ioc_ids:
+        conn.execute(
+            """
+            UPDATE iocs
+            SET deleted = 1,
+                deleted_at = COALESCE(deleted_at, CURRENT_TIMESTAMP)
+            WHERE id = ?
+              AND COALESCE(deleted, 0) = 0
+              AND NOT EXISTS (
+                SELECT 1
+                FROM ioc_sources s
+                WHERE s.ioc_id = iocs.id
+                  AND s.workspace_id = iocs.workspace_id
+              )
+            """,
+            (ioc_id,),
+        )
+
+    return changed
+
+
+def ensure_ioc_in_workspace(conn: sqlite3.Connection, source_row, workspace_id: int) -> int:
+    row = conn.execute(
+        """
+        SELECT id
+        FROM iocs
+        WHERE workspace_id = ?
+          AND type = ?
+          AND value_norm = ?
+        """,
+        (workspace_id, source_row["type"], source_row["value_norm"]),
+    ).fetchone()
+    if row:
+        return int(row["id"])
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO iocs(
+          workspace_id, type, value_raw, value_norm, deleted, deleted_at, collected_at, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            workspace_id,
+            source_row["type"],
+            source_row["value_raw"],
+            source_row["value_norm"],
+            int(source_row["deleted"] or 0),
+            source_row["deleted_at"],
+            source_row["collected_at"],
+            source_row["created_at"],
+        ),
+    )
+    row = conn.execute(
+        """
+        SELECT id
+        FROM iocs
+        WHERE workspace_id = ?
+          AND type = ?
+          AND value_norm = ?
+        """,
+        (workspace_id, source_row["type"], source_row["value_norm"]),
+    ).fetchone()
+    return int(row["id"]) if row else int(source_row["ioc_id"])
+
+
+def relink_ioc_source(
+    conn: sqlite3.Connection,
+    source_row,
+    workspace_id: int,
+    ioc_id: int,
+) -> bool:
+    source_id = int(source_row["source_id"])
+    existing = find_ioc_source(
+        conn,
+        workspace_id,
+        ioc_id,
+        int(source_row["source_url_id"]),
+        source_row["extraction_rule_id"],
+    )
+    if existing and int(existing["id"]) != source_id:
+        merged_evidence = merge_evidence_text(existing["evidence_text"], source_row["evidence_text"])
+        conn.execute(
+            """
+            UPDATE ioc_sources
+            SET evidence_text = ?
+            WHERE id = ?
+            """,
+            (merged_evidence, int(existing["id"])),
+        )
+        conn.execute("DELETE FROM ioc_sources WHERE id = ?", (source_id,))
+        return True
+
+    if (
+        int(source_row["source_workspace_id"] or DEFAULT_WORKSPACE_ID) == workspace_id
+        and int(source_row["ioc_id"]) == ioc_id
+    ):
+        return False
+
+    conn.execute(
+        """
+        UPDATE ioc_sources
+        SET workspace_id = ?,
+            ioc_id = ?
+        WHERE id = ?
+        """,
+        (workspace_id, ioc_id, source_id),
+    )
+    return True
+
+
+def find_ioc_source(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    ioc_id: int,
+    source_url_id: int,
+    extraction_rule_id: int | None,
+):
+    if extraction_rule_id is None:
+        return conn.execute(
+            """
+            SELECT id, evidence_text
+            FROM ioc_sources
+            WHERE workspace_id = ?
+              AND ioc_id = ?
+              AND source_url_id = ?
+              AND extraction_rule_id IS NULL
+            LIMIT 1
+            """,
+            (workspace_id, ioc_id, source_url_id),
+        ).fetchone()
+    return conn.execute(
+        """
+        SELECT id, evidence_text
+        FROM ioc_sources
+        WHERE workspace_id = ?
+          AND ioc_id = ?
+          AND source_url_id = ?
+          AND extraction_rule_id = ?
+        LIMIT 1
+        """,
+        (workspace_id, ioc_id, source_url_id, extraction_rule_id),
+    ).fetchone()
+
+
+def merge_evidence_text(existing: str | None, incoming: str | None) -> str | None:
+    existing_text = (existing or "").strip()
+    incoming_text = (incoming or "").strip()
+    if not existing_text:
+        return incoming_text or None
+    if not incoming_text or incoming_text in existing_text:
+        return existing
+    return f"{existing_text}\n\n---\n\n{incoming_text}"
+
+
+def migrate_workspace_unique_constraints(conn: sqlite3.Connection) -> None:
+    if is_postgres_connection(conn):
+        migrate_postgres_workspace_unique_constraints(conn)
+        return
+    rebuild_sqlite_workspace_unique_tables(conn)
+
+
+def migrate_postgres_workspace_unique_constraints(conn: sqlite3.Connection) -> None:
+    for statement in (
+        "ALTER TABLE keywords DROP CONSTRAINT IF EXISTS keywords_text_key",
+        "ALTER TABLE queues DROP CONSTRAINT IF EXISTS queues_name_queue_type_key",
+        "ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_dedupe_key_key",
+        "ALTER TABLE urls DROP CONSTRAINT IF EXISTS urls_url_norm_key",
+        "ALTER TABLE whitelist_urls DROP CONSTRAINT IF EXISTS whitelist_urls_url_norm_key",
+        "ALTER TABLE url_sources DROP CONSTRAINT IF EXISTS url_sources_dedupe_key_key",
+        "ALTER TABLE iocs DROP CONSTRAINT IF EXISTS iocs_type_value_norm_key",
+    ):
+        try:
+            conn.execute(statement)
+        except Exception:
+            pass
+    conn.executescript(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_keywords_workspace_text ON keywords(workspace_id, text);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_queues_workspace_name_type ON queues(workspace_id, name, queue_type);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_workspace_dedupe ON jobs(workspace_id, dedupe_key);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_urls_workspace_norm ON urls(workspace_id, url_norm);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_whitelist_workspace_norm ON whitelist_urls(workspace_id, url_norm);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_url_sources_workspace_dedupe ON url_sources(workspace_id, dedupe_key);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_iocs_workspace_type_norm ON iocs(workspace_id, type, value_norm);
+        """
+    )
+
+
+def sqlite_table_sql(conn: sqlite3.Connection, table: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row["sql"] or "" if row else ""
+
+
+def rebuild_sqlite_workspace_unique_tables(conn: sqlite3.Connection) -> None:
+    targets = {
+        "keywords": (
+            "UNIQUE (workspace_id, text)",
+            """
+            CREATE TABLE {table} (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
+              text TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              paused_by_user INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE (workspace_id, text)
+            )
+            """,
+            [
+                ("id", "id"),
+                ("workspace_id", str(DEFAULT_WORKSPACE_ID)),
+                ("text", "''"),
+                ("status", "'pending'"),
+                ("paused_by_user", "0"),
+                ("created_at", "CURRENT_TIMESTAMP"),
+            ],
+        ),
+        "queues": (
+            "UNIQUE (workspace_id, name, queue_type)",
+            """
+            CREATE TABLE {table} (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
+              name TEXT NOT NULL,
+              queue_type TEXT NOT NULL CHECK(queue_type IN ('keyword_search', 'url_crawl')),
+              status TEXT NOT NULL DEFAULT 'draft',
+              max_concurrent_jobs INTEGER NOT NULL DEFAULT 1,
+              active_max_concurrent_jobs INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              started_at TEXT,
+              stopped_at TEXT,
+              UNIQUE (workspace_id, name, queue_type)
+            )
+            """,
+            [
+                ("id", "id"),
+                ("workspace_id", str(DEFAULT_WORKSPACE_ID)),
+                ("name", "''"),
+                ("queue_type", "'keyword_search'"),
+                ("status", "'draft'"),
+                ("max_concurrent_jobs", "1"),
+                ("active_max_concurrent_jobs", "1"),
+                ("created_at", "CURRENT_TIMESTAMP"),
+                ("updated_at", "CURRENT_TIMESTAMP"),
+                ("started_at", "NULL"),
+                ("stopped_at", "NULL"),
+            ],
+        ),
+        "jobs": (
+            "UNIQUE (workspace_id, dedupe_key)",
+            """
+            CREATE TABLE {table} (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
+              queue_id INTEGER REFERENCES queues(id),
+              type TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              payload TEXT NOT NULL,
+              dedupe_key TEXT,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              error TEXT,
+              target_url_id INTEGER,
+              target_queue_item_id INTEGER,
+              worker_slot_key TEXT,
+              run_token TEXT,
+              heartbeat_at TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              started_at TEXT,
+              finished_at TEXT,
+              UNIQUE (workspace_id, dedupe_key)
+            )
+            """,
+            [
+                ("id", "id"),
+                ("workspace_id", str(DEFAULT_WORKSPACE_ID)),
+                ("queue_id", "NULL"),
+                ("type", "'unknown'"),
+                ("status", "'pending'"),
+                ("payload", "'{}'"),
+                ("dedupe_key", "NULL"),
+                ("attempts", "0"),
+                ("error", "NULL"),
+                ("target_url_id", "NULL"),
+                ("target_queue_item_id", "NULL"),
+                ("worker_slot_key", "NULL"),
+                ("run_token", "NULL"),
+                ("heartbeat_at", "NULL"),
+                ("created_at", "CURRENT_TIMESTAMP"),
+                ("started_at", "NULL"),
+                ("finished_at", "NULL"),
+            ],
+        ),
+        "urls": (
+            "UNIQUE (workspace_id, url_norm)",
+            """
+            CREATE TABLE {table} (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
+              url_raw TEXT NOT NULL,
+              url_norm TEXT NOT NULL,
+              domain TEXT NOT NULL,
+              title TEXT,
+              first_source TEXT NOT NULL,
+              review_status TEXT NOT NULL DEFAULT 'pending_review',
+              crawl_status TEXT NOT NULL DEFAULT 'not_crawled',
+              final_url TEXT,
+              status_code INTEGER,
+              content_type TEXT,
+              content_length INTEGER,
+              fetch_method TEXT,
+              crawl_error TEXT,
+              html TEXT,
+              crawled_at TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE (workspace_id, url_norm)
+            )
+            """,
+            [
+                ("id", "id"),
+                ("workspace_id", str(DEFAULT_WORKSPACE_ID)),
+                ("url_raw", "''"),
+                ("url_norm", "''"),
+                ("domain", "''"),
+                ("title", "NULL"),
+                ("first_source", "'unknown'"),
+                ("review_status", "'pending_review'"),
+                ("crawl_status", "'not_crawled'"),
+                ("final_url", "NULL"),
+                ("status_code", "NULL"),
+                ("content_type", "NULL"),
+                ("content_length", "NULL"),
+                ("fetch_method", "NULL"),
+                ("crawl_error", "NULL"),
+                ("html", "NULL"),
+                ("crawled_at", "NULL"),
+                ("created_at", "CURRENT_TIMESTAMP"),
+            ],
+        ),
+        "whitelist_urls": (
+            "UNIQUE (workspace_id, url_norm)",
+            """
+            CREATE TABLE {table} (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
+              url_raw TEXT NOT NULL,
+              url_norm TEXT NOT NULL,
+              match_type TEXT NOT NULL DEFAULT 'exact',
+              match_value TEXT,
+              note TEXT,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              matched_url_count INTEGER NOT NULL DEFAULT 0,
+              queue_item_count INTEGER NOT NULL DEFAULT 0,
+              counts_updated_at TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE (workspace_id, url_norm)
+            )
+            """,
+            [
+                ("id", "id"),
+                ("workspace_id", str(DEFAULT_WORKSPACE_ID)),
+                ("url_raw", "''"),
+                ("url_norm", "''"),
+                ("match_type", "'exact'"),
+                ("match_value", "NULL"),
+                ("note", "NULL"),
+                ("enabled", "1"),
+                ("matched_url_count", "0"),
+                ("queue_item_count", "0"),
+                ("counts_updated_at", "NULL"),
+                ("created_at", "CURRENT_TIMESTAMP"),
+                ("updated_at", "CURRENT_TIMESTAMP"),
+            ],
+        ),
+        "url_sources": (
+            "UNIQUE (workspace_id, dedupe_key)",
+            """
+            CREATE TABLE {table} (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
+              url_id INTEGER NOT NULL REFERENCES urls(id),
+              source_type TEXT NOT NULL,
+              dedupe_key TEXT NOT NULL,
+              queue_id INTEGER REFERENCES queues(id),
+              keyword_id INTEGER REFERENCES keywords(id),
+              search_query_id INTEGER REFERENCES search_queries(id),
+              source_url_id INTEGER REFERENCES urls(id),
+              title TEXT,
+              snippet TEXT,
+              rank INTEGER,
+              page_no INTEGER,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE (workspace_id, dedupe_key)
+            )
+            """,
+            [
+                ("id", "id"),
+                ("workspace_id", str(DEFAULT_WORKSPACE_ID)),
+                ("url_id", "NULL"),
+                ("source_type", "'unknown'"),
+                ("dedupe_key", "''"),
+                ("queue_id", "NULL"),
+                ("keyword_id", "NULL"),
+                ("search_query_id", "NULL"),
+                ("source_url_id", "NULL"),
+                ("title", "NULL"),
+                ("snippet", "NULL"),
+                ("rank", "NULL"),
+                ("page_no", "NULL"),
+                ("created_at", "CURRENT_TIMESTAMP"),
+            ],
+        ),
+        "iocs": (
+            "UNIQUE (workspace_id, type, value_norm)",
+            """
+            CREATE TABLE {table} (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
+              type TEXT NOT NULL,
+              value_raw TEXT NOT NULL,
+              value_norm TEXT NOT NULL,
+              deleted INTEGER NOT NULL DEFAULT 0,
+              deleted_at TEXT,
+              collected_at TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE (workspace_id, type, value_norm)
+            )
+            """,
+            [
+                ("id", "id"),
+                ("workspace_id", str(DEFAULT_WORKSPACE_ID)),
+                ("type", "''"),
+                ("value_raw", "''"),
+                ("value_norm", "''"),
+                ("deleted", "0"),
+                ("deleted_at", "NULL"),
+                ("collected_at", "NULL"),
+                ("created_at", "CURRENT_TIMESTAMP"),
+            ],
+        ),
+    }
+
+    rebuilds = [
+        (table, create_sql, columns)
+        for table, (unique_phrase, create_sql, columns) in targets.items()
+        if table_exists(conn, table) and unique_phrase not in sqlite_table_sql(conn, table)
+    ]
+    if not rebuilds:
+        return
+
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("PRAGMA legacy_alter_table = ON")
+    try:
+        for table, create_sql, columns in rebuilds:
+            rebuild_sqlite_table(conn, table, create_sql, columns)
+    finally:
+        conn.commit()
+        conn.execute("PRAGMA legacy_alter_table = OFF")
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def rebuild_sqlite_table(
+    conn: sqlite3.Connection,
+    table: str,
+    create_sql: str,
+    columns: list[tuple[str, str]],
+) -> None:
+    old_table = f"{table}__workspace_old"
+    conn.execute(f"DROP TABLE IF EXISTS {old_table}")
+    existing_columns = table_columns(conn, table)
+    conn.execute(f"ALTER TABLE {table} RENAME TO {old_table}")
+    conn.execute(create_sql.format(table=table))
+    insert_columns = [column for column, _ in columns]
+    select_exprs = [
+        column if column in existing_columns else default_sql
+        for column, default_sql in columns
+    ]
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO {table}({", ".join(insert_columns)})
+        SELECT {", ".join(select_exprs)}
+        FROM {old_table}
+        """
+    )
+    conn.execute(f"DROP TABLE {old_table}")
+
+
 def upsert_ioc_record(
     conn: sqlite3.Connection,
     ioc_type: str,
     value_raw: str,
     value_norm: str,
+    workspace_id: int | None = None,
 ) -> int | None:
+    workspace_id = workspace_id or DEFAULT_WORKSPACE_ID
     row = conn.execute(
         """
         SELECT id, COALESCE(deleted, 0) AS deleted
         FROM iocs
-        WHERE type = ?
+        WHERE workspace_id = ?
+          AND type = ?
           AND value_norm = ?
         """,
-        (ioc_type, value_norm),
+        (workspace_id, ioc_type, value_norm),
     ).fetchone()
     if row:
         if int(row["deleted"] or 0):
@@ -713,19 +1449,20 @@ def upsert_ioc_record(
 
     conn.execute(
         """
-        INSERT OR IGNORE INTO iocs(type, value_raw, value_norm, collected_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT OR IGNORE INTO iocs(workspace_id, type, value_raw, value_norm, collected_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
-        (ioc_type, value_raw, value_norm),
+        (workspace_id, ioc_type, value_raw, value_norm),
     )
     row = conn.execute(
         """
         SELECT id, COALESCE(deleted, 0) AS deleted
         FROM iocs
-        WHERE type = ?
+        WHERE workspace_id = ?
+          AND type = ?
           AND value_norm = ?
         """,
-        (ioc_type, value_norm),
+        (workspace_id, ioc_type, value_norm),
     ).fetchone()
     if not row or int(row["deleted"] or 0):
         return None
@@ -741,11 +1478,18 @@ def upsert_ioc_source(
     evidence_text: str | None = None,
 ) -> int:
     ioc = conn.execute(
-        "SELECT COALESCE(deleted, 0) AS deleted FROM iocs WHERE id = ?",
+        "SELECT workspace_id, COALESCE(deleted, 0) AS deleted FROM iocs WHERE id = ?",
         (ioc_id,),
     ).fetchone()
     if not ioc or int(ioc["deleted"] or 0):
         return 0
+    source_url = conn.execute(
+        "SELECT workspace_id FROM urls WHERE id = ?",
+        (source_url_id,),
+    ).fetchone()
+    if not source_url or int(source_url["workspace_id"]) != int(ioc["workspace_id"]):
+        return 0
+    workspace_id = int(ioc["workspace_id"])
 
     source_type = source_type or "crawl"
     if extraction_rule_id is None:
@@ -753,26 +1497,28 @@ def upsert_ioc_source(
             """
             SELECT id
             FROM ioc_sources
-            WHERE ioc_id = ?
+            WHERE workspace_id = ?
+              AND ioc_id = ?
               AND source_url_id = ?
               AND source_type = ?
               AND extraction_rule_id IS NULL
             LIMIT 1
             """,
-            (ioc_id, source_url_id, source_type),
+            (workspace_id, ioc_id, source_url_id, source_type),
         ).fetchone()
     else:
         row = conn.execute(
             """
             SELECT id
             FROM ioc_sources
-            WHERE ioc_id = ?
+            WHERE workspace_id = ?
+              AND ioc_id = ?
               AND source_url_id = ?
               AND source_type = ?
               AND extraction_rule_id = ?
             LIMIT 1
             """,
-            (ioc_id, source_url_id, source_type, extraction_rule_id),
+            (workspace_id, ioc_id, source_url_id, source_type, extraction_rule_id),
         ).fetchone()
 
     if row:
@@ -794,11 +1540,11 @@ def upsert_ioc_source(
     conn.execute(
         """
         INSERT OR IGNORE INTO ioc_sources(
-          ioc_id, source_url_id, source_type, extraction_rule_id, evidence_text
+          workspace_id, ioc_id, source_url_id, source_type, extraction_rule_id, evidence_text
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (ioc_id, source_url_id, source_type, extraction_rule_id, evidence_text),
+        (workspace_id, ioc_id, source_url_id, source_type, extraction_rule_id, evidence_text),
     )
 
     if extraction_rule_id is None:
@@ -806,47 +1552,53 @@ def upsert_ioc_source(
             """
             SELECT id
             FROM ioc_sources
-            WHERE ioc_id = ?
+            WHERE workspace_id = ?
+              AND ioc_id = ?
               AND source_url_id = ?
               AND source_type = ?
               AND extraction_rule_id IS NULL
             ORDER BY id
             LIMIT 1
             """,
-            (ioc_id, source_url_id, source_type),
+            (workspace_id, ioc_id, source_url_id, source_type),
         ).fetchone()
     else:
         row = conn.execute(
             """
             SELECT id
             FROM ioc_sources
-            WHERE ioc_id = ?
+            WHERE workspace_id = ?
+              AND ioc_id = ?
               AND source_url_id = ?
               AND source_type = ?
               AND extraction_rule_id = ?
             ORDER BY id
             LIMIT 1
             """,
-            (ioc_id, source_url_id, source_type, extraction_rule_id),
+            (workspace_id, ioc_id, source_url_id, source_type, extraction_rule_id),
         ).fetchone()
 
     if row:
         return int(row["id"])
 
+    extraction_filter = "extraction_rule_id IS NULL"
+    fallback_params: tuple[object, ...] = (workspace_id, ioc_id, source_url_id)
+    if extraction_rule_id is not None:
+        extraction_filter = "extraction_rule_id = ?"
+        fallback_params = (*fallback_params, extraction_rule_id)
+
     fallback = conn.execute(
-        """
+        f"""
         SELECT id
         FROM ioc_sources
-        WHERE ioc_id = ?
+        WHERE workspace_id = ?
+          AND ioc_id = ?
           AND source_url_id = ?
-          AND (
-            (? IS NULL AND extraction_rule_id IS NULL)
-            OR extraction_rule_id = ?
-          )
+          AND {extraction_filter}
         ORDER BY id
         LIMIT 1
         """,
-        (ioc_id, source_url_id, extraction_rule_id, extraction_rule_id),
+        fallback_params,
     ).fetchone()
     return int(fallback["id"]) if fallback else 0
 
@@ -899,7 +1651,7 @@ def record_keyword_search_url_ioc(conn: sqlite3.Connection, url_id: int) -> bool
 
     row = conn.execute(
         """
-        SELECT u.id, u.url_raw, u.url_norm
+        SELECT u.id, u.workspace_id, u.url_raw, u.url_norm
         FROM urls u
         WHERE u.id = ?
           AND u.review_status = 'approved'
@@ -916,10 +1668,11 @@ def record_keyword_search_url_ioc(conn: sqlite3.Connection, url_id: int) -> bool
         return False
 
     url_norm = normalize_url_without_query(row["url_norm"] or row["url_raw"])
-    if not url_norm or is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm):
+    workspace_id = int(row["workspace_id"] or DEFAULT_WORKSPACE_ID)
+    if not url_norm or is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm, workspace_id):
         return False
 
-    ioc_id = upsert_ioc_record(conn, "url", row["url_raw"] or url_norm, url_norm)
+    ioc_id = upsert_ioc_record(conn, "url", row["url_raw"] or url_norm, url_norm, workspace_id)
     source_context = keyword_search_url_source_context(conn, int(row["id"]))
     if not ioc_id or not source_context:
         return False
@@ -1036,10 +1789,11 @@ def migrate_domain_tables_into_urls(conn: sqlite3.Connection) -> None:
         review_status = row["review_status"] or "pending_review"
         conn.execute(
             """
-            INSERT OR IGNORE INTO urls(url_raw, url_norm, domain, first_source, review_status)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO urls(workspace_id, url_raw, url_norm, domain, first_source, review_status)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
+                DEFAULT_WORKSPACE_ID,
                 url_norm,
                 url_norm,
                 normalized_domain,
@@ -1055,8 +1809,9 @@ def migrate_domain_tables_into_urls(conn: sqlite3.Connection) -> None:
                 ELSE review_status
             END
             WHERE url_norm = ?
+              AND workspace_id = ?
             """,
-            (review_status, url_norm),
+            (review_status, url_norm, DEFAULT_WORKSPACE_ID),
         )
 
     if table_exists(conn, "domain_sources"):
@@ -1072,18 +1827,22 @@ def migrate_domain_tables_into_urls(conn: sqlite3.Connection) -> None:
             domain_url = normalize_url(f"https://{row['domain']}/")
             if not domain_url:
                 continue
-            url = conn.execute("SELECT id FROM urls WHERE url_norm = ?", (domain_url,)).fetchone()
+            url = conn.execute(
+                "SELECT id FROM urls WHERE workspace_id = ? AND url_norm = ?",
+                (DEFAULT_WORKSPACE_ID, domain_url),
+            ).fetchone()
             if not url:
                 continue
             conn.execute(
                 """
                 INSERT OR IGNORE INTO url_sources(
-                  url_id, source_type, dedupe_key, queue_id, keyword_id, search_query_id,
+                  workspace_id, url_id, source_type, dedupe_key, queue_id, keyword_id, search_query_id,
                   source_url_id, title, snippet, rank, page_no
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
                 """,
                 (
+                    DEFAULT_WORKSPACE_ID,
                     url["id"],
                     row["source_type"],
                     f"migrated-domain:{row['dedupe_key']}",
@@ -1212,6 +1971,7 @@ def cleanup_malformed_review_queue_urls(conn: sqlite3.Connection) -> dict[str, i
         rows = conn.execute(
             """
             SELECT DISTINCT u.id,
+                   u.workspace_id,
                    u.url_raw,
                    u.url_norm,
                    u.domain,
@@ -1234,6 +1994,7 @@ def cleanup_malformed_review_queue_urls(conn: sqlite3.Connection) -> dict[str, i
         rows = conn.execute(
             """
             SELECT u.id,
+                   u.workspace_id,
                    u.url_raw,
                    u.url_norm,
                    u.domain,
@@ -1267,7 +2028,11 @@ def cleanup_malformed_review_queue_urls(conn: sqlite3.Connection) -> dict[str, i
             stats["removed_jobs"] += cleanup_stats["removed_jobs"]
             continue
 
-        if table_exists(conn, "whitelist_urls") and is_url_whitelisted(conn, cleaned_norm):
+        if table_exists(conn, "whitelist_urls") and is_url_whitelisted(
+            conn,
+            cleaned_norm,
+            int(row["workspace_id"] or DEFAULT_WORKSPACE_ID),
+        ):
             cleanup_stats = ignore_pending_url_record(conn, url_id, "ignored_whitelist")
             stats["removed_queue_items"] += cleanup_stats["removed_queue_items"]
             stats["removed_jobs"] += cleanup_stats["removed_jobs"]
@@ -1289,9 +2054,10 @@ def cleanup_malformed_review_queue_urls(conn: sqlite3.Connection) -> dict[str, i
             SELECT id
             FROM urls
             WHERE url_norm = ?
+              AND workspace_id = ?
               AND id != ?
             """,
-            (cleaned_norm, url_id),
+            (cleaned_norm, int(row["workspace_id"] or DEFAULT_WORKSPACE_ID), url_id),
         ).fetchone()
         if existing:
             merge_stats = merge_url_record(conn, url_id, int(existing["id"]))
@@ -2001,7 +2767,7 @@ def refresh_builtin_extraction_rules(conn: sqlite3.Connection) -> None:
 def cleanup_invalid_iocs(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         """
-        SELECT id, type, value_norm
+        SELECT id, workspace_id, type, value_norm
         FROM iocs
         WHERE type IN ('domain', 'email', 'phone', 'url', 'address')
           AND COALESCE(deleted, 0) = 0
@@ -2021,7 +2787,7 @@ def cleanup_invalid_iocs(conn: sqlite3.Connection) -> None:
         if normalized == row["value_norm"]:
             continue
         if normalized:
-            merge_or_update_ioc(conn, int(row["id"]), row["type"], normalized)
+            merge_or_update_ioc(conn, int(row["id"]), int(row["workspace_id"]), row["type"], normalized)
         else:
             conn.execute("DELETE FROM ioc_sources WHERE ioc_id = ?", (row["id"],))
             conn.execute("DELETE FROM iocs WHERE id = ?", (row["id"],))
@@ -2042,10 +2808,22 @@ def cleanup_invalid_phone_sources(conn: sqlite3.Connection, ioc_id: int, value_n
         conn.execute("DELETE FROM ioc_sources WHERE id = ?", (source["id"],))
 
 
-def merge_or_update_ioc(conn: sqlite3.Connection, ioc_id: int, ioc_type: str, normalized: str) -> None:
+def merge_or_update_ioc(
+    conn: sqlite3.Connection,
+    ioc_id: int,
+    workspace_id: int,
+    ioc_type: str,
+    normalized: str,
+) -> None:
     existing = conn.execute(
-        "SELECT id, COALESCE(deleted, 0) AS deleted FROM iocs WHERE type = ? AND value_norm = ?",
-        (ioc_type, normalized),
+        """
+        SELECT id, COALESCE(deleted, 0) AS deleted
+        FROM iocs
+        WHERE workspace_id = ?
+          AND type = ?
+          AND value_norm = ?
+        """,
+        (workspace_id, ioc_type, normalized),
     ).fetchone()
     if not existing:
         conn.execute(
@@ -2124,16 +2902,28 @@ def domain_ioc_is_full_url_host(conn: sqlite3.Connection, ioc_id: int, domain: s
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS workspaces (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  slug TEXT NOT NULL UNIQUE,
+  description TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS keywords (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  text TEXT NOT NULL UNIQUE,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
+  text TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   paused_by_user INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (workspace_id, text)
 );
 
 CREATE TABLE IF NOT EXISTS queues (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
   name TEXT NOT NULL,
   queue_type TEXT NOT NULL CHECK(queue_type IN ('keyword_search', 'url_crawl')),
   status TEXT NOT NULL DEFAULT 'draft',
@@ -2143,11 +2933,12 @@ CREATE TABLE IF NOT EXISTS queues (
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   started_at TEXT,
   stopped_at TEXT,
-  UNIQUE (name, queue_type)
+  UNIQUE (workspace_id, name, queue_type)
 );
 
 CREATE TABLE IF NOT EXISTS queue_routes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
   keyword_queue_id INTEGER NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
   url_queue_id INTEGER NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -2169,6 +2960,7 @@ CREATE TABLE IF NOT EXISTS search_dorks (
 
 CREATE TABLE IF NOT EXISTS search_queries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
   queue_id INTEGER REFERENCES queues(id),
   keyword_id INTEGER NOT NULL REFERENCES keywords(id),
   dork_id INTEGER NOT NULL REFERENCES search_dorks(id),
@@ -2185,20 +2977,28 @@ CREATE TABLE IF NOT EXISTS search_queries (
 
 CREATE TABLE IF NOT EXISTS jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
   queue_id INTEGER REFERENCES queues(id),
   type TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   payload TEXT NOT NULL,
-  dedupe_key TEXT UNIQUE,
+  dedupe_key TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
   error TEXT,
+  target_url_id INTEGER,
+  target_queue_item_id INTEGER,
+  worker_slot_key TEXT,
+  run_token TEXT,
+  heartbeat_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   started_at TEXT,
-  finished_at TEXT
+  finished_at TEXT,
+  UNIQUE (workspace_id, dedupe_key)
 );
 
 CREATE TABLE IF NOT EXISTS search_queue_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
   queue_id INTEGER NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
   search_query_id INTEGER NOT NULL REFERENCES search_queries(id),
   keyword_id INTEGER NOT NULL REFERENCES keywords(id),
@@ -2215,8 +3015,9 @@ CREATE TABLE IF NOT EXISTS search_queue_items (
 
 CREATE TABLE IF NOT EXISTS urls (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
   url_raw TEXT NOT NULL,
-  url_norm TEXT NOT NULL UNIQUE,
+  url_norm TEXT NOT NULL,
   domain TEXT NOT NULL,
   title TEXT,
   first_source TEXT NOT NULL,
@@ -2230,13 +3031,15 @@ CREATE TABLE IF NOT EXISTS urls (
   crawl_error TEXT,
   html TEXT,
   crawled_at TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (workspace_id, url_norm)
 );
 
 CREATE TABLE IF NOT EXISTS whitelist_urls (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
   url_raw TEXT NOT NULL,
-  url_norm TEXT NOT NULL UNIQUE,
+  url_norm TEXT NOT NULL,
   match_type TEXT NOT NULL DEFAULT 'exact',
   match_value TEXT,
   note TEXT,
@@ -2245,7 +3048,8 @@ CREATE TABLE IF NOT EXISTS whitelist_urls (
   queue_item_count INTEGER NOT NULL DEFAULT 0,
   counts_updated_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (workspace_id, url_norm)
 );
 
 CREATE TABLE IF NOT EXISTS url_bodies (
@@ -2257,6 +3061,7 @@ CREATE TABLE IF NOT EXISTS url_bodies (
 
 CREATE TABLE IF NOT EXISTS url_queue_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
   queue_id INTEGER NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
   url_id INTEGER NOT NULL REFERENCES urls(id),
   source_queue_id INTEGER REFERENCES queues(id),
@@ -2273,9 +3078,10 @@ CREATE TABLE IF NOT EXISTS url_queue_items (
 
 CREATE TABLE IF NOT EXISTS url_sources (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
   url_id INTEGER NOT NULL REFERENCES urls(id),
   source_type TEXT NOT NULL,
-  dedupe_key TEXT NOT NULL UNIQUE,
+  dedupe_key TEXT NOT NULL,
   queue_id INTEGER REFERENCES queues(id),
   keyword_id INTEGER REFERENCES keywords(id),
   search_query_id INTEGER REFERENCES search_queries(id),
@@ -2284,7 +3090,8 @@ CREATE TABLE IF NOT EXISTS url_sources (
   snippet TEXT,
   rank INTEGER,
   page_no INTEGER,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (workspace_id, dedupe_key)
 );
 
 CREATE TABLE IF NOT EXISTS extraction_rules (
@@ -2308,6 +3115,7 @@ CREATE TABLE IF NOT EXISTS extraction_rules (
 
 CREATE TABLE IF NOT EXISTS iocs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
   type TEXT NOT NULL,
   value_raw TEXT NOT NULL,
   value_norm TEXT NOT NULL,
@@ -2315,11 +3123,12 @@ CREATE TABLE IF NOT EXISTS iocs (
   deleted_at TEXT,
   collected_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (type, value_norm)
+  UNIQUE (workspace_id, type, value_norm)
 );
 
 CREATE TABLE IF NOT EXISTS ioc_sources (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL DEFAULT 1 REFERENCES workspaces(id),
   ioc_id INTEGER NOT NULL REFERENCES iocs(id),
   source_url_id INTEGER NOT NULL REFERENCES urls(id),
   source_type TEXT NOT NULL DEFAULT 'crawl',

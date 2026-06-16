@@ -6,9 +6,10 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
+from flask import Flask, flash, g, jsonify, redirect, render_template, request, session, url_for
 
 from .db import (
+    DEFAULT_WORKSPACE_ID,
     connect,
     database_label,
     init_db,
@@ -54,12 +55,22 @@ def create_app(start_worker: bool = False) -> Flask:
     app.config["AUTO_WORKER_ENABLED"] = start_worker
     init_db()
 
+    @app.before_request
+    def load_current_workspace() -> None:
+        if request.endpoint == "static":
+            return
+        with connect() as conn:
+            g.workspaces = list_workspaces(conn)
+            g.current_workspace = resolve_current_workspace(conn)
+
     @app.context_processor
     def inject_globals() -> dict[str, object]:
         return {
             "auto_worker_enabled": app.config.get("AUTO_WORKER_ENABLED", False),
             "database_label": database_label(),
             "nav": NAV,
+            "workspaces": getattr(g, "workspaces", []),
+            "current_workspace": getattr(g, "current_workspace", None),
         }
 
     @app.template_filter("status_label")
@@ -93,40 +104,106 @@ def create_app(start_worker: bool = False) -> Flask:
             size /= 1024
         return ""
 
+    @app.route("/workspaces", methods=["GET", "POST"])
+    def workspaces():
+        with connect() as conn:
+            if request.method == "POST":
+                name = request.form.get("name", "").strip()
+                description = request.form.get("description", "").strip() or None
+                if not name:
+                    flash("Workspace name is required.", "error")
+                    return redirect(url_for("workspaces"))
+                workspace_id, created = create_workspace(conn, name, description)
+                session["workspace_id"] = workspace_id
+                flash(
+                    f"{'Created' if created else 'Selected'} workspace '{name}'.",
+                    "success",
+                )
+                return redirect(url_for("workspaces"))
+
+            rows = query_workspaces(conn)
+        return render_template("workspaces.html", rows=rows)
+
+    @app.post("/workspaces/select")
+    def select_workspace():
+        next_url = request.form.get("next") or url_for("dashboard")
+        if not next_url.startswith("/"):
+            next_url = url_for("dashboard")
+        workspace_id = request.form.get("workspace_id", type=int)
+        with connect() as conn:
+            row = get_workspace(conn, workspace_id)
+            if row:
+                session["workspace_id"] = int(row["id"])
+                flash(f"Switched to workspace '{row['name']}'.", "success")
+            else:
+                flash("Workspace not found.", "error")
+        return redirect(next_url)
+
     @app.get("/")
     def dashboard():
+        workspace_id = current_workspace_id()
         with connect() as conn:
             counts = {
-                "queues": scalar(conn, "SELECT COUNT(*) FROM queues"),
-                "keywords": scalar(conn, "SELECT COUNT(*) FROM keywords"),
-                "search_queries": scalar(conn, "SELECT COUNT(*) FROM search_queries"),
-                "pending_jobs": scalar(conn, "SELECT COUNT(*) FROM jobs WHERE status = 'pending'"),
+                "queues": scalar(conn, "SELECT COUNT(*) FROM queues WHERE workspace_id = ?", (workspace_id,)),
+                "keywords": scalar(conn, "SELECT COUNT(*) FROM keywords WHERE workspace_id = ?", (workspace_id,)),
+                "search_queries": scalar(conn, "SELECT COUNT(*) FROM search_queries WHERE workspace_id = ?", (workspace_id,)),
+                "pending_jobs": scalar(
+                    conn,
+                    "SELECT COUNT(*) FROM jobs WHERE workspace_id = ? AND status = 'pending'",
+                    (workspace_id,),
+                ),
                 "pending_review": scalar(
                     conn,
                     """
                     SELECT COUNT(*)
                     FROM urls
-                    WHERE review_status = 'pending_review'
+                    WHERE workspace_id = ?
+                      AND review_status = 'pending_review'
                       AND crawl_status NOT IN ('crawled', 'metadata_only')
                     """,
+                    (workspace_id,),
                 ),
-                "approved_urls": scalar(conn, "SELECT COUNT(*) FROM urls WHERE review_status = 'approved'"),
+                "approved_urls": scalar(
+                    conn,
+                    "SELECT COUNT(*) FROM urls WHERE workspace_id = ? AND review_status = 'approved'",
+                    (workspace_id,),
+                ),
                 "crawled_urls": scalar(
                     conn,
-                    "SELECT COUNT(*) FROM urls WHERE crawl_status IN ('crawled', 'metadata_only')",
+                    """
+                    SELECT COUNT(*)
+                    FROM urls
+                    WHERE workspace_id = ?
+                      AND crawl_status IN ('crawled', 'metadata_only')
+                    """,
+                    (workspace_id,),
                 ),
-                "iocs": scalar(conn, "SELECT COUNT(*) FROM iocs WHERE COALESCE(deleted, 0) = 0"),
+                "iocs": scalar(
+                    conn,
+                    "SELECT COUNT(*) FROM iocs WHERE workspace_id = ? AND COALESCE(deleted, 0) = 0",
+                    (workspace_id,),
+                ),
             }
             recent_jobs = conn.execute(
-                "SELECT * FROM jobs ORDER BY id DESC LIMIT 8"
+                "SELECT * FROM jobs WHERE workspace_id = ? ORDER BY id DESC LIMIT 8",
+                (workspace_id,),
             ).fetchall()
             recent_iocs = conn.execute(
-                "SELECT * FROM iocs WHERE COALESCE(deleted, 0) = 0 ORDER BY id DESC LIMIT 8"
+                """
+                SELECT *
+                FROM iocs
+                WHERE workspace_id = ?
+                  AND COALESCE(deleted, 0) = 0
+                ORDER BY id DESC
+                LIMIT 8
+                """,
+                (workspace_id,),
             ).fetchall()
         return render_template("dashboard.html", counts=counts, recent_jobs=recent_jobs, recent_iocs=recent_iocs)
 
     @app.route("/whitelist", methods=["GET", "POST"])
     def whitelist():
+        workspace_id = current_workspace_id()
         with connect() as conn:
             if request.method == "POST":
                 raw_urls = request.form.get("urls", "")
@@ -146,10 +223,10 @@ def create_app(start_worker: bool = False) -> Flask:
                     conn.execute(
                         """
                         INSERT INTO whitelist_urls(
-                          url_raw, url_norm, match_type, match_value, note, enabled
+                          workspace_id, url_raw, url_norm, match_type, match_value, note, enabled
                         )
-                        VALUES (?, ?, ?, ?, ?, 1)
-                        ON CONFLICT(url_norm) DO UPDATE SET
+                        VALUES (?, ?, ?, ?, ?, ?, 1)
+                        ON CONFLICT(workspace_id, url_norm) DO UPDATE SET
                             url_raw = excluded.url_raw,
                             match_type = excluded.match_type,
                             match_value = excluded.match_value,
@@ -158,6 +235,7 @@ def create_app(start_worker: bool = False) -> Flask:
                             updated_at = CURRENT_TIMESTAMP
                         """,
                         (
+                            workspace_id,
                             item,
                             whitelist_entry["url_norm"],
                             whitelist_entry["match_type"],
@@ -167,47 +245,57 @@ def create_app(start_worker: bool = False) -> Flask:
                     )
                     if conn.total_changes > before:
                         added += 1
-                    cleanup = apply_url_whitelist(conn, whitelist_entry["url_norm"])
+                    cleanup = apply_url_whitelist(conn, whitelist_entry["url_norm"], workspace_id)
                     ignored_urls += cleanup["ignored_urls"]
                     removed_items += cleanup["removed_items"]
                     removed_jobs += cleanup["removed_jobs"]
                     removed_iocs += cleanup["removed_iocs"]
                     row = conn.execute(
-                        "SELECT id FROM whitelist_urls WHERE url_norm = ?",
-                        (whitelist_entry["url_norm"],),
+                        "SELECT id FROM whitelist_urls WHERE workspace_id = ? AND url_norm = ?",
+                        (workspace_id, whitelist_entry["url_norm"]),
                     ).fetchone()
                     if row:
                         refresh_whitelist_counts(conn, int(row["id"]))
-                refresh_whitelist_counts(conn)
+                refresh_whitelist_counts(conn, workspace_id=workspace_id)
                 flash(
                     f"Whitelist updated. Added/updated {added} URLs, skipped {skipped}. Ignored {ignored_urls} existing URL rows, removed {removed_items} queue items, {removed_jobs} jobs and {removed_iocs} matching IOC rows.",
                     "success" if added or ignored_urls or removed_items or removed_iocs else "error",
                 )
                 return redirect(url_for("whitelist"))
 
-            refresh_stale_whitelist_counts(conn)
+            refresh_stale_whitelist_counts(conn, workspace_id)
             rows = conn.execute(
                 """
                 SELECT wu.*
                 FROM whitelist_urls wu
+                WHERE wu.workspace_id = ?
                 ORDER BY wu.enabled DESC, wu.id DESC
                 LIMIT 500
-                """
+                """,
+                (workspace_id,),
             ).fetchall()
         return render_template("whitelist.html", rows=rows)
 
     @app.post("/whitelist/<int:item_id>/delete")
     def delete_whitelist_url(item_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
-            row = conn.execute("SELECT url_norm FROM whitelist_urls WHERE id = ?", (item_id,)).fetchone()
+            row = conn.execute(
+                "SELECT url_norm FROM whitelist_urls WHERE id = ? AND workspace_id = ?",
+                (item_id, workspace_id),
+            ).fetchone()
             if not row:
                 flash("Whitelist URL not found.", "error")
             else:
-                conn.execute("DELETE FROM whitelist_urls WHERE id = ?", (item_id,))
+                conn.execute(
+                    "DELETE FROM whitelist_urls WHERE id = ? AND workspace_id = ?",
+                    (item_id, workspace_id),
+                )
                 flash(f"Removed whitelist URL: {row['url_norm']}", "success")
         return redirect(url_for("whitelist"))
 
     def handle_queue_post(conn, default_queue_id: int | None = None):
+        workspace_id = current_workspace_id()
         action = request.form.get("action")
         if action == "create":
             name = request.form.get("name", "").strip()
@@ -218,13 +306,13 @@ def create_app(start_worker: bool = False) -> Flask:
             if queue_type not in {"keyword_search", "url_crawl"}:
                 flash("Queue type is invalid.", "error")
                 return redirect(url_for("queue_create"))
-            queue_id = get_or_create_queue(conn, name, queue_type)
+            queue_id = get_or_create_queue(conn, name, queue_type, workspace_id)
             flash(f"Queue created: {name}", "success")
             return redirect(url_for("queue_detail", queue_id=queue_id))
 
         if action == "add_urls":
             queue_id = request.form.get("queue_id", type=int) or default_queue_id
-            queue = get_queue(conn, queue_id, "url_crawl")
+            queue = get_queue(conn, queue_id, "url_crawl", workspace_id)
             if not queue:
                 flash("URL queue is required.", "error")
                 return redirect(url_for("queues"))
@@ -239,7 +327,7 @@ def create_app(start_worker: bool = False) -> Flask:
 
         if action == "update_concurrency":
             queue_id = request.form.get("queue_id", type=int) or default_queue_id
-            queue = get_queue(conn, queue_id, "url_crawl")
+            queue = get_queue(conn, queue_id, "url_crawl", workspace_id)
             if not queue:
                 flash("URL queue is required.", "error")
                 return redirect(url_for("queues"))
@@ -270,7 +358,12 @@ def create_app(start_worker: bool = False) -> Flask:
         if action == "link_queues":
             keyword_queue_id = request.form.get("keyword_queue_id", type=int)
             url_queue_id = request.form.get("url_queue_id", type=int)
-            ok, message = bind_keyword_queue_to_url_queue(conn, keyword_queue_id, url_queue_id)
+            ok, message = bind_keyword_queue_to_url_queue(
+                conn,
+                keyword_queue_id,
+                url_queue_id,
+                workspace_id,
+            )
             flash(message, "success" if ok else "error")
             if keyword_queue_id:
                 return redirect(url_for("queue_detail", queue_id=keyword_queue_id))
@@ -297,6 +390,7 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.route("/queues", methods=["GET", "POST"])
     def queues():
+        workspace_id = current_workspace_id()
         with connect() as conn:
             if request.method == "POST":
                 return handle_queue_post(conn)
@@ -305,20 +399,35 @@ def create_app(start_worker: bool = False) -> Flask:
             if selected_queue_id:
                 return redirect(url_for("queue_detail", queue_id=selected_queue_id))
 
-            rows = query_queues(conn)
-            url_overview = query_url_overview(conn)
+            rows = query_queues(conn, workspace_id)
+            url_overview = query_url_overview(conn, workspace_id)
         return render_template("queues.html", rows=rows, url_overview=url_overview)
 
     @app.route("/queues/new", methods=["GET", "POST"])
     def queue_create():
+        workspace_id = current_workspace_id()
         with connect() as conn:
             if request.method == "POST":
                 return handle_queue_post(conn)
             keyword_queues = conn.execute(
-                "SELECT * FROM queues WHERE queue_type = 'keyword_search' ORDER BY id DESC"
+                """
+                SELECT *
+                FROM queues
+                WHERE workspace_id = ?
+                  AND queue_type = 'keyword_search'
+                ORDER BY id DESC
+                """,
+                (workspace_id,),
             ).fetchall()
             url_queues = conn.execute(
-                "SELECT * FROM queues WHERE queue_type = 'url_crawl' ORDER BY id DESC"
+                """
+                SELECT *
+                FROM queues
+                WHERE workspace_id = ?
+                  AND queue_type = 'url_crawl'
+                ORDER BY id DESC
+                """,
+                (workspace_id,),
             ).fetchall()
         return render_template(
             "queue_create.html",
@@ -328,11 +437,12 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.route("/queues/<int:queue_id>", methods=["GET", "POST"])
     def queue_detail(queue_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
             if request.method == "POST":
                 return handle_queue_post(conn, default_queue_id=queue_id)
 
-            selected_rows = query_queues(conn, queue_id=queue_id)
+            selected_rows = query_queues(conn, workspace_id, queue_id=queue_id)
             selected_queue = selected_rows[0] if selected_rows else None
             if not selected_queue:
                 flash("Queue not found.", "error")
@@ -340,11 +450,12 @@ def create_app(start_worker: bool = False) -> Flask:
             selected_jobs = conn.execute(
                 """
                 SELECT * FROM jobs
-                WHERE queue_id = ?
+                WHERE workspace_id = ?
+                  AND queue_id = ?
                 ORDER BY id DESC
                 LIMIT 80
                 """,
-                (queue_id,),
+                (workspace_id, queue_id),
             ).fetchall()
             selected_url_items = query_url_queue_items(conn, queue_id)
             selected_queries = query_keyword_queue_items(conn, queue_id)
@@ -365,10 +476,16 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.get("/api/queues/<int:queue_id>/crawling-urls")
     def queue_crawling_urls_api(queue_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
             queue = conn.execute(
-                "SELECT id, name, queue_type, status FROM queues WHERE id = ?",
-                (queue_id,),
+                """
+                SELECT id, name, queue_type, status
+                FROM queues
+                WHERE id = ?
+                  AND workspace_id = ?
+                """,
+                (queue_id, workspace_id),
             ).fetchone()
             if not queue:
                 return jsonify({"ok": False, "error": "Queue not found."}), 404
@@ -389,10 +506,16 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.get("/api/queues/<int:queue_id>/url-items")
     def queue_url_items_api(queue_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
             queue = conn.execute(
-                "SELECT id, name, queue_type, status FROM queues WHERE id = ?",
-                (queue_id,),
+                """
+                SELECT id, name, queue_type, status
+                FROM queues
+                WHERE id = ?
+                  AND workspace_id = ?
+                """,
+                (queue_id, workspace_id),
             ).fetchone()
             if not queue:
                 return jsonify({"ok": False, "error": "Queue not found."}), 404
@@ -413,10 +536,16 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.get("/api/queues/<int:queue_id>/keyword-items")
     def queue_keyword_items_api(queue_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
             queue = conn.execute(
-                "SELECT id, name, queue_type, status FROM queues WHERE id = ?",
-                (queue_id,),
+                """
+                SELECT id, name, queue_type, status
+                FROM queues
+                WHERE id = ?
+                  AND workspace_id = ?
+                """,
+                (queue_id, workspace_id),
             ).fetchone()
             if not queue:
                 return jsonify({"ok": False, "error": "Queue not found."}), 404
@@ -437,10 +566,16 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.get("/api/queues/<int:queue_id>/keyword-search-status")
     def queue_keyword_search_status_api(queue_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
             queue = conn.execute(
-                "SELECT id, name, queue_type, status FROM queues WHERE id = ?",
-                (queue_id,),
+                """
+                SELECT id, name, queue_type, status
+                FROM queues
+                WHERE id = ?
+                  AND workspace_id = ?
+                """,
+                (queue_id, workspace_id),
             ).fetchone()
             if not queue:
                 return jsonify({"ok": False, "error": "Queue not found."}), 404
@@ -461,8 +596,12 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/queues/<int:queue_id>/start")
     def start_queue(queue_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
-            queue = conn.execute("SELECT * FROM queues WHERE id = ?", (queue_id,)).fetchone()
+            queue = conn.execute(
+                "SELECT * FROM queues WHERE id = ? AND workspace_id = ?",
+                (queue_id, workspace_id),
+            ).fetchone()
             if not queue:
                 flash("Queue not found.", "error")
                 return redirect(url_for("queues"))
@@ -503,8 +642,9 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/queues/<int:queue_id>/restart-keyword")
     def restart_keyword_queue(queue_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
-            queue = get_queue(conn, queue_id, "keyword_search")
+            queue = get_queue(conn, queue_id, "keyword_search", workspace_id)
             if not queue:
                 flash("Keyword Search Queue not found.", "error")
                 return redirect(url_for("queues"))
@@ -547,8 +687,12 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/queues/<int:queue_id>/stop")
     def stop_queue(queue_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
-            queue = conn.execute("SELECT * FROM queues WHERE id = ?", (queue_id,)).fetchone()
+            queue = conn.execute(
+                "SELECT * FROM queues WHERE id = ? AND workspace_id = ?",
+                (queue_id, workspace_id),
+            ).fetchone()
             if not queue:
                 flash("Queue not found.", "error")
                 return redirect(url_for("queues"))
@@ -571,8 +715,9 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/url-queue-items/<int:item_id>/delete")
     def delete_url_queue_item_route(item_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
-            deleted, queue_id, job_count, error = delete_url_queue_item(conn, item_id)
+            deleted, queue_id, job_count, error = delete_url_queue_item(conn, item_id, workspace_id)
         if not deleted:
             flash(error, "error")
             return redirect(request.referrer or url_for("queues"))
@@ -584,11 +729,12 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.route("/keywords", methods=["GET", "POST"])
     def keywords():
+        workspace_id = current_workspace_id()
         with connect() as conn:
             if request.method == "POST":
                 raw_keywords = request.form.get("keywords", "")
                 queue_id = request.form.get("queue_id", type=int)
-                queue = get_queue(conn, queue_id, "keyword_search")
+                queue = get_queue(conn, queue_id, "keyword_search", workspace_id)
                 if not queue:
                     flash("Select a specific Keyword Search Queue before adding keywords.", "error")
                     return redirect(url_for("keywords"))
@@ -614,14 +760,19 @@ def create_app(start_worker: bool = False) -> Flask:
                 initial_work_status = "pending" if runnable_now else "paused"
 
                 for text in keyword_lines:
-                    keyword_id = upsert_keyword(conn, text)
+                    keyword_id = upsert_keyword(conn, text, workspace_id)
                     keywords_imported += 1
                     for dork in dorks:
                         query_text = text if direct_query_mode else render_dork(dork["template"], text)
                         if not query_text:
                             continue
                         search_query_id, created = upsert_search_query(
-                            conn, keyword_id, dork["id"], query_text, queue_id
+                            conn,
+                            keyword_id,
+                            dork["id"],
+                            query_text,
+                            queue_id,
+                            workspace_id,
                         )
                         if created:
                             queries_created += 1
@@ -688,7 +839,14 @@ def create_app(start_worker: bool = False) -> Flask:
 
             dorks = conn.execute("SELECT * FROM search_dorks ORDER BY enabled DESC, id").fetchall()
             keyword_queues = conn.execute(
-                "SELECT * FROM queues WHERE queue_type = 'keyword_search' ORDER BY id DESC"
+                """
+                SELECT *
+                FROM queues
+                WHERE workspace_id = ?
+                  AND queue_type = 'keyword_search'
+                ORDER BY id DESC
+                """,
+                (workspace_id,),
             ).fetchall()
             selected_keyword_queue_id = request.args.get("queue_id", type=int)
             rows = conn.execute(
@@ -705,10 +863,12 @@ def create_app(start_worker: bool = False) -> Flask:
                 LEFT JOIN search_queries sq ON sq.keyword_id = k.id
                 LEFT JOIN search_queue_items sqi ON sqi.keyword_id = k.id
                 LEFT JOIN queues q ON q.id = sqi.queue_id
+                WHERE k.workspace_id = ?
                 GROUP BY k.id
                 ORDER BY k.id DESC
                 LIMIT 200
-                """
+                """,
+                (workspace_id,),
             ).fetchall()
         return render_template(
             "keywords.html",
@@ -720,8 +880,12 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/keywords/<int:keyword_id>/stop")
     def stop_keyword(keyword_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
-            keyword = conn.execute("SELECT * FROM keywords WHERE id = ?", (keyword_id,)).fetchone()
+            keyword = conn.execute(
+                "SELECT * FROM keywords WHERE id = ? AND workspace_id = ?",
+                (keyword_id, workspace_id),
+            ).fetchone()
             if not keyword:
                 flash("Keyword not found.", "error")
                 return redirect(url_for("keywords"))
@@ -735,8 +899,12 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/keywords/<int:keyword_id>/resume")
     def resume_keyword(keyword_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
-            keyword = conn.execute("SELECT * FROM keywords WHERE id = ?", (keyword_id,)).fetchone()
+            keyword = conn.execute(
+                "SELECT * FROM keywords WHERE id = ? AND workspace_id = ?",
+                (keyword_id, workspace_id),
+            ).fetchone()
             if not keyword:
                 flash("Keyword not found.", "error")
                 return redirect(url_for("keywords"))
@@ -746,8 +914,12 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/keywords/<int:keyword_id>/delete")
     def delete_keyword(keyword_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
-            keyword = conn.execute("SELECT * FROM keywords WHERE id = ?", (keyword_id,)).fetchone()
+            keyword = conn.execute(
+                "SELECT * FROM keywords WHERE id = ? AND workspace_id = ?",
+                (keyword_id, workspace_id),
+            ).fetchone()
             if not keyword:
                 flash("Keyword not found.", "error")
                 return redirect(url_for("keywords"))
@@ -889,6 +1061,7 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.get("/review")
     def review():
+        workspace_id = current_workspace_id()
         legacy_status = request.args.get("status")
         url_status = normalize_review_status(
             request.args.get("url_status") or legacy_status or "pending_review"
@@ -897,7 +1070,7 @@ def create_app(start_worker: bool = False) -> Flask:
         q = request.args.get("q", "").strip()
         page_size = request.args.get("page_size", type=int) or DEFAULT_REVIEW_PAGE_SIZE
         with connect() as conn:
-            url_queues = query_review_url_queues(conn)
+            url_queues = query_review_url_queues(conn, workspace_id)
             selected_queue_id = resolve_review_url_queue_id(
                 url_queues,
                 request.args.get("queue_id", type=int),
@@ -934,6 +1107,7 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.get("/api/review/urls")
     def review_urls_api():
+        workspace_id = current_workspace_id()
         legacy_status = request.args.get("status")
         url_status = normalize_review_status(
             request.args.get("url_status") or legacy_status or "pending_review"
@@ -942,7 +1116,7 @@ def create_app(start_worker: bool = False) -> Flask:
         q = request.args.get("q", "").strip()
         page_size = request.args.get("page_size", type=int) or DEFAULT_REVIEW_PAGE_SIZE
         with connect() as conn:
-            url_queues = query_review_url_queues(conn)
+            url_queues = query_review_url_queues(conn, workspace_id)
             selected_queue_id = resolve_review_url_queue_id(
                 url_queues,
                 request.args.get("queue_id", type=int),
@@ -961,11 +1135,17 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/api/review/urls/<int:url_id>/approve")
     def approve_url_api(url_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
             queue_id = read_review_queue_id(request.args)
-            if queue_id and not get_queue(conn, queue_id, "url_crawl"):
+            if queue_id and not get_queue(conn, queue_id, "url_crawl", workspace_id):
                 return jsonify({"ok": False, "error": "URL queue is invalid."}), 400
-            changed = approve_url_and_enqueue(conn, url_id, queue_id=queue_id)
+            changed = approve_url_and_enqueue(
+                conn,
+                url_id,
+                queue_id=queue_id,
+                workspace_id=workspace_id,
+            )
         return jsonify(
             {
                 "ok": True,
@@ -981,8 +1161,9 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/api/review/urls/<int:url_id>/reject")
     def reject_url_api(url_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
-            changed = reject_url(conn, url_id)
+            changed = reject_url(conn, url_id, workspace_id=workspace_id)
         return jsonify(
             {
                 "ok": True,
@@ -994,6 +1175,7 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/api/review/urls/bulk")
     def bulk_review_urls_api():
+        workspace_id = current_workspace_id()
         payload = request.get_json(silent=True) if request.is_json else None
         payload = payload or request.form
         action = (payload.get("bulk_action") or payload.get("action") or "").strip()
@@ -1008,15 +1190,20 @@ def create_app(start_worker: bool = False) -> Flask:
             return jsonify({"ok": False, "error": "Select at least one URL row."}), 400
         changed = 0
         with connect() as conn:
-            if queue_id and not get_queue(conn, queue_id, "url_crawl"):
+            if queue_id and not get_queue(conn, queue_id, "url_crawl", workspace_id):
                 return jsonify({"ok": False, "error": "URL queue is invalid."}), 400
             if action == "approve":
                 for url_id in url_ids:
-                    if approve_url_and_enqueue(conn, url_id, queue_id=queue_id):
+                    if approve_url_and_enqueue(
+                        conn,
+                        url_id,
+                        queue_id=queue_id,
+                        workspace_id=workspace_id,
+                    ):
                         changed += 1
             elif action == "reject":
                 for url_id in url_ids:
-                    if reject_url(conn, url_id):
+                    if reject_url(conn, url_id, workspace_id=workspace_id):
                         changed += 1
             else:
                 return jsonify({"ok": False, "error": "Bulk URL action is invalid."}), 400
@@ -1032,9 +1219,15 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/urls/<int:url_id>/approve")
     def approve_url(url_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
             queue_id = request.args.get("queue_id", type=int)
-            changed = approve_url_and_enqueue(conn, url_id, queue_id=queue_id)
+            changed = approve_url_and_enqueue(
+                conn,
+                url_id,
+                queue_id=queue_id,
+                workspace_id=workspace_id,
+            )
         flash(
             "URL approved and crawl job queued if needed." if changed else "URL is already reviewed and is read-only.",
             "success" if changed else "error",
@@ -1043,8 +1236,9 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/urls/<int:url_id>/reject")
     def reject_url_route(url_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
-            changed = reject_url(conn, url_id)
+            changed = reject_url(conn, url_id, workspace_id=workspace_id)
         flash(
             "URL rejected." if changed else "URL is already reviewed and is read-only.",
             "success" if changed else "error",
@@ -1053,6 +1247,7 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/urls/bulk")
     def bulk_review_urls():
+        workspace_id = current_workspace_id()
         action = request.form.get("bulk_action", "")
         queue_id = request.form.get("queue_id", type=int)
         url_ids = unique_ints(request.form.getlist("url_ids"))
@@ -1061,13 +1256,21 @@ def create_app(start_worker: bool = False) -> Flask:
             return redirect(request.referrer or url_for("review"))
         changed = 0
         with connect() as conn:
+            if queue_id and not get_queue(conn, queue_id, "url_crawl", workspace_id):
+                flash("URL queue is invalid.", "error")
+                return redirect(request.referrer or url_for("review"))
             if action == "approve":
                 for url_id in url_ids:
-                    if approve_url_and_enqueue(conn, url_id, queue_id=queue_id):
+                    if approve_url_and_enqueue(
+                        conn,
+                        url_id,
+                        queue_id=queue_id,
+                        workspace_id=workspace_id,
+                    ):
                         changed += 1
             elif action == "reject":
                 for url_id in url_ids:
-                    if reject_url(conn, url_id):
+                    if reject_url(conn, url_id, workspace_id=workspace_id):
                         changed += 1
             else:
                 flash("Bulk URL action is invalid.", "error")
@@ -1078,6 +1281,7 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.get("/crawl")
     def crawl_status():
+        workspace_id = current_workspace_id()
         with connect() as conn:
             rows = conn.execute(
                 """
@@ -1097,32 +1301,35 @@ def create_app(start_worker: bool = False) -> Flask:
                        crawled_at,
                        created_at
                 FROM urls
-                WHERE review_status = 'approved' OR crawl_status != 'not_crawled'
+                WHERE workspace_id = ?
+                  AND (review_status = 'approved' OR crawl_status != 'not_crawled')
                 ORDER BY crawled_at DESC, id DESC
                 LIMIT 300
-                """
+                """,
+                (workspace_id,),
             ).fetchall()
         return render_template("crawl.html", rows=rows)
 
     @app.route("/jobs", methods=["GET", "POST"])
     def jobs():
+        workspace_id = current_workspace_id()
         messages = []
         if request.method == "POST":
             action = request.form.get("action")
             if action == "pause_all":
                 with connect() as conn:
-                    paused_jobs, paused_queries = pause_pending_jobs(conn)
+                    paused_jobs, paused_queries = pause_pending_jobs(conn, workspace_id)
                 flash(f"Stopped queue. Paused {paused_jobs} pending jobs and {paused_queries} search queries.", "success")
                 return redirect(url_for("jobs"))
             if action == "resume_all":
                 with connect() as conn:
-                    resumed_jobs, resumed_queries = resume_paused_jobs(conn)
+                    resumed_jobs, resumed_queries = resume_paused_jobs(conn, workspace_id)
                 flash(f"Resumed queue. Requeued {resumed_jobs} jobs and {resumed_queries} search queries.", "success")
                 return redirect(url_for("jobs"))
             if action == "run_all":
-                messages = run_all()
+                messages = run_all(workspace_id=workspace_id)
             else:
-                messages = [run_one()]
+                messages = [run_one(workspace_id=workspace_id)]
             for message in messages:
                 ok = any(marker in message for marker in ("completed", "No pending", "paused"))
                 flash(message, "success" if ok else "error")
@@ -1134,17 +1341,22 @@ def create_app(start_worker: bool = False) -> Flask:
                 SELECT j.*, q.name AS queue_name, q.queue_type
                 FROM jobs j
                 LEFT JOIN queues q ON q.id = j.queue_id
+                WHERE j.workspace_id = ?
                 ORDER BY j.id DESC
                 LIMIT 200
-                """
+                """,
+                (workspace_id,),
             ).fetchall()
             worker_slots = conn.execute(
                 """
                 SELECT ws.*, q.name AS queue_name, q.queue_type
                 FROM worker_slots ws
                 LEFT JOIN queues q ON q.id = ws.queue_id
+                WHERE ws.workspace_id = ?
+                   OR q.workspace_id = ?
                 ORDER BY ws.worker_type, ws.slot_key
-                """
+                """,
+                (workspace_id, workspace_id),
             ).fetchall()
         return render_template(
             "jobs.html",
@@ -1155,13 +1367,14 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.get("/iocs")
     def iocs():
+        workspace_id = current_workspace_id()
         selected_id = request.args.get("ioc_id", type=int)
         ioc_type = request.args.get("type", "")
         q = request.args.get("q", "").strip()
         source_domain = normalize_ioc_domain_filter(request.args.get("domain", ""))
         page_size = request.args.get("page_size", type=int) or DEFAULT_IOC_PAGE_SIZE
         with connect() as conn:
-            total = count_iocs(conn, ioc_type, q, source_domain)
+            total = count_iocs(conn, workspace_id, ioc_type, q, source_domain)
             pagination = build_pagination(
                 request.args.get("page", type=int),
                 total,
@@ -1170,6 +1383,7 @@ def create_app(start_worker: bool = False) -> Flask:
             )
             rows = query_iocs(
                 conn,
+                workspace_id,
                 ioc_type,
                 q,
                 source_domain,
@@ -1184,9 +1398,10 @@ def create_app(start_worker: bool = False) -> Flask:
                     SELECT *
                     FROM iocs
                     WHERE id = ?
+                      AND workspace_id = ?
                       AND COALESCE(deleted, 0) = 0
                     """,
-                    (selected_id,),
+                    (selected_id, workspace_id),
                 ).fetchone()
                 if selected:
                     sources = conn.execute(
@@ -1196,9 +1411,10 @@ def create_app(start_worker: bool = False) -> Flask:
                         JOIN urls u ON u.id = s.source_url_id
                         LEFT JOIN extraction_rules r ON r.id = s.extraction_rule_id
                         WHERE s.ioc_id = ?
+                          AND s.workspace_id = ?
                         ORDER BY s.id DESC
                         """,
-                        (selected_id,),
+                        (selected_id, workspace_id),
                     ).fetchall()
         return render_template(
             "iocs.html",
@@ -1213,15 +1429,17 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.get("/iocs/<int:ioc_id>/evidence")
     def ioc_evidence(ioc_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
             selected = conn.execute(
                 """
                 SELECT *
                 FROM iocs
                 WHERE id = ?
+                  AND workspace_id = ?
                   AND COALESCE(deleted, 0) = 0
                 """,
-                (ioc_id,),
+                (ioc_id, workspace_id),
             ).fetchone()
             if not selected:
                 return jsonify({"error": "IOC not found."}), 404
@@ -1233,9 +1451,10 @@ def create_app(start_worker: bool = False) -> Flask:
                 JOIN urls u ON u.id = s.source_url_id
                 LEFT JOIN extraction_rules r ON r.id = s.extraction_rule_id
                 WHERE s.ioc_id = ?
+                  AND s.workspace_id = ?
                 ORDER BY s.id DESC
                 """,
-                (ioc_id,),
+                (ioc_id, workspace_id),
             ).fetchall()
 
         return jsonify(
@@ -1266,15 +1485,17 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/iocs/<int:ioc_id>/delete")
     def delete_ioc(ioc_id: int):
+        workspace_id = current_workspace_id()
         with connect() as conn:
             row = conn.execute(
                 """
                 SELECT *
                 FROM iocs
                 WHERE id = ?
+                  AND workspace_id = ?
                   AND COALESCE(deleted, 0) = 0
                 """,
-                (ioc_id,),
+                (ioc_id, workspace_id),
             ).fetchone()
             if not row:
                 flash("IOC not found.", "error")
@@ -1284,16 +1505,21 @@ def create_app(start_worker: bool = False) -> Flask:
                     q=request.form.get("q", ""),
                     domain=request.form.get("domain", ""),
                 ))
-            source_count = scalar(conn, "SELECT COUNT(*) FROM ioc_sources WHERE ioc_id = ?", (ioc_id,))
+            source_count = scalar(
+                conn,
+                "SELECT COUNT(*) FROM ioc_sources WHERE ioc_id = ? AND workspace_id = ?",
+                (ioc_id, workspace_id),
+            )
             conn.execute(
                 """
                 UPDATE iocs
                 SET deleted = 1,
                     deleted_at = CURRENT_TIMESTAMP
                 WHERE id = ?
+                  AND workspace_id = ?
                   AND COALESCE(deleted, 0) = 0
                 """,
-                (ioc_id,),
+                (ioc_id, workspace_id),
             )
         flash(
             f"Deleted IOC #{ioc_id}. {source_count} evidence rows and source URLs were kept for audit.",
@@ -1309,6 +1535,7 @@ def create_app(start_worker: bool = False) -> Flask:
 
     @app.post("/iocs/bulk-delete")
     def bulk_delete_iocs():
+        workspace_id = current_workspace_id()
         ioc_ids = unique_ints(request.form.getlist("ioc_ids"))
         if not ioc_ids:
             flash("Select at least one IOC row.", "error")
@@ -1327,14 +1554,20 @@ def create_app(start_worker: bool = False) -> Flask:
                 SELECT COUNT(*)
                 FROM iocs
                 WHERE id IN ({placeholders})
+                  AND workspace_id = ?
                   AND COALESCE(deleted, 0) = 0
                 """,
-                tuple(ioc_ids),
+                (*ioc_ids, workspace_id),
             )
             source_count = scalar(
                 conn,
-                f"SELECT COUNT(*) FROM ioc_sources WHERE ioc_id IN ({placeholders})",
-                tuple(ioc_ids),
+                f"""
+                SELECT COUNT(*)
+                FROM ioc_sources
+                WHERE ioc_id IN ({placeholders})
+                  AND workspace_id = ?
+                """,
+                (*ioc_ids, workspace_id),
             )
             conn.execute(
                 f"""
@@ -1342,9 +1575,10 @@ def create_app(start_worker: bool = False) -> Flask:
                 SET deleted = 1,
                     deleted_at = CURRENT_TIMESTAMP
                 WHERE id IN ({placeholders})
+                  AND workspace_id = ?
                   AND COALESCE(deleted, 0) = 0
                 """,
-                tuple(ioc_ids),
+                (*ioc_ids, workspace_id),
             )
 
         flash(
@@ -1367,6 +1601,7 @@ def create_app(start_worker: bool = False) -> Flask:
 
 NAV = [
     ("Dashboard", "dashboard"),
+    ("Workspaces", "workspaces"),
     ("Queues", "queues"),
     ("Keywords", "keywords"),
     ("Search Dorks", "dorks"),
@@ -1388,6 +1623,108 @@ REVIEW_STATUS_VALUES = {item["value"] for item in REVIEW_TABS}
 DEFAULT_REVIEW_PAGE_SIZE = 100
 DEFAULT_IOC_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 250
+
+
+def current_workspace_id() -> int:
+    workspace = getattr(g, "current_workspace", None)
+    if workspace:
+        return int(workspace["id"])
+    return DEFAULT_WORKSPACE_ID
+
+
+def list_workspaces(conn):
+    return conn.execute(
+        """
+        SELECT *
+        FROM workspaces
+        ORDER BY id
+        """
+    ).fetchall()
+
+
+def get_workspace(conn, workspace_id: int | None):
+    if not workspace_id:
+        return None
+    return conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+
+
+def resolve_current_workspace(conn):
+    requested_id = request.values.get("workspace_id", type=int)
+    if requested_id:
+        row = get_workspace(conn, requested_id)
+        if row:
+            session["workspace_id"] = int(row["id"])
+            return row
+
+    session_id = session.get("workspace_id")
+    try:
+        session_id = int(session_id)
+    except (TypeError, ValueError):
+        session_id = None
+
+    row = get_workspace(conn, session_id) if session_id else None
+    if not row:
+        row = get_workspace(conn, DEFAULT_WORKSPACE_ID)
+    if row:
+        session["workspace_id"] = int(row["id"])
+    return row
+
+
+def workspace_slug(name: str) -> str:
+    raw_slug = "".join(
+        char.lower() if char.isalnum() else "-"
+        for char in (name or "").strip()
+    )
+    slug = "-".join(part for part in raw_slug.split("-") if part)
+    return slug[:80] or "workspace"
+
+
+def create_workspace(conn, name: str, description: str | None = None) -> tuple[int, bool]:
+    existing = conn.execute(
+        "SELECT id FROM workspaces WHERE lower(name) = lower(?)",
+        (name,),
+    ).fetchone()
+    if existing:
+        return int(existing["id"]), False
+
+    base_slug = workspace_slug(name)
+    slug = base_slug
+    suffix = 2
+    while conn.execute("SELECT 1 FROM workspaces WHERE slug = ?", (slug,)).fetchone():
+        slug = f"{base_slug}-{suffix}"
+        suffix += 1
+
+    before = conn.total_changes
+    conn.execute(
+        """
+        INSERT INTO workspaces(name, slug, description)
+        VALUES (?, ?, ?)
+        """,
+        (name, slug, description),
+    )
+    row = conn.execute("SELECT id FROM workspaces WHERE slug = ?", (slug,)).fetchone()
+    return int(row["id"]), conn.total_changes > before
+
+
+def query_workspaces(conn):
+    return conn.execute(
+        """
+        SELECT w.*,
+               COUNT(DISTINCT q.id) AS queue_count,
+               COUNT(DISTINCT CASE WHEN q.queue_type = 'keyword_search' THEN q.id END) AS keyword_queue_count,
+               COUNT(DISTINCT CASE WHEN q.queue_type = 'url_crawl' THEN q.id END) AS url_queue_count,
+               COUNT(DISTINCT j.id) AS job_count,
+               COUNT(DISTINCT u.id) AS url_count,
+               COUNT(DISTINCT i.id) AS ioc_count
+        FROM workspaces w
+        LEFT JOIN queues q ON q.workspace_id = w.id
+        LEFT JOIN jobs j ON j.workspace_id = w.id
+        LEFT JOIN urls u ON u.workspace_id = w.id
+        LEFT JOIN iocs i ON i.workspace_id = w.id AND COALESCE(i.deleted, 0) = 0
+        GROUP BY w.id
+        ORDER BY w.id
+        """
+    ).fetchall()
 
 
 def scalar(conn, sql: str, params: tuple[object, ...] = ()) -> int:
@@ -1474,13 +1811,19 @@ def normalize_whitelist_entry(value: str) -> dict[str, str] | None:
     }
 
 
-def refresh_stale_whitelist_counts(conn) -> int:
+def refresh_stale_whitelist_counts(conn, workspace_id: int | None = None) -> int:
+    where = "WHERE counts_updated_at IS NULL"
+    params: tuple[object, ...] = ()
+    if workspace_id is not None:
+        where += " AND workspace_id = ?"
+        params = (workspace_id,)
     stale_rows = conn.execute(
-        """
+        f"""
         SELECT id
         FROM whitelist_urls
-        WHERE counts_updated_at IS NULL
-        """
+        {where}
+        """,
+        params,
     ).fetchall()
     refreshed = 0
     for row in stale_rows:
@@ -1489,9 +1832,20 @@ def refresh_stale_whitelist_counts(conn) -> int:
     return refreshed
 
 
-def refresh_whitelist_counts(conn, whitelist_id: int | None = None) -> int:
-    where_sql = "WHERE id = ?" if whitelist_id else ""
-    params = (whitelist_id,) if whitelist_id else ()
+def refresh_whitelist_counts(
+    conn,
+    whitelist_id: int | None = None,
+    workspace_id: int | None = None,
+) -> int:
+    filters = []
+    params: list[object] = []
+    if whitelist_id:
+        filters.append("id = ?")
+        params.append(whitelist_id)
+    if workspace_id:
+        filters.append("workspace_id = ?")
+        params.append(workspace_id)
+    where_sql = "WHERE " + " AND ".join(filters) if filters else ""
     rows = conn.execute(
         f"""
         SELECT id
@@ -1499,7 +1853,7 @@ def refresh_whitelist_counts(conn, whitelist_id: int | None = None) -> int:
         {where_sql}
         ORDER BY id
         """,
-        params,
+        tuple(params),
     ).fetchall()
     for row in rows:
         item_id = int(row["id"])
@@ -1509,7 +1863,8 @@ def refresh_whitelist_counts(conn, whitelist_id: int | None = None) -> int:
             SELECT COUNT(*)
             FROM urls u
             JOIN whitelist_urls wu ON wu.id = ?
-            WHERE {whitelist_match_sql('u.url_norm', 'wu')}
+            WHERE u.workspace_id = wu.workspace_id
+              AND {whitelist_match_sql('u.url_norm', 'wu')}
             """,
             (item_id,),
         )
@@ -1520,7 +1875,9 @@ def refresh_whitelist_counts(conn, whitelist_id: int | None = None) -> int:
             FROM url_queue_items qi
             JOIN urls u ON u.id = qi.url_id
             JOIN whitelist_urls wu ON wu.id = ?
-            WHERE {whitelist_match_sql('u.url_norm', 'wu')}
+            WHERE qi.workspace_id = wu.workspace_id
+              AND u.workspace_id = wu.workspace_id
+              AND {whitelist_match_sql('u.url_norm', 'wu')}
             """,
             (item_id,),
         )
@@ -1537,18 +1894,26 @@ def refresh_whitelist_counts(conn, whitelist_id: int | None = None) -> int:
     return len(rows)
 
 
-def upsert_keyword(conn, text: str) -> int:
-    conn.execute("INSERT OR IGNORE INTO keywords(text) VALUES (?)", (text,))
+def upsert_keyword(conn, text: str, workspace_id: int) -> int:
+    conn.execute(
+        "INSERT OR IGNORE INTO keywords(workspace_id, text) VALUES (?, ?)",
+        (workspace_id, text),
+    )
     conn.execute(
         """
         UPDATE keywords
         SET status = 'pending',
             paused_by_user = 0
-        WHERE text = ? AND status IN ('paused', 'failed', 'done')
+        WHERE workspace_id = ?
+          AND text = ?
+          AND status IN ('paused', 'failed', 'done')
         """,
-        (text,),
+        (workspace_id, text),
     )
-    row = conn.execute("SELECT id FROM keywords WHERE text = ?", (text,)).fetchone()
+    row = conn.execute(
+        "SELECT id FROM keywords WHERE workspace_id = ? AND text = ?",
+        (workspace_id, text),
+    ).fetchone()
     return int(row["id"])
 
 
@@ -1813,16 +2178,30 @@ def delete_keyword_from_queue(conn, keyword_id: int) -> tuple[bool, int, int, st
     return True, len(query_ids), job_count, ""
 
 
-def pause_pending_jobs(conn) -> tuple[int, int]:
+def pause_pending_jobs(conn, workspace_id: int) -> tuple[int, int]:
     queue_ids = {
         int(row["queue_id"])
         for row in conn.execute(
-            "SELECT DISTINCT queue_id FROM jobs WHERE status = 'pending' AND queue_id IS NOT NULL"
+            """
+            SELECT DISTINCT queue_id
+            FROM jobs
+            WHERE workspace_id = ?
+              AND status = 'pending'
+              AND queue_id IS NOT NULL
+            """,
+            (workspace_id,),
         ).fetchall()
     }
     search_query_ids = search_query_ids_from_jobs(
         conn.execute(
-            "SELECT * FROM jobs WHERE status = 'pending' AND type = 'search_query'"
+            """
+            SELECT *
+            FROM jobs
+            WHERE workspace_id = ?
+              AND status = 'pending'
+              AND type = 'search_query'
+            """,
+            (workspace_id,),
         ).fetchall()
     )
     paused_jobs = conn.execute(
@@ -1832,8 +2211,10 @@ def pause_pending_jobs(conn) -> tuple[int, int]:
             started_at = NULL,
             finished_at = NULL,
             error = NULL
-        WHERE status = 'pending'
-        """
+        WHERE workspace_id = ?
+          AND status = 'pending'
+        """,
+        (workspace_id,),
     ).rowcount
 
     affected_keyword_ids = set()
@@ -1841,18 +2222,26 @@ def pause_pending_jobs(conn) -> tuple[int, int]:
         row = conn.execute("SELECT keyword_id FROM search_queries WHERE id = ?", (query_id,)).fetchone()
         if row:
             affected_keyword_ids.add(int(row["keyword_id"]))
-        conn.execute("UPDATE search_queries SET status = 'paused' WHERE id = ?", (query_id,))
+        conn.execute(
+            "UPDATE search_queries SET status = 'paused' WHERE id = ? AND workspace_id = ?",
+            (query_id, workspace_id),
+        )
 
     for keyword_id in affected_keyword_ids:
-        conn.execute("UPDATE keywords SET status = 'paused' WHERE id = ?", (keyword_id,))
+        conn.execute(
+            "UPDATE keywords SET status = 'paused' WHERE id = ? AND workspace_id = ?",
+            (keyword_id, workspace_id),
+        )
     conn.execute(
         """
         UPDATE search_queue_items
         SET status = 'paused',
             started_at = NULL,
             finished_at = NULL
-        WHERE status = 'pending'
-        """
+        WHERE workspace_id = ?
+          AND status = 'pending'
+        """,
+        (workspace_id,),
     )
     conn.execute(
         """
@@ -1860,8 +2249,10 @@ def pause_pending_jobs(conn) -> tuple[int, int]:
         SET status = 'paused',
             started_at = NULL,
             finished_at = NULL
-        WHERE status = 'pending'
-        """
+        WHERE workspace_id = ?
+          AND status = 'pending'
+        """,
+        (workspace_id,),
     )
     for queue_id in queue_ids:
         conn.execute(
@@ -1872,14 +2263,16 @@ def pause_pending_jobs(conn) -> tuple[int, int]:
     return max(paused_jobs, 0), len(search_query_ids)
 
 
-def resume_paused_jobs(conn) -> tuple[int, int]:
+def resume_paused_jobs(conn, workspace_id: int) -> tuple[int, int]:
     paused_queues = conn.execute(
         """
         SELECT id
         FROM queues
-        WHERE status = 'paused'
+        WHERE workspace_id = ?
+          AND status = 'paused'
         ORDER BY id
-        """
+        """,
+        (workspace_id,),
     ).fetchall()
     resumed_jobs = 0
     resumed_items = 0
@@ -1902,26 +2295,45 @@ def search_query_ids_from_jobs(rows) -> list[int]:
     return query_ids
 
 
-def get_queue(conn, queue_id: int | None, queue_type: str | None = None):
+def get_queue(
+    conn,
+    queue_id: int | None,
+    queue_type: str | None = None,
+    workspace_id: int | None = None,
+):
     if not queue_id:
         return None
+    filters = ["id = ?"]
+    params: list[object] = [queue_id]
+    if workspace_id is not None:
+        filters.append("workspace_id = ?")
+        params.append(workspace_id)
     if queue_type:
-        return conn.execute(
-            "SELECT * FROM queues WHERE id = ? AND queue_type = ?", (queue_id, queue_type)
-        ).fetchone()
-    return conn.execute("SELECT * FROM queues WHERE id = ?", (queue_id,)).fetchone()
+        filters.append("queue_type = ?")
+        params.append(queue_type)
+    return conn.execute(
+        f"SELECT * FROM queues WHERE {' AND '.join(filters)}",
+        tuple(params),
+    ).fetchone()
 
 
-def get_or_create_queue(conn, name: str, queue_type: str) -> int:
+def get_or_create_queue(conn, name: str, queue_type: str, workspace_id: int) -> int:
     conn.execute(
         """
-        INSERT OR IGNORE INTO queues(name, queue_type, status)
-        VALUES (?, ?, 'draft')
+        INSERT OR IGNORE INTO queues(workspace_id, name, queue_type, status)
+        VALUES (?, ?, ?, 'draft')
         """,
-        (name, queue_type),
+        (workspace_id, name, queue_type),
     )
     row = conn.execute(
-        "SELECT id FROM queues WHERE name = ? AND queue_type = ?", (name, queue_type)
+        """
+        SELECT id
+        FROM queues
+        WHERE workspace_id = ?
+          AND name = ?
+          AND queue_type = ?
+        """,
+        (workspace_id, name, queue_type),
     ).fetchone()
     return int(row["id"])
 
@@ -1931,8 +2343,11 @@ def get_output_url_queue(conn, keyword_queue_id: int):
         """
         SELECT uq.*
         FROM queue_routes qr
+        JOIN queues kq ON kq.id = qr.keyword_queue_id
         JOIN queues uq ON uq.id = qr.url_queue_id
         WHERE qr.keyword_queue_id = ?
+          AND qr.workspace_id = kq.workspace_id
+          AND uq.workspace_id = kq.workspace_id
           AND uq.queue_type = 'url_crawl'
         """,
         (keyword_queue_id,),
@@ -1940,12 +2355,15 @@ def get_output_url_queue(conn, keyword_queue_id: int):
 
 
 def bind_keyword_queue_to_url_queue(
-    conn, keyword_queue_id: int | None, url_queue_id: int | None
+    conn,
+    keyword_queue_id: int | None,
+    url_queue_id: int | None,
+    workspace_id: int,
 ) -> tuple[bool, str]:
-    keyword_queue = get_queue(conn, keyword_queue_id, "keyword_search")
+    keyword_queue = get_queue(conn, keyword_queue_id, "keyword_search", workspace_id)
     if not keyword_queue:
         return False, "Select a valid Keyword Search Queue."
-    url_queue = get_queue(conn, url_queue_id, "url_crawl")
+    url_queue = get_queue(conn, url_queue_id, "url_crawl", workspace_id)
     if not url_queue:
         return False, "Select a valid URL Crawl Queue."
 
@@ -1954,15 +2372,22 @@ def bind_keyword_queue_to_url_queue(
         SELECT keyword_queue_id
         FROM queue_routes
         WHERE url_queue_id = ?
+          AND workspace_id = ?
           AND keyword_queue_id != ?
         """,
-        (url_queue_id, keyword_queue_id),
+        (url_queue_id, workspace_id, keyword_queue_id),
     ).fetchone()
     if linked_url:
         return False, "This URL Crawl Queue is already bound to another Keyword Search Queue."
 
     existing = conn.execute(
-        "SELECT id, url_queue_id FROM queue_routes WHERE keyword_queue_id = ?", (keyword_queue_id,)
+        """
+        SELECT id, url_queue_id
+        FROM queue_routes
+        WHERE workspace_id = ?
+          AND keyword_queue_id = ?
+        """,
+        (workspace_id, keyword_queue_id),
     ).fetchone()
     changing_existing_route = existing and int(existing["url_queue_id"]) != int(url_queue_id)
     if changing_existing_route:
@@ -1998,18 +2423,19 @@ def bind_keyword_queue_to_url_queue(
             """
             UPDATE queue_routes
             SET url_queue_id = ?,
+                workspace_id = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE keyword_queue_id = ?
             """,
-            (url_queue_id, keyword_queue_id),
+            (url_queue_id, workspace_id, keyword_queue_id),
         )
     else:
         conn.execute(
             """
-            INSERT INTO queue_routes(keyword_queue_id, url_queue_id)
-            VALUES (?, ?)
+            INSERT INTO queue_routes(workspace_id, keyword_queue_id, url_queue_id)
+            VALUES (?, ?, ?)
             """,
-            (keyword_queue_id, url_queue_id),
+            (workspace_id, keyword_queue_id, url_queue_id),
         )
     conn.execute(
         """
@@ -2023,9 +2449,13 @@ def bind_keyword_queue_to_url_queue(
     return True, f"Bound keyword queue '{keyword_queue['name']}' to URL queue '{url_queue['name']}'."
 
 
-def query_queues(conn, queue_id: int | None = None):
-    where_sql = "WHERE q.id = ?" if queue_id else ""
-    params = (queue_id,) if queue_id else ()
+def query_queues(conn, workspace_id: int, queue_id: int | None = None):
+    filters = ["q.workspace_id = ?"]
+    params: list[object] = [workspace_id]
+    if queue_id:
+        filters.append("q.id = ?")
+        params.append(queue_id)
+    where_sql = "WHERE " + " AND ".join(filters)
     return conn.execute(
         f"""
         WITH job_stats AS (
@@ -2037,12 +2467,14 @@ def query_queues(conn, queue_id: int | None = None):
                  SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done_jobs,
                  SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_jobs
           FROM jobs
+          WHERE workspace_id = ?
           GROUP BY queue_id
         ),
         search_item_stats AS (
           SELECT queue_id,
                  COUNT(*) AS search_query_count
           FROM search_queue_items
+          WHERE workspace_id = ?
           GROUP BY queue_id
         ),
         url_item_stats AS (
@@ -2065,6 +2497,8 @@ def query_queues(conn, queue_id: int | None = None):
                  END) AS queue_url_rejected
           FROM url_queue_items uqi
           JOIN urls queue_url ON queue_url.id = uqi.url_id
+          WHERE uqi.workspace_id = ?
+            AND queue_url.workspace_id = ?
           GROUP BY uqi.queue_id
         )
         SELECT q.*,
@@ -2087,16 +2521,18 @@ def query_queues(conn, queue_id: int | None = None):
         LEFT JOIN search_item_stats sis ON sis.queue_id = q.id
         LEFT JOIN url_item_stats uis ON uis.queue_id = q.id
         LEFT JOIN queue_routes qr ON qr.keyword_queue_id = q.id
+          AND qr.workspace_id = q.workspace_id
         LEFT JOIN queues uq ON uq.id = qr.url_queue_id
+          AND uq.workspace_id = q.workspace_id
         {where_sql}
         ORDER BY q.id DESC
         LIMIT 200
         """,
-        params,
+        (workspace_id, workspace_id, workspace_id, workspace_id, *params),
     ).fetchall()
 
 
-def query_url_overview(conn):
+def query_url_overview(conn, workspace_id: int):
     return conn.execute(
         """
         SELECT
@@ -2111,7 +2547,9 @@ def query_url_overview(conn):
           ) AS pending_urls,
           SUM(CASE WHEN review_status = 'rejected' THEN 1 ELSE 0 END) AS rejected_urls
         FROM urls
-        """
+        WHERE workspace_id = ?
+        """,
+        (workspace_id,),
     ).fetchone()
 
 
@@ -2302,9 +2740,14 @@ def split_ioc_search_tokens(q: str) -> list[str]:
     return [token.lower() for token in q.split() if token.strip()][:12]
 
 
-def build_ioc_filters(ioc_type: str, q: str, source_domain: str = "") -> tuple[str, list[object]]:
-    params: list[object] = []
-    where = ["COALESCE(i.deleted, 0) = 0"]
+def build_ioc_filters(
+    workspace_id: int,
+    ioc_type: str,
+    q: str,
+    source_domain: str = "",
+) -> tuple[str, list[object]]:
+    params: list[object] = [workspace_id]
+    where = ["i.workspace_id = ?", "COALESCE(i.deleted, 0) = 0"]
     if ioc_type:
         where.append("i.type = ?")
         params.append(ioc_type)
@@ -2329,6 +2772,8 @@ def build_ioc_filters(ioc_type: str, q: str, source_domain: str = "") -> tuple[s
               FROM ioc_sources sd
               JOIN urls u3 ON u3.id = sd.source_url_id
               WHERE sd.ioc_id = i.id
+                AND sd.workspace_id = i.workspace_id
+                AND u3.workspace_id = i.workspace_id
                 AND (
             """
             + " OR ".join(domain_clauses)
@@ -2354,6 +2799,8 @@ def build_ioc_filters(ioc_type: str, q: str, source_domain: str = "") -> tuple[s
                 JOIN urls u2 ON u2.id = s2.source_url_id
                 LEFT JOIN extraction_rules r2 ON r2.id = s2.extraction_rule_id
                 WHERE s2.ioc_id = i.id
+                  AND s2.workspace_id = i.workspace_id
+                  AND u2.workspace_id = i.workspace_id
                   AND (
                     LOWER(COALESCE(u2.domain, '')) LIKE ?
                     OR LOWER(COALESCE(u2.url_norm, '')) LIKE ?
@@ -2370,8 +2817,8 @@ def build_ioc_filters(ioc_type: str, q: str, source_domain: str = "") -> tuple[s
     return where_sql, params
 
 
-def count_iocs(conn, ioc_type: str, q: str, source_domain: str = "") -> int:
-    where_sql, params = build_ioc_filters(ioc_type, q, source_domain)
+def count_iocs(conn, workspace_id: int, ioc_type: str, q: str, source_domain: str = "") -> int:
+    where_sql, params = build_ioc_filters(workspace_id, ioc_type, q, source_domain)
     return scalar(
         conn,
         f"""
@@ -2385,13 +2832,14 @@ def count_iocs(conn, ioc_type: str, q: str, source_domain: str = "") -> int:
 
 def query_iocs(
     conn,
+    workspace_id: int,
     ioc_type: str,
     q: str,
     source_domain: str = "",
     limit: int = DEFAULT_IOC_PAGE_SIZE,
     offset: int = 0,
 ):
-    where_sql, params = build_ioc_filters(ioc_type, q, source_domain)
+    where_sql, params = build_ioc_filters(workspace_id, ioc_type, q, source_domain)
     return conn.execute(
         f"""
         SELECT i.*,
@@ -2402,7 +2850,9 @@ def query_iocs(
                GROUP_CONCAT(DISTINCT r.name) AS rule_names
         FROM iocs i
         LEFT JOIN ioc_sources s ON s.ioc_id = i.id
+          AND s.workspace_id = i.workspace_id
         LEFT JOIN urls u ON u.id = s.source_url_id
+          AND u.workspace_id = i.workspace_id
         LEFT JOIN extraction_rules r ON r.id = s.extraction_rule_id
         {where_sql}
         GROUP BY i.id
@@ -2854,12 +3304,19 @@ def requeue_url_queue_item(conn, queue_id: int, url_id: int, queue_item_id: int)
 
 
 def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int, int]:
+    queue = conn.execute(
+        "SELECT workspace_id FROM queues WHERE id = ? AND queue_type = 'url_crawl'",
+        (queue_id,),
+    ).fetchone()
+    if not queue:
+        return 0, 0, len(parse_lines(raw_targets))
+    workspace_id = int(queue["workspace_id"])
     added = 0
     requeued = 0
     skipped = 0
     for item in parse_lines(raw_targets):
         url_norm = normalize_url(item)
-        if not url_norm or is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm):
+        if not url_norm or is_media_asset_url(url_norm) or is_url_whitelisted(conn, url_norm, workspace_id):
             skipped += 1
             continue
         domain = get_domain(url_norm)
@@ -2867,7 +3324,7 @@ def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int, 
             skipped += 1
             continue
 
-        url_id = upsert_url(conn, item, url_norm, domain, "manual_queue")
+        url_id = upsert_url(conn, item, url_norm, domain, "manual_queue", workspace_id=workspace_id)
         target = conn.execute("SELECT crawl_status FROM urls WHERE id = ?", (url_id,)).fetchone()
         if target and target["crawl_status"] in TERMINAL_CRAWL_STATUSES:
             remove_url_from_queue_items(conn, url_id)
@@ -2892,10 +3349,10 @@ def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int, 
         before = conn.total_changes
         conn.execute(
             """
-            INSERT OR IGNORE INTO url_queue_items(queue_id, url_id, status)
-            VALUES (?, ?, 'paused')
+            INSERT OR IGNORE INTO url_queue_items(workspace_id, queue_id, url_id, status)
+            VALUES (?, ?, ?, 'paused')
             """,
-            (queue_id, url_id),
+            (workspace_id, queue_id, url_id),
         )
         item_row = conn.execute(
             """
@@ -2915,27 +3372,39 @@ def add_urls_to_queue(conn, queue_id: int, raw_targets: str) -> tuple[int, int, 
     return added, requeued, skipped
 
 
-def apply_url_whitelist(conn, url_norm: str) -> dict[str, int]:
+def apply_url_whitelist(
+    conn,
+    url_norm: str,
+    workspace_id: int | None = None,
+) -> dict[str, int]:
+    workspace_id = workspace_id or current_workspace_id()
     whitelist = conn.execute(
-        "SELECT * FROM whitelist_urls WHERE url_norm = ? AND enabled = 1",
-        (url_norm,),
+        """
+        SELECT *
+        FROM whitelist_urls
+        WHERE workspace_id = ?
+          AND url_norm = ?
+          AND enabled = 1
+        """,
+        (workspace_id, url_norm),
     ).fetchone()
     if not whitelist:
         return {"ignored_urls": 0, "removed_items": 0, "removed_jobs": 0, "removed_iocs": 0}
 
-    removed_iocs = soft_delete_whitelisted_iocs(conn, int(whitelist["id"]))
+    removed_iocs = soft_delete_whitelisted_iocs(conn, int(whitelist["id"]), workspace_id)
 
     match_value = whitelist["match_value"] or whitelist["url_norm"]
     if whitelist["match_type"] == "prefix":
-        params: list[object] = [match_value, len(match_value), match_value]
-        where = "(url_norm = ? OR substr(url_norm, 1, ?) = ?)"
+        params: list[object] = [workspace_id, match_value, len(match_value), match_value]
+        where = "workspace_id = ? AND (url_norm = ? OR substr(url_norm, 1, ?) = ?)"
         if match_value.endswith("/"):
             root_match_value = match_value.rstrip("/")
-            where = f"({where} OR url_norm = ? OR substr(url_norm, 1, ?) = ?)"
+            where = f"({where} OR (workspace_id = ? AND (url_norm = ? OR substr(url_norm, 1, ?) = ?)))"
+            params.append(workspace_id)
             params.extend([root_match_value, len(match_value), f"{root_match_value}?"])
     else:
-        params = [whitelist["url_norm"]]
-        where = "url_norm = ?"
+        params = [workspace_id, whitelist["url_norm"]]
+        where = "workspace_id = ? AND url_norm = ?"
 
     rows = conn.execute(f"SELECT id FROM urls WHERE {where}", params).fetchall()
     if not rows:
@@ -2970,15 +3439,21 @@ def apply_url_whitelist(conn, url_norm: str) -> dict[str, int]:
     }
 
 
-def delete_url_queue_item(conn, item_id: int) -> tuple[bool, int | None, int, str]:
+def delete_url_queue_item(
+    conn,
+    item_id: int,
+    workspace_id: int | None = None,
+) -> tuple[bool, int | None, int, str]:
+    workspace_id = workspace_id or current_workspace_id()
     item = conn.execute(
         """
         SELECT qi.*, u.url_norm
         FROM url_queue_items qi
         JOIN urls u ON u.id = qi.url_id
         WHERE qi.id = ?
+          AND qi.workspace_id = ?
         """,
-        (item_id,),
+        (item_id, workspace_id),
     ).fetchone()
     if not item:
         return False, None, 0, "URL queue item not found."
@@ -3041,14 +3516,17 @@ def upsert_search_queue_item(
     output_url_queue_id: int | None = None,
     initial_work_status: str = "paused",
 ) -> int:
+    queue = conn.execute("SELECT workspace_id FROM queues WHERE id = ?", (queue_id,)).fetchone()
+    workspace_id = int(queue["workspace_id"]) if queue else current_workspace_id()
     conn.execute(
         """
         INSERT OR IGNORE INTO search_queue_items(
-          queue_id, search_query_id, keyword_id, output_url_queue_id, status
+          workspace_id, queue_id, search_query_id, keyword_id, output_url_queue_id, status
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
+            workspace_id,
             queue_id,
             search_query_id,
             keyword_id,
@@ -3155,6 +3633,8 @@ def queue_search_job(
     output_url_queue_id: int | None,
     initial_status: str,
 ) -> int:
+    queue = conn.execute("SELECT workspace_id FROM queues WHERE id = ?", (queue_id,)).fetchone()
+    workspace_id = int(queue["workspace_id"]) if queue else current_workspace_id()
     payload = build_search_job_payload(search_query_id, queue_item_id, output_url_queue_id)
     payload_json = json.dumps(payload)
     dedupe_key = f"queue:{queue_id}:search:{search_query_id}"
@@ -3167,7 +3647,8 @@ def queue_search_job(
     updated = conn.execute(
         """
         UPDATE jobs
-        SET queue_id = ?,
+        SET workspace_id = ?,
+            queue_id = ?,
             payload = ?,
             status = CASE
                 WHEN status = 'pending' AND ? = 'paused' THEN status
@@ -3183,7 +3664,15 @@ def queue_search_job(
         WHERE dedupe_key = ?
           AND status != 'running'
         """,
-        (queue_id, payload_json, initial_status, initial_status, initial_status, dedupe_key),
+        (
+            workspace_id,
+            queue_id,
+            payload_json,
+            initial_status,
+            initial_status,
+            initial_status,
+            dedupe_key,
+        ),
     ).rowcount
     if updated:
         return max(updated, 0)
@@ -3194,6 +3683,7 @@ def queue_search_job(
         payload,
         dedupe_key,
         queue_id=queue_id,
+        workspace_id=workspace_id,
         initial_status=initial_status,
     )
     return 1
@@ -3253,38 +3743,53 @@ def validate_and_preview_dork(template: str, sample_keyword: str) -> dict[str, o
 
 
 def upsert_search_query(
-    conn, keyword_id: int, dork_id: int, query_text: str, queue_id: int | None = None
+    conn,
+    keyword_id: int,
+    dork_id: int,
+    query_text: str,
+    queue_id: int | None = None,
+    workspace_id: int | None = None,
 ) -> tuple[int, bool]:
+    workspace_id = workspace_id or current_workspace_id()
     before = conn.total_changes
     conn.execute(
         """
-        INSERT OR IGNORE INTO search_queries(queue_id, keyword_id, dork_id, query_text)
-        VALUES (?, ?, ?, ?)
+        INSERT OR IGNORE INTO search_queries(workspace_id, queue_id, keyword_id, dork_id, query_text)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (queue_id, keyword_id, dork_id, query_text),
+        (workspace_id, queue_id, keyword_id, dork_id, query_text),
     )
     created = conn.total_changes > before
+    queue_filter = "queue_id IS NULL"
+    query_params: tuple[object, ...] = (workspace_id, keyword_id, dork_id, query_text)
+    if queue_id is not None:
+        queue_filter = "queue_id = ?"
+        query_params = (*query_params, queue_id)
     row = conn.execute(
-        """
+        f"""
         SELECT id
         FROM search_queries
-        WHERE keyword_id = ?
+        WHERE workspace_id = ?
+          AND keyword_id = ?
           AND dork_id = ?
           AND query_text = ?
-          AND (queue_id = ? OR (queue_id IS NULL AND ? IS NULL))
+          AND {queue_filter}
         """,
-        (keyword_id, dork_id, query_text, queue_id, queue_id),
+        query_params,
     ).fetchone()
     if not row:
         row = conn.execute(
             """
             SELECT id
             FROM search_queries
-            WHERE keyword_id = ? AND dork_id = ? AND query_text = ?
+            WHERE workspace_id = ?
+              AND keyword_id = ?
+              AND dork_id = ?
+              AND query_text = ?
             ORDER BY id DESC
             LIMIT 1
             """,
-            (keyword_id, dork_id, query_text),
+            (workspace_id, keyword_id, dork_id, query_text),
         ).fetchone()
     return int(row["id"]), created
 
@@ -3305,7 +3810,7 @@ def read_rule_form() -> dict[str, object]:
     }
 
 
-def query_review_url_queues(conn):
+def query_review_url_queues(conn, workspace_id: int):
     return conn.execute(
         """
         SELECT q.id,
@@ -3325,10 +3830,12 @@ def query_review_url_queues(conn):
         FROM queues q
         LEFT JOIN url_queue_items uqi ON uqi.queue_id = q.id
         LEFT JOIN urls u ON u.id = uqi.url_id
-        WHERE q.queue_type = 'url_crawl'
+        WHERE q.workspace_id = ?
+          AND q.queue_type = 'url_crawl'
         GROUP BY q.id, q.name, q.status, q.queue_type, q.created_at
         ORDER BY q.id DESC
-        """
+        """,
+        (workspace_id,),
     ).fetchall()
 
 
