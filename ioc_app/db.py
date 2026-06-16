@@ -648,6 +648,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     migrate_job_targets(conn)
     migrate_url_bodies(conn)
     backfill_keyword_search_url_iocs(conn)
+    ensure_workspace_migration_indexes(conn)
     sync_ioc_workspaces_from_sources(conn)
     conn.executescript(
         """
@@ -875,6 +876,20 @@ def backfill_workspace_ids(conn: sqlite3.Connection) -> None:
         if table_match and "workspace_id" not in table_columns(conn, table_match.group(1)):
             continue
         conn.execute(sql, (DEFAULT_WORKSPACE_ID,))
+
+
+def ensure_workspace_migration_indexes(conn: sqlite3.Connection) -> None:
+    required_tables = ("iocs", "ioc_sources", "urls")
+    if not all(table_exists(conn, table) for table in required_tables):
+        return
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ioc_sources_ioc ON ioc_sources(ioc_id);
+        CREATE INDEX IF NOT EXISTS idx_ioc_sources_source_url ON ioc_sources(source_url_id);
+        CREATE INDEX IF NOT EXISTS idx_ioc_sources_workspace ON ioc_sources(workspace_id, ioc_id, source_url_id);
+        CREATE INDEX IF NOT EXISTS idx_urls_workspace_id ON urls(workspace_id, id);
+        """
+    )
 
 
 def sync_ioc_workspaces_from_sources(conn: sqlite3.Connection) -> int:

@@ -5,6 +5,7 @@ __pycache__/
 venv/
 env/
 
+.local/
 .env.local
 deploy_local/.env*.local
 
@@ -13,7 +14,12 @@ deploy/.env.*
 deploy/nginx/.htpasswd-*
 
 data/
+data/cloak_profiles/
+data/ioc_investigator.sqlite3
 .vscode/
+
+decrypt_payload_88i/
+plan/
 
 *.sqlite3
 *.sqlite3-*

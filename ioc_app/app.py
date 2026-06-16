@@ -53,7 +53,10 @@ def create_app(start_worker: bool = False) -> Flask:
     app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "local-dev-secret")
     app.config["DEBUG"] = env_bool("FLASK_DEBUG", not production)
     app.config["AUTO_WORKER_ENABLED"] = start_worker
+    init_started_at = time.monotonic()
+    print(f"Initializing database: {database_label()}", flush=True)
     init_db()
+    print(f"Database initialized in {time.monotonic() - init_started_at:.1f}s", flush=True)
 
     @app.before_request
     def load_current_workspace() -> None:
